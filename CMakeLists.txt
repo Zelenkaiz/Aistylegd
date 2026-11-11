@@ -10,7 +10,14 @@ set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 
 project(AIStyleDecorator VERSION 1.0.0)
 
-file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS src/*.cpp main.cpp)
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
+    set(SOURCES src/main.cpp)
+elseif (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/main.cpp")
+    set(SOURCES main.cpp)
+else()
+    file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS src/*.cpp *.cpp)
+endif()
+
 add_library(${PROJECT_NAME} SHARED ${SOURCES})
 
 if (NOT DEFINED ENV{GEODE_SDK})
