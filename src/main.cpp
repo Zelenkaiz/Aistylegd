@@ -7,7 +7,6 @@
 #include <Geode/ui/Popup.hpp>
 #include <Geode/ui/TextInput.hpp>
 #include <Geode/utils/web.hpp>
-#include <matjson/std.hpp>
 #include <random>
 #include <sstream>
 #include <algorithm>
@@ -17,6 +16,8 @@
 
 #ifdef GEODE_IS_WINDOWS
 #include <windows.h>
+#undef min
+#undef max
 #endif
 
 using namespace geode::prelude;
@@ -246,7 +247,7 @@ static std::vector<GeneratedObjectSpec> generateProceduralStyleDecor(
 }
 
 // ============================================================================
-// Спавн сгенерированных объектов в LevelEditorLayer (только проверенные 2.2074 биндинги)
+// Спавн сгенерированных объектов в LevelEditorLayer
 // ============================================================================
 static int spawnGeneratedObjectsInEditor(EditorUI* ui, std::vector<GeneratedObjectSpec> const& specs) {
     if (!ui || !ui->m_editorLayer || specs.empty()) return 0;
@@ -451,10 +452,9 @@ protected:
             userPrompt.empty() ? "Standard rich decoration for this style" : userPrompt
         );
 
-        std::vector<matjson::Value> msgs = {
-            matjson::makeObject({{"role", "system"}, {"content", systemPrompt}}),
-            matjson::makeObject({{"role", "user"}, {"content", fullUserPrompt}})
-        };
+        matjson::Value msgs = matjson::Value::array();
+        msgs.push(matjson::makeObject({{"role", "system"}, {"content", systemPrompt}}));
+        msgs.push(matjson::makeObject({{"role", "user"}, {"content", fullUserPrompt}}));
 
         matjson::Value body = matjson::makeObject({
             {"model", modelName},
