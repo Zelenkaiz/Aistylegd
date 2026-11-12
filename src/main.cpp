@@ -1369,27 +1369,58 @@ static constexpr RusKeyMapEntry kKeyTable[] = {
 
 // ============================================================================
 // СЕРОЕ МЕНЮ МОДА:
-// 1. Сначала экран "Подключите ИИ по API" (если еще не подключен)
-// 2. После подключения — строго СЕРОЕ окно ЧАТА с поддержкой русского языка!
+// 1. Экран подключения и смены API (провайдер + ключ + Вставить/Очистить/Сохранить)
+// 2. После подключения — строго СЕРОЕ окно ЧАТА с кнопкой «Сменить API» и русским вводом!
 // ============================================================================
+struct ApiProviderPreset {
+    const char* name;
+    const char* endpointUrl;
+    const char* defaultModel;
+};
+
+static constexpr ApiProviderPreset kApiProviders[] = {
+    { "OpenAI",     "https://api.openai.com/v1/chat/completions",                            "gpt-4o-mini" },
+    { "Gemini",     "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini-2.5-flash" },
+    { "DeepSeek",   "https://api.deepseek.com/chat/completions",                             "deepseek-chat" },
+    { "Groq",       "https://api.groq.com/openai/v1/chat/completions",                       "llama-3.3-70b-versatile" },
+    { "OpenRouter", "https://openrouter.ai/api/v1/chat/completions",                         "openai/gpt-4o-mini" }
+};
+
+static int detectProviderIndexFromKey(std::string const& key, int currentIdx) {
+    if (key.rfind("AIza", 0) == 0) return 1;      // Gemini
+    if (key.rfind("gsk_", 0) == 0) return 3;      // Groq
+    if (key.rfind("sk-or-", 0) == 0) return 4;    // OpenRouter
+    return currentIdx;
+}
+
+static std::string maskApiKeyPreview(std::string const& key) {
+    if (key.empty()) return "не задан";
+    if (key.size() <= 8) return key;
+    return key.substr(0, 5) + "..." + key.substr(key.size() - 4);
+}
+
 class AIDecorPopup : public geode::Popup {
 protected:
     EditorUI* m_editorUI = nullptr;
     ContourAnalysis m_contour;
     bool m_isApiSetupStage = false;
     bool m_russianLayout = true;
+    int m_providerIdx = 0;
     std::string m_inputBuffer;
+    std::string m_statusBannerRU;
     bool m_prevKeyStates[256]{};
 
     CCNode* m_stageContainer = nullptr;
     CCLabelTTF* m_inputDisplayLabel = nullptr;
     CCLabelTTF* m_langBadgeLabel = nullptr;
+    CCLabelTTF* m_providerBtnLabel = nullptr;
+    CCLabelTTF* m_apiCurrentStatusLabel = nullptr;
     CCLabelTTF* m_chatHistoryLabel1 = nullptr;
     CCLabelTTF* m_chatHistoryLabel2 = nullptr;
     CCLabelTTF* m_chatHistoryLabel3 = nullptr;
 
     bool init(EditorUI* ui, ContourAnalysis contour) {
-        if (!Popup::init(430.f, 250.f)) return false;
+        if (!Popup::init(440.f, 260.f)) return false;
 
         m_editorUI = ui;
         m_contour = std::move(contour);
@@ -1419,9 +1450,11 @@ protected:
         grayInner->setZOrder(-1);
         m_mainLayer->addChild(grayInner);
 
-        std::string savedKey = Mod::get()->getSavedValue<std::string>("connected-api-key", "");
-        std::string settingKey = Mod::get()->getSettingValue<std::string>("ai-api-key");
-        bool hasKey = g_apiConnectedSession || !savedKey.empty() || !settingKey.empty();
+        m_providerIdx = static_cast<int>(Mod::get()->getSavedValue<int64_t>("api-provider-index", 0));
+        if (m_providerIdx < 0 || m_providerIdx >= 5) m_providerIdx = 0;
+
+        std::string savedKey = getSavedApiKey();
+        bool hasKey = g_apiConnectedSession || !savedKey.empty();
 
         m_stageContainer = CCNode::create();
         m_stageContainer->setPosition(CCPoint{ 0.f, 0.f });
@@ -1445,6 +1478,31 @@ protected:
         return true;
     }
 
+    std::string getSavedApiKey() const {
+        std::string savedKey = Mod::get()->getSavedValue<std::string>("connected-api-key", "");
+        if (!savedKey.empty()) return savedKey;
+        return Mod::get()->getSettingValue<std::string>("ai-api-key");
+    }
+
+    void clearStageButtons() {
+        if (!m_buttonMenu) return;
+        std::vector<std::string> ids = {
+            "api-connect-btn"_spr,
+            "api-paste-btn"_spr,
+            "api-clear-btn"_spr,
+            "api-provider-btn"_spr,
+            "api-back-btn"_spr,
+            "chat-send-btn"_spr,
+            "chat-lang-btn"_spr,
+            "chat-change-api-btn"_spr
+        };
+        for (auto const& id : ids) {
+            while (auto* node = m_buttonMenu->getChildByID(id)) {
+                node->removeFromParentAndCleanup(true);
+            }
+        }
+    }
+
     void restoreLockedContourPositions() {
         for (auto const& st : m_contour.lockedStates) {
             if (st.obj && st.obj->getParent()) {
@@ -1456,67 +1514,136 @@ protected:
 
     void buildApiConnectStage() {
         m_isApiSetupStage = true;
-        m_russianLayout = false; // Для ввода API-ключа по умолчанию ENG
-        m_inputBuffer.clear();
+        m_russianLayout = false; // Для ввода API-ключа включаем ENG
         m_stageContainer->removeAllChildrenWithCleanup(true);
+        clearStageButtons();
+
+        m_langBadgeLabel = nullptr;
+        m_chatHistoryLabel1 = nullptr;
+        m_chatHistoryLabel2 = nullptr;
+        m_chatHistoryLabel3 = nullptr;
+
+        std::string currentKey = getSavedApiKey();
+        m_inputBuffer = currentKey;
 
         auto size = m_mainLayer->getContentSize();
         auto center = CCPoint{ size.width / 2.f, size.height / 2.f };
 
-        auto titleLbl = CCLabelTTF::create("ПОДКЛЮЧЕНИЕ ИИ ПО API", "Arial", 18.f);
+        bool hadConnectedApi = g_apiConnectedSession || !currentKey.empty();
+
+        auto titleLbl = CCLabelTTF::create(
+            hadConnectedApi ? "НАСТРОЙКА И СМЕНА ИИ ПО API" : "ПОДКЛЮЧЕНИЕ ИИ ПО API",
+            "Arial", 17.f
+        );
         titleLbl->setColor(ccColor3B{ 235, 240, 248 });
-        titleLbl->setPosition(CCPoint{ center.x, center.y + 88.f });
+        titleLbl->setPosition(CCPoint{ center.x - (hadConnectedApi ? 40.f : 0.f), center.y + 96.f });
         m_stageContainer->addChild(titleLbl);
 
+        // Если API уже был подключен — добавляем кнопку «Назад в чат» в правом верхнем углу
+        if (hadConnectedApi) {
+            auto backBg = CCScale9Sprite::create("square02b_001.png");
+            backBg->setContentSize(CCSize{ 92.f, 24.f });
+            backBg->setColor(ccColor3B{ 74, 80, 90 });
+            auto backTxt = CCLabelTTF::create("Назад в чат", "Arial", 12.f);
+            backTxt->setColor(ccColor3B{ 235, 240, 250 });
+            backTxt->setPosition(CCPoint{ 46.f, 12.f });
+            backBg->addChild(backTxt);
+
+            auto backBtn = CCMenuItemSpriteExtra::create(backBg, this, menu_selector(AIDecorPopup::onBackToChatClicked));
+            backBtn->setPosition(CCPoint{ center.x + 154.f, center.y + 96.f });
+            backBtn->setID("api-back-btn"_spr);
+            m_buttonMenu->addChild(backBtn);
+        }
+
         auto cardBg = CCScale9Sprite::create("square02b_001.png");
-        cardBg->setContentSize(CCSize{ 380.f, 92.f });
+        cardBg->setContentSize(CCSize{ 400.f, 94.f });
         cardBg->setColor(ccColor3B{ 32, 35, 40 });
-        cardBg->setPosition(CCPoint{ center.x, center.y + 22.f });
+        cardBg->setPosition(CCPoint{ center.x, center.y + 30.f });
         m_stageContainer->addChild(cardBg);
 
-        auto notice1 = CCLabelTTF::create(
-            "Перед запуском мода необходимо подключить ИИ по API.",
-            "Arial", 14.f
-        );
-        notice1->setColor(ccColor3B{ 210, 218, 230 });
-        notice1->setPosition(CCPoint{ center.x, center.y + 42.f });
-        m_stageContainer->addChild(notice1);
+        std::string statusText = hadConnectedApi
+            ? fmt::format("Текущий API: {} (ключ: {})", kApiProviders[m_providerIdx].name, maskApiKeyPreview(currentKey))
+            : "Перед запуском мода необходимо подключить ИИ по API.";
+
+        m_apiCurrentStatusLabel = CCLabelTTF::create(statusText.c_str(), "Arial", 13.f);
+        m_apiCurrentStatusLabel->setColor(hadConnectedApi ? ccColor3B{ 165, 235, 195 } : ccColor3B{ 215, 222, 235 });
+        m_apiCurrentStatusLabel->setPosition(CCPoint{ center.x, center.y + 56.f });
+        m_stageContainer->addChild(m_apiCurrentStatusLabel);
+
+        // Кнопка выбора провайдера API (OpenAI / Gemini / DeepSeek / Groq / OpenRouter)
+        auto provBg = CCScale9Sprite::create("square02b_001.png");
+        provBg->setContentSize(CCSize{ 280.f, 26.f });
+        provBg->setColor(ccColor3B{ 68, 74, 86 });
+        std::string provText = fmt::format("Провайдер API: {} (нажми чтобы сменить)", kApiProviders[m_providerIdx].name);
+        m_providerBtnLabel = CCLabelTTF::create(provText.c_str(), "Arial", 12.f);
+        m_providerBtnLabel->setColor(ccColor3B{ 240, 245, 255 });
+        m_providerBtnLabel->setPosition(CCPoint{ 140.f, 13.f });
+        provBg->addChild(m_providerBtnLabel);
+
+        auto provBtn = CCMenuItemSpriteExtra::create(provBg, this, menu_selector(AIDecorPopup::onCycleApiProvider));
+        provBtn->setPosition(CCPoint{ center.x, center.y + 26.f });
+        provBtn->setID("api-provider-btn"_spr);
+        m_buttonMenu->addChild(provBtn);
 
         auto notice2 = CCLabelTTF::create(
-            "Вставьте ваш API-ключ (Ctrl+V) или введите его ниже и нажмите Enter:",
-            "Arial", 13.f
-        );
-        notice2->setColor(ccColor3B{ 165, 175, 190 });
-        notice2->setPosition(CCPoint{ center.x, center.y + 16.f });
-        m_stageContainer->addChild(notice2);
-
-        auto notice3 = CCLabelTTF::create(
-            "(Поддерживаются OpenAI, Gemini, DeepSeek, Groq, OpenRouter)",
+            "Вставьте новый API-ключ (Ctrl+V или кнопкой ниже) и нажмите «Сохранить API»:",
             "Arial", 12.f
         );
-        notice3->setColor(ccColor3B{ 130, 140, 155 });
-        notice3->setPosition(CCPoint{ center.x, center.y - 8.f });
-        m_stageContainer->addChild(notice3);
+        notice2->setColor(ccColor3B{ 165, 175, 190 });
+        notice2->setPosition(CCPoint{ center.x, center.y - 4.f });
+        m_stageContainer->addChild(notice2);
 
         // Серое поле ввода API-ключа
         auto inputBg = CCScale9Sprite::create("square02b_001.png");
-        inputBg->setContentSize(CCSize{ 380.f, 34.f });
-        inputBg->setColor(ccColor3B{ 24, 26, 30 });
-        inputBg->setPosition(CCPoint{ center.x, center.y - 48.f });
+        inputBg->setContentSize(CCSize{ 400.f, 34.f });
+        inputBg->setColor(ccColor3B{ 22, 24, 28 });
+        inputBg->setPosition(CCPoint{ center.x, center.y - 44.f });
         m_stageContainer->addChild(inputBg);
 
-        m_inputDisplayLabel = CCLabelTTF::create("Вставьте API-ключ (Ctrl+V) или введите здесь...", "Arial", 14.f);
-        m_inputDisplayLabel->setColor(ccColor3B{ 150, 155, 165 });
-        m_inputDisplayLabel->setPosition(CCPoint{ center.x, center.y - 48.f });
+        m_inputDisplayLabel = CCLabelTTF::create("", "Arial", 13.f);
+        m_inputDisplayLabel->setPosition(CCPoint{ center.x, center.y - 44.f });
         m_stageContainer->addChild(m_inputDisplayLabel);
+        refreshInputLabel();
 
-        auto connectSpr = ButtonSprite::create("Connect API");
-        connectSpr->setColor(ccColor3B{ 170, 178, 190 });
-        connectSpr->setScale(0.72f);
-        auto connectBtn = CCMenuItemSpriteExtra::create(connectSpr, this, menu_selector(AIDecorPopup::onConnectApiClicked));
-        connectBtn->setPosition(CCPoint{ center.x, center.y - 94.f });
-        m_buttonMenu->addChild(connectBtn);
+        // Три удобные серые кнопки внизу: [Вставить Ctrl+V] [Очистить] [Сохранить API]
+        auto pasteBg = CCScale9Sprite::create("square02b_001.png");
+        pasteBg->setContentSize(CCSize{ 122.f, 32.f });
+        pasteBg->setColor(ccColor3B{ 72, 78, 88 });
+        auto pasteTxt = CCLabelTTF::create("Вставить (Ctrl+V)", "Arial", 12.f);
+        pasteTxt->setColor(ccColor3B{ 235, 240, 250 });
+        pasteTxt->setPosition(CCPoint{ 61.f, 16.f });
+        pasteBg->addChild(pasteTxt);
+
+        auto pasteBtn = CCMenuItemSpriteExtra::create(pasteBg, this, menu_selector(AIDecorPopup::onPasteApiClicked));
+        pasteBtn->setPosition(CCPoint{ center.x - 136.f, center.y - 92.f });
+        pasteBtn->setID("api-paste-btn"_spr);
+        m_buttonMenu->addChild(pasteBtn);
+
+        auto clearBg = CCScale9Sprite::create("square02b_001.png");
+        clearBg->setContentSize(CCSize{ 96.f, 32.f });
+        clearBg->setColor(ccColor3B{ 72, 78, 88 });
+        auto clearTxt = CCLabelTTF::create("Очистить", "Arial", 12.f);
+        clearTxt->setColor(ccColor3B{ 235, 240, 250 });
+        clearTxt->setPosition(CCPoint{ 48.f, 16.f });
+        clearBg->addChild(clearTxt);
+
+        auto clearBtn = CCMenuItemSpriteExtra::create(clearBg, this, menu_selector(AIDecorPopup::onClearApiClicked));
+        clearBtn->setPosition(CCPoint{ center.x - 16.f, center.y - 92.f });
+        clearBtn->setID("api-clear-btn"_spr);
+        m_buttonMenu->addChild(clearBtn);
+
+        auto saveBg = CCScale9Sprite::create("square02b_001.png");
+        saveBg->setContentSize(CCSize{ 148.f, 32.f });
+        saveBg->setColor(ccColor3B{ 92, 102, 118 });
+        auto saveTxt = CCLabelTTF::create(hadConnectedApi ? "Сохранить новый API" : "Подключить API", "Arial", 13.f);
+        saveTxt->setColor(ccColor3B{ 255, 255, 255 });
+        saveTxt->setPosition(CCPoint{ 74.f, 16.f });
+        saveBg->addChild(saveTxt);
+
+        auto connectBtn = CCMenuItemSpriteExtra::create(saveBg, this, menu_selector(AIDecorPopup::onConnectApiClicked));
+        connectBtn->setPosition(CCPoint{ center.x + 118.f, center.y - 92.f });
         connectBtn->setID("api-connect-btn"_spr);
+        m_buttonMenu->addChild(connectBtn);
     }
 
     void buildGrayChatStage() {
@@ -1524,35 +1651,51 @@ protected:
         m_russianLayout = true; // В чате сразу включаем РУССКИЙ язык!
         m_inputBuffer.clear();
         m_stageContainer->removeAllChildrenWithCleanup(true);
-        if (auto* oldBtn = m_buttonMenu->getChildByID("api-connect-btn"_spr)) {
-            oldBtn->removeFromParentAndCleanup(true);
-        }
+        clearStageButtons();
+
+        m_providerBtnLabel = nullptr;
+        m_apiCurrentStatusLabel = nullptr;
 
         auto size = m_mainLayer->getContentSize();
         auto center = CCPoint{ size.width / 2.f, size.height / 2.f };
 
         // Верхняя серая шапка чата
-        auto headerLbl = CCLabelTTF::create("ИИ ЧАТ-БОТ (Правый Alt — открыть/закрыть)", "Arial", 16.f);
+        auto headerLbl = CCLabelTTF::create("ИИ ЧАТ-БОТ (Правый Alt — открыть/закрыть)", "Arial", 15.f);
         headerLbl->setColor(ccColor3B{ 230, 235, 242 });
-        headerLbl->setPosition(CCPoint{ center.x - 25.f, center.y + 94.f });
+        headerLbl->setPosition(CCPoint{ center.x - 65.f, center.y + 96.f });
         m_stageContainer->addChild(headerLbl);
+
+        // Кнопка «Сменить API» прямо в шапке серого окна чата!
+        auto apiBtnBg = CCScale9Sprite::create("square02b_001.png");
+        apiBtnBg->setContentSize(CCSize{ 92.f, 22.f });
+        apiBtnBg->setColor(ccColor3B{ 75, 80, 90 });
+        auto apiBtnLbl = CCLabelTTF::create("Сменить API", "Arial", 12.f);
+        apiBtnLbl->setColor(ccColor3B{ 235, 240, 250 });
+        apiBtnLbl->setPosition(CCPoint{ 46.f, 11.f });
+        apiBtnBg->addChild(apiBtnLbl);
+
+        auto changeApiBtn = CCMenuItemSpriteExtra::create(apiBtnBg, this, menu_selector(AIDecorPopup::onOpenApiSettings));
+        changeApiBtn->setPosition(CCPoint{ center.x + 102.f, center.y + 96.f });
+        changeApiBtn->setID("chat-change-api-btn"_spr);
+        m_buttonMenu->addChild(changeApiBtn);
 
         // Кнопка переключения языка РУС / ENG
         auto langBg = CCScale9Sprite::create("square02b_001.png");
-        langBg->setContentSize(CCSize{ 64.f, 22.f });
+        langBg->setContentSize(CCSize{ 52.f, 22.f });
         langBg->setColor(ccColor3B{ 75, 80, 90 });
-        m_langBadgeLabel = CCLabelTTF::create("РУС", "Arial", 13.f);
+        m_langBadgeLabel = CCLabelTTF::create("РУС", "Arial", 12.f);
         m_langBadgeLabel->setColor(ccColor3B{ 240, 245, 255 });
-        m_langBadgeLabel->setPosition(CCPoint{ 32.f, 11.f });
+        m_langBadgeLabel->setPosition(CCPoint{ 26.f, 11.f });
         langBg->addChild(m_langBadgeLabel);
 
         auto langBtn = CCMenuItemSpriteExtra::create(langBg, this, menu_selector(AIDecorPopup::onToggleLanguage));
-        langBtn->setPosition(CCPoint{ center.x + 165.f, center.y + 94.f });
+        langBtn->setPosition(CCPoint{ center.x + 178.f, center.y + 96.f });
+        langBtn->setID("chat-lang-btn"_spr);
         m_buttonMenu->addChild(langBtn);
 
         // Серое окно истории сообщений чата
         auto chatAreaBg = CCScale9Sprite::create("square02b_001.png");
-        chatAreaBg->setContentSize(CCSize{ 394.f, 122.f });
+        chatAreaBg->setContentSize(CCSize{ 404.f, 124.f });
         chatAreaBg->setColor(ccColor3B{ 30, 32, 37 });
         chatAreaBg->setPosition(CCPoint{ center.x, center.y + 16.f });
         m_stageContainer->addChild(chatAreaBg);
@@ -1561,17 +1704,26 @@ protected:
             ? findFirstFreeEditorLayerBlock(m_editorUI->m_editorLayer, 4)
             : 1;
 
-        std::string greeting1 = fmt::format(
-            "ИИ (API подключен): Выделено {} клеток (слои {}-{}). Жду задачу!",
-            m_contour.cellCount(), freeLayer, freeLayer + 3
-        );
+        std::string savedKey = getSavedApiKey();
+        std::string greeting1 = !m_statusBannerRU.empty()
+            ? m_statusBannerRU
+            : fmt::format(
+                "ИИ ({} API: {}): Выделено {} клеток (слои {}-{}).",
+                kApiProviders[m_providerIdx].name,
+                maskApiKeyPreview(savedKey),
+                m_contour.cellCount(),
+                freeLayer,
+                freeLayer + 3
+            );
+        m_statusBannerRU.clear();
+
         m_chatHistoryLabel1 = CCLabelTTF::create(greeting1.c_str(), "Arial", 13.f);
         m_chatHistoryLabel1->setColor(ccColor3B{ 195, 205, 220 });
         m_chatHistoryLabel1->setPosition(CCPoint{ center.x, center.y + 54.f });
         m_stageContainer->addChild(m_chatHistoryLabel1);
 
         m_chatHistoryLabel2 = CCLabelTTF::create(
-            "Напиши в чат что сделать, или укажи стиль декора и количество объектов:",
+            "Напиши задачу, стиль декора и количество объектов (или «сменить апи»):",
             "Arial", 13.f
         );
         m_chatHistoryLabel2->setColor(ccColor3B{ 170, 178, 192 });
@@ -1586,29 +1738,30 @@ protected:
         m_chatHistoryLabel3->setPosition(CCPoint{ center.x, center.y - 16.f });
         m_stageContainer->addChild(m_chatHistoryLabel3);
 
-        // Серая строка ввода чата внизу (только чат!)
+        // Серая строка ввода чата внизу
         auto inputBarBg = CCScale9Sprite::create("square02b_001.png");
-        inputBarBg->setContentSize(CCSize{ 312.f, 34.f });
+        inputBarBg->setContentSize(CCSize{ 320.f, 34.f });
         inputBarBg->setColor(ccColor3B{ 22, 24, 28 });
-        inputBarBg->setPosition(CCPoint{ center.x - 40.f, center.y - 76.f });
+        inputBarBg->setPosition(CCPoint{ center.x - 42.f, center.y - 78.f });
         m_stageContainer->addChild(inputBarBg);
 
         m_inputDisplayLabel = CCLabelTTF::create("Напиши задачу ИИ на русском (Enter — отправить)...", "Arial", 13.f);
         m_inputDisplayLabel->setColor(ccColor3B{ 150, 156, 168 });
-        m_inputDisplayLabel->setPosition(CCPoint{ center.x - 40.f, center.y - 76.f });
+        m_inputDisplayLabel->setPosition(CCPoint{ center.x - 42.f, center.y - 78.f });
         m_stageContainer->addChild(m_inputDisplayLabel);
 
         // Серая кнопка отправки в чат
         auto sendBg = CCScale9Sprite::create("square02b_001.png");
-        sendBg->setContentSize(CCSize{ 74.f, 34.f });
+        sendBg->setContentSize(CCSize{ 76.f, 34.f });
         sendBg->setColor(ccColor3B{ 82, 88, 98 });
         auto sendTxt = CCLabelTTF::create("Отправить", "Arial", 13.f);
         sendTxt->setColor(ccColor3B{ 245, 248, 255 });
-        sendTxt->setPosition(CCPoint{ 37.f, 17.f });
+        sendTxt->setPosition(CCPoint{ 38.f, 17.f });
         sendBg->addChild(sendTxt);
 
         auto sendBtn = CCMenuItemSpriteExtra::create(sendBg, this, menu_selector(AIDecorPopup::onSendChatClicked));
-        sendBtn->setPosition(CCPoint{ center.x + 160.f, center.y - 76.f });
+        sendBtn->setPosition(CCPoint{ center.x + 164.f, center.y - 78.f });
+        sendBtn->setID("chat-send-btn"_spr);
         m_buttonMenu->addChild(sendBtn);
     }
 
@@ -1622,7 +1775,11 @@ protected:
             }
             m_inputDisplayLabel->setColor(ccColor3B{ 145, 150, 162 });
         } else {
-            std::string shown = m_inputBuffer + "|";
+            std::string shown = m_inputBuffer;
+            if (shown.size() > 48) {
+                shown = "..." + shown.substr(shown.size() - 45);
+            }
+            shown += "|";
             m_inputDisplayLabel->setString(shown.c_str());
             m_inputDisplayLabel->setColor(ccColor3B{ 245, 248, 255 });
         }
@@ -1635,19 +1792,88 @@ protected:
         }
     }
 
+    void onOpenApiSettings(CCObject*) {
+        buildApiConnectStage();
+    }
+
+    void onBackToChatClicked(CCObject*) {
+        buildGrayChatStage();
+    }
+
+    void onCycleApiProvider(CCObject*) {
+        m_providerIdx = (m_providerIdx + 1) % 5;
+        if (m_providerBtnLabel) {
+            std::string provText = fmt::format("Провайдер API: {} (нажми чтобы сменить)", kApiProviders[m_providerIdx].name);
+            m_providerBtnLabel->setString(provText.c_str());
+        }
+    }
+
+    void onPasteApiClicked(CCObject*) {
+        std::string clip = geode::utils::clipboard::read();
+        if (!clip.empty()) {
+            // Убираем пробелы и переносы строк по краям ключа
+            while (!clip.empty() && (clip.back() == '\n' || clip.back() == '\r' || clip.back() == ' ' || clip.back() == '\t')) {
+                clip.pop_back();
+            }
+            size_t start = 0;
+            while (start < clip.size() && (clip[start] == '\n' || clip[start] == '\r' || clip[start] == ' ' || clip[start] == '\t')) {
+                start++;
+            }
+            clip = clip.substr(start);
+
+            m_inputBuffer = clip;
+            if (m_inputBuffer.size() > 220) m_inputBuffer.resize(220);
+
+            int detected = detectProviderIndexFromKey(m_inputBuffer, m_providerIdx);
+            if (detected != m_providerIdx) {
+                m_providerIdx = detected;
+                if (m_providerBtnLabel) {
+                    std::string provText = fmt::format("Провайдер API: {} (автоопределён)", kApiProviders[m_providerIdx].name);
+                    m_providerBtnLabel->setString(provText.c_str());
+                }
+            }
+            refreshInputLabel();
+        }
+    }
+
+    void onClearApiClicked(CCObject*) {
+        m_inputBuffer.clear();
+        refreshInputLabel();
+    }
+
     void onConnectApiClicked(CCObject*) {
         std::string key = m_inputBuffer;
         if (key.empty()) {
             key = "ai-connected-key";
         }
+        m_providerIdx = detectProviderIndexFromKey(key, m_providerIdx);
+
         g_apiConnectedSession = true;
         Mod::get()->setSavedValue("connected-api-key", key);
+        Mod::get()->setSavedValue("api-provider-index", static_cast<int64_t>(m_providerIdx));
         Mod::get()->setSettingValue("ai-api-key", key);
+        Mod::get()->setSettingValue("ai-api-url", std::string(kApiProviders[m_providerIdx].endpointUrl));
+        Mod::get()->setSettingValue("ai-model", std::string(kApiProviders[m_providerIdx].defaultModel));
+
+        m_statusBannerRU = fmt::format(
+            "API обновлён: {} (ключ {}). Выделено {} клеток.",
+            kApiProviders[m_providerIdx].name,
+            maskApiKeyPreview(key),
+            m_contour.cellCount()
+        );
         buildGrayChatStage();
     }
 
     void onSendChatClicked(CCObject*) {
         restoreLockedContourPositions();
+
+        std::string lowCmd = normalizeLowerUTF8(m_inputBuffer);
+        if (hasWord(lowCmd, "сменить апи") || hasWord(lowCmd, "поменять апи") ||
+            hasWord(lowCmd, "изменить апи") || hasWord(lowCmd, "новый апи") ||
+            lowCmd == "апи" || lowCmd == "api" || lowCmd == "/api") {
+            buildApiConnectStage();
+            return;
+        }
 
         std::mt19937 rng(std::random_device{}());
         ChatBotPlan plan = parseUserChatCommand(m_inputBuffer);
@@ -1701,13 +1927,17 @@ protected:
             return;
         }
 
-        // Ctrl+V вставляет текст (API-ключ или русский текст из буфера обмена)
+        // Ctrl+V вставляет текст (API-ключ в окне API или русский текст в чате)
         if (ctrlDown && wasJustPressed('V')) {
-            std::string clip = geode::utils::clipboard::read();
-            if (!clip.empty()) {
-                m_inputBuffer += clip;
-                if (m_inputBuffer.size() > 220) m_inputBuffer.resize(220);
-                refreshInputLabel();
+            if (m_isApiSetupStage) {
+                onPasteApiClicked(nullptr);
+            } else {
+                std::string clip = geode::utils::clipboard::read();
+                if (!clip.empty()) {
+                    m_inputBuffer += clip;
+                    if (m_inputBuffer.size() > 220) m_inputBuffer.resize(220);
+                    refreshInputLabel();
+                }
             }
             return;
         }
