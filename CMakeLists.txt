@@ -10,14 +10,12 @@ set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 
 project(AIStyleDecorator VERSION 1.0.1)
 
-add_compile_definitions(NOMINMAX)
-
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
     set(SOURCES src/main.cpp)
 elseif (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/main.cpp")
     set(SOURCES main.cpp)
 else()
-    file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS src/*.cpp *.cpp)
+    file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS src/*.cpp)
 endif()
 
 add_library(${PROJECT_NAME} SHARED ${SOURCES})
@@ -29,9 +27,5 @@ else()
 endif()
 
 add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
-
-if (TARGET GeodeBindings)
-    target_compile_options(GeodeBindings PRIVATE -include Geode/Bindings.hpp)
-endif()
 
 setup_geode_mod(${PROJECT_NAME})
