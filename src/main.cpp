@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <queue>
+#include <random>
 #include <set>
 #include <sstream>
 #include <string>
@@ -24,7 +25,7 @@
 using namespace geode::prelude;
 
 // ============================================================================
-// Стили декора и слоты цветовой палитры (строго единый цвет на один тип/слой)
+// Стили декора, слоты палитры и роли слоев редактора
 // ============================================================================
 enum class DecorStyle {
     Neon = 0,
@@ -35,18 +36,18 @@ enum class DecorStyle {
 
 enum class ColorSlot : int {
     DarkFill = 0,         // Слой +0: темное внутреннее заполнение
-    Dark3D = 1,           // Слой +0/+2: темная заливка 3D-граней и подложек
-    MidTone = 2,          // Слой +1: внутренние арки, тех-полосы и средний шип
-    BrightMain = 3,       // Слой +1/+3: основной неон, глазки/череп, трава, внутренний шип
-    HighlightOutline = 4, // Слой +2: яркий внешний контур, 3D-линии и микро-квадраты
-    AdditiveGlow = 5      // Слой +3: мягкое неоновое свечение (с аддитивным смешиванием)
+    Dark3D = 1,           // Слой +0/+2: темная подложка 3D-блоков и внутренних стоек
+    MidTone = 2,          // Слой +1: средний тон для арок, рамок, скоб и средних шипов
+    BrightMain = 3,       // Слой +1/+3: главный яркий цвет (эмблемы, глаз, череп, блики, трава)
+    HighlightOutline = 4, // Слой +2: светлый неоновый контур, 3D-линии и микро-детали
+    AdditiveGlow = 5      // Слой +3: мягкий мелкий и контурный неон (аддитивное свечение)
 };
 
 enum class LayerRole : int {
-    Fill = 0,        // firstFreeLayer + 0: Заполнение
-    InnerDetail = 1, // firstFreeLayer + 1: Внутренний узор, арки, ядро
-    Outline3D = 2,   // firstFreeLayer + 2: Внешний контур, 3D и вложенные шипы
-    NeonAndGrass = 3 // firstFreeLayer + 3: Неоновый глоу и внешняя трава/капли
+    Fill = 0,        // firstFreeLayer + 0: Базовое заполнение
+    InnerDetail = 1, // firstFreeLayer + 1: Внутренние декор-блоки, глаз/череп, узоры
+    Outline3D = 2,   // firstFreeLayer + 2: Контур, готовые 3D-блоки и вложенные шипы
+    NeonAndGrass = 3 // firstFreeLayer + 3: Мелкий контурный неон (снаружи и внутри) + трава
 };
 
 struct StylePalette {
@@ -54,7 +55,6 @@ struct StylePalette {
     ccColor3B slotColors[6];
     GLubyte slotOpacity[6];
     bool slotBlending[6];
-    int slotChannelID[6];
 };
 
 struct SelectedSpikeInfo {
@@ -99,20 +99,14 @@ struct GeneratedObjectSpec {
     GLubyte customOpacity = 255;
     bool noTouch = true;
     bool noGlow = true;
+    int priorityTier = 1; // 0 = обязательный контур/фон, 1 = основа, 2 = декор, 3 = микро-детали
 };
 
-struct LiveColoredNode {
-    Ref<GameObject> obj;
-    ccColor3B color{ 255, 255, 255 };
-    GLubyte opacity = 255;
-    bool additiveBlend = false;
-};
-
-static std::vector<LiveColoredNode> g_liveColoredObjects;
+static int g_lastColorIndex = -1;
+static int g_lastArchetypeIndex = -1;
 
 // ============================================================================
-// Безопасные C++23 шаблоны для работы с полями GameObject и LevelEditorLayer
-// (не требуют внешних символов линковщика и гарантируют 100% сборку на 2.2081)
+// C++23 безопасные шаблоны для работы с полями GameObject и вкладками EditorUI
 // ============================================================================
 template <typename ObjT>
 static int readObjID(ObjT* obj) {
@@ -189,6 +183,10 @@ static void writeObjFlags(ObjT* obj, int zOrder, bool noTouch, bool noGlow) {
     }
 }
 
+// ============================================================================
+// Нативная окраска ЛЮБОГО объекта через канал 1004 (White) + HSV в GJSpriteColor
+// (LevelEditorLayer::updateVisibility сам красит все детали в нужный RGB цвет!)
+// ============================================================================
 static void rgbToHsv(ccColor3B c, float& outH, float& outS, float& outV) {
     float r = c.r / 255.f;
     float g = c.g / 255.f;
@@ -212,14 +210,23 @@ static void rgbToHsv(ccColor3B c, float& outH, float& outS, float& outV) {
 }
 
 template <typename SpriteColorT>
-static void configureGJSpriteColor(SpriteColorT* sc, int channelID, ccColor3B rgb, GLubyte opacity, bool blending) {
+static void applyNativeHSVColorToSpriteColor(SpriteColorT* sc, ccColor3B rgb, GLubyte opacity, bool blending) {
     if (!sc) return;
+    float H = 0.f, S = 0.f, V = 1.f;
+    rgbToHsv(rgb, H, S, V);
+
+    // Сдвиг оттенка от базового белого (канал 1004: H=0, S=0, V=1)
+    float hueSigned = (H > 180.f) ? (H - 360.f) : H;
     float alphaF = static_cast<float>(opacity) / 255.f;
-    if constexpr (requires { sc->m_colorID = channelID; }) {
-        sc->m_colorID = channelID;
+
+    // Канал 1004 в GD всегда белый (RGB 255,255,255). При включенном m_usesHSV = true
+    // и аддитивных флагах (absoluteSaturation=true, absoluteBrightness=true)
+    // сам движок GD преобразует белый в точный RGB цвет (R, G, B) на каждом кадре!
+    if constexpr (requires { sc->m_colorID = 1004; }) {
+        sc->m_colorID = 1004;
     }
-    if constexpr (requires { sc->m_defaultColorID = channelID; }) {
-        sc->m_defaultColorID = channelID;
+    if constexpr (requires { sc->m_defaultColorID = 1004; }) {
+        sc->m_defaultColorID = 1004;
     }
     if constexpr (requires { sc->m_opacity = alphaF; }) {
         sc->m_opacity = alphaF;
@@ -233,75 +240,21 @@ static void configureGJSpriteColor(SpriteColorT* sc, int channelID, ccColor3B rg
     if constexpr (requires { sc->m_usesCustomBlend = blending; }) {
         sc->m_usesCustomBlend = blending;
     }
-    if constexpr (requires { sc->m_usesHSV = false; }) {
-        sc->m_usesHSV = false;
+    if constexpr (requires { sc->m_usesHSV = true; }) {
+        sc->m_usesHSV = true;
+    }
+    if constexpr (requires { sc->m_hsv; }) {
+        sc->m_hsv = cocos2d::ccHSVValue{ hueSigned, S, V - 1.0f, true, true };
     }
 }
 
-template <typename ColorActionT>
-static void configureColorActionStruct(ColorActionT* ca, ccColor3B rgb, GLubyte opacity, bool blending) {
-    if (!ca) return;
-    float alphaF = static_cast<float>(opacity) / 255.f;
-    if constexpr (requires { ca->m_fromColor = rgb; }) {
-        ca->m_fromColor = rgb;
-    }
-    if constexpr (requires { ca->m_toColor = rgb; }) {
-        ca->m_toColor = rgb;
-    }
-    if constexpr (requires { ca->m_color = rgb; }) {
-        ca->m_color = rgb;
-    }
-    if constexpr (requires { ca->m_currentColor = rgb; }) {
-        ca->m_currentColor = rgb;
-    }
-    if constexpr (requires { ca->m_blending = blending; }) {
-        ca->m_blending = blending;
-    }
-    if constexpr (requires { ca->m_opacity = alphaF; }) {
-        ca->m_opacity = alphaF;
-    }
-    if constexpr (requires { ca->m_fromOpacity = alphaF; }) {
-        ca->m_fromOpacity = alphaF;
-    }
-}
-
-template <typename EffectMgrT>
-static void syncEffectManagerChannels(EffectMgrT* em, StylePalette const& pal) {
-    if (!em) return;
-    if constexpr (requires { em->m_colorActionVector; }) {
-        auto& vec = em->m_colorActionVector;
-        for (int s = 0; s < 6; ++s) {
-            int ch = pal.slotChannelID[s];
-            if (ch >= 0 && ch < static_cast<int>(vec.size()) && vec[ch]) {
-                configureColorActionStruct(vec[ch], pal.slotColors[s], pal.slotOpacity[s], pal.slotBlending[s]);
-            }
-        }
-    }
-}
-
-template <typename EditorLayerT>
-static void syncPaletteWithLevelChannels(EditorLayerT* editorLayer, StylePalette const& pal) {
-    if (!editorLayer) return;
-    if constexpr (requires { editorLayer->m_effectManager; }) {
-        syncEffectManagerChannels(editorLayer->m_effectManager, pal);
-    }
-    if constexpr (requires { editorLayer->m_levelSettings; }) {
-        if (editorLayer->m_levelSettings) {
-            if constexpr (requires { editorLayer->m_levelSettings->m_effectManager; }) {
-                syncEffectManagerChannels(editorLayer->m_levelSettings->m_effectManager, pal);
-            }
-        }
-    }
-}
-
-static void enforceVisualColorOnNode(GameObject* obj, ccColor3B color, GLubyte opacity, bool additiveBlend) {
+static void applyDirectSpriteVisuals(GameObject* obj, ccColor3B color, GLubyte opacity, bool additiveBlend) {
     if (!obj) return;
     obj->setColor(color);
     obj->setOpacity(opacity);
     if (additiveBlend) {
         obj->setBlendFunc(ccBlendFunc{ GL_SRC_ALPHA, GL_ONE });
     }
-
     if (auto* children = obj->getChildren()) {
         for (unsigned int i = 0; i < children->count(); ++i) {
             if (auto* spr = typeinfo_cast<CCSprite*>(children->objectAtIndex(i))) {
@@ -325,21 +278,175 @@ static void bindObjectToPaletteSlot(ObjT* obj, StylePalette const& pal, ColorSlo
     ccColor3B col = pal.slotColors[idx];
     GLubyte op = (customOpacity < 255) ? customOpacity : pal.slotOpacity[idx];
     bool blend = pal.slotBlending[idx];
-    int channelID = pal.slotChannelID[idx];
 
     if constexpr (requires { obj->m_baseColor; }) {
-        configureGJSpriteColor(obj->m_baseColor, channelID, col, op, blend);
+        applyNativeHSVColorToSpriteColor(obj->m_baseColor, col, op, blend);
     }
     if constexpr (requires { obj->m_detailColor; }) {
-        configureGJSpriteColor(obj->m_detailColor, channelID, col, op, blend);
+        applyNativeHSVColorToSpriteColor(obj->m_detailColor, col, op, blend);
     }
 
-    enforceVisualColorOnNode(obj, col, op, blend);
-    g_liveColoredObjects.push_back(LiveColoredNode{ obj, col, op, blend });
+    applyDirectSpriteVisuals(obj, col, op, blend);
 }
 
 // ============================================================================
-// Автоматический поиск первого незаполненного слоя редактора (Editor Layer)
+// Чтение реальных ID готовых объектов прямо из вкладок редактора (Фото 2, 3, 4, 5, 6)
+// ============================================================================
+struct EditorTabCatalog {
+    // Фото 2 (Вкладка 4 — 3D блоки и линии, страница 2 и 0)
+    int id3DTrapTop    = 211;
+    int id3DHalfStrip  = 211;
+    int id3DMedRect    = 211;
+    int id3DSmallSq    = 211;
+    int id3DLCorner    = 211;
+    int id3DTriCorner  = 211;
+    int id3DBrickTrap  = 211;
+    int id3DBrickStrip = 211;
+    int id3DLineRight  = 211;
+    int id3DLineTop    = 211;
+
+    // Фото 3 (Вкладка 9 — Декор/Эмблемы, страница 10)
+    int idBone        = 211;
+    int idLeaf        = 211;
+    int idChainLink   = 211;
+    int idHeart       = 211;
+    int idCrossCircle = 211;
+    int idHashtag     = 211;
+    int idLightning   = 211;
+    int idGhost       = 211;
+    int idSkull       = 211;
+    int idKey         = 211;
+    int idEye         = 211;
+    int idSwirl       = 211;
+
+    // Фото 4 (Вкладка 10 — Полосы, квадратики и скобы, страница 8)
+    int idDiagDouble1    = 211;
+    int idDiagDouble2    = 211;
+    int idDiagThick      = 211;
+    int idDiagThin       = 211;
+    int idHollowSquare   = 211;
+    int idParallelLines  = 211;
+    int idBracketCorner  = 211;
+    int idBracketArch    = 211;
+    int idBracketT       = 211;
+    int idBracketCross   = 211;
+    int idSlashTickSmall = 211;
+    int idSlashTickWide  = 211;
+
+    // Фото 5 (Вкладка 10 — Тонкие линии, точки, дуги, крестики, страница 10)
+    int idDoubleDots    = 211;
+    int idThinLineLong  = 211;
+    int idGradLine      = 211;
+    int idThinLineShort = 211;
+    int idArcThin       = 211;
+    int idCircleDot     = 211;
+    int idSmallCross    = 211;
+    int idSmallTriangle = 211;
+    int idShortDash     = 211;
+    int idChevron       = 211;
+    int idArcThickLarge = 211;
+    int idArcThickSmall = 211;
+
+    // Фото 6 (Вкладка 10 — Разные виды неона/глоу, включая мелкий контурный неон, страница 0)
+    int idGlowEdgeFull  = 1888;
+    int idGlowEdgeSmall = 1888;
+    int idGlowCorner    = 1888;
+    int idGlowCircle    = 1888;
+};
+
+template <typename EditorUIT>
+static int readButtonObjectIDFromTab(EditorUIT* ui, int tabIndex, int pageIndex, int slotIndex, int fallbackID) {
+    if (!ui) return fallbackID;
+    if constexpr (requires { ui->m_createButtonBars; }) {
+        CCArray* bars = ui->m_createButtonBars;
+        if (!bars || tabIndex < 0 || tabIndex >= static_cast<int>(bars->count())) return fallbackID;
+        auto* bar = static_cast<EditButtonBar*>(bars->objectAtIndex(tabIndex));
+        if (!bar) return fallbackID;
+        if constexpr (requires { bar->m_buttonArray; }) {
+            CCArray* btns = bar->m_buttonArray;
+            if (!btns || btns->count() == 0) return fallbackID;
+            int idx = pageIndex * 12 + slotIndex;
+            if (idx < 0 || idx >= static_cast<int>(btns->count())) return fallbackID;
+            auto* item = static_cast<CreateMenuItem*>(btns->objectAtIndex(idx));
+            if (!item) return fallbackID;
+            if constexpr (requires { item->m_objectID; }) {
+                int objID = static_cast<int>(item->m_objectID);
+                if (objID > 0) return objID;
+            }
+        }
+    }
+    return fallbackID;
+}
+
+static EditorTabCatalog loadEditorTabCatalog(EditorUI* ui) {
+    EditorTabCatalog cat;
+    if (!ui) return cat;
+
+    // Фото 2: Вкладка 4 (5-я слева — 3D), страница 2 (3-я точка снизу) и страница 0
+    cat.id3DLineTop    = readButtonObjectIDFromTab(ui, 4, 0, 1, 211);
+    cat.id3DLineRight  = readButtonObjectIDFromTab(ui, 4, 0, 2, 211);
+    cat.id3DTrapTop    = readButtonObjectIDFromTab(ui, 4, 2, 0, 211);
+    cat.id3DHalfStrip  = readButtonObjectIDFromTab(ui, 4, 2, 1, 211);
+    cat.id3DMedRect    = readButtonObjectIDFromTab(ui, 4, 2, 2, 211);
+    cat.id3DSmallSq    = readButtonObjectIDFromTab(ui, 4, 2, 3, 211);
+    cat.id3DLCorner    = readButtonObjectIDFromTab(ui, 4, 2, 4, 211);
+    cat.id3DTriCorner  = readButtonObjectIDFromTab(ui, 4, 2, 5, 211);
+    cat.id3DBrickTrap  = readButtonObjectIDFromTab(ui, 4, 2, 9, 211);
+    cat.id3DBrickStrip = readButtonObjectIDFromTab(ui, 4, 2, 10, 211);
+
+    // Фото 3: Вкладка 9 (10-я слева — Шестиугольник/Декор), страница 10 (11-я точка снизу)
+    cat.idBone        = readButtonObjectIDFromTab(ui, 9, 10, 0, 211);
+    cat.idLeaf        = readButtonObjectIDFromTab(ui, 9, 10, 1, 211);
+    cat.idChainLink   = readButtonObjectIDFromTab(ui, 9, 10, 2, 211);
+    cat.idHeart       = readButtonObjectIDFromTab(ui, 9, 10, 3, 211);
+    cat.idCrossCircle = readButtonObjectIDFromTab(ui, 9, 10, 4, 211);
+    cat.idHashtag     = readButtonObjectIDFromTab(ui, 9, 10, 5, 211);
+    cat.idLightning   = readButtonObjectIDFromTab(ui, 9, 10, 6, 211);
+    cat.idGhost       = readButtonObjectIDFromTab(ui, 9, 10, 7, 211);
+    cat.idSkull       = readButtonObjectIDFromTab(ui, 9, 10, 8, 211);
+    cat.idKey         = readButtonObjectIDFromTab(ui, 9, 10, 9, 211);
+    cat.idEye         = readButtonObjectIDFromTab(ui, 9, 10, 10, 211);
+    cat.idSwirl       = readButtonObjectIDFromTab(ui, 9, 10, 11, 211);
+
+    // Фото 4: Вкладка 10 (11-я слева — Трава/Глоу/Детали), страница 8 (9-я точка снизу)
+    cat.idDiagDouble1    = readButtonObjectIDFromTab(ui, 10, 8, 0, 503);
+    cat.idDiagDouble2    = readButtonObjectIDFromTab(ui, 10, 8, 1, 504);
+    cat.idDiagThick      = readButtonObjectIDFromTab(ui, 10, 8, 2, 505);
+    cat.idDiagThin       = readButtonObjectIDFromTab(ui, 10, 8, 3, 505);
+    cat.idHollowSquare   = readButtonObjectIDFromTab(ui, 10, 8, 4, 211);
+    cat.idParallelLines  = readButtonObjectIDFromTab(ui, 10, 8, 5, 211);
+    cat.idBracketCorner  = readButtonObjectIDFromTab(ui, 10, 8, 6, 211);
+    cat.idBracketArch    = readButtonObjectIDFromTab(ui, 10, 8, 7, 211);
+    cat.idBracketT       = readButtonObjectIDFromTab(ui, 10, 8, 8, 211);
+    cat.idBracketCross   = readButtonObjectIDFromTab(ui, 10, 8, 9, 211);
+    cat.idSlashTickSmall = readButtonObjectIDFromTab(ui, 10, 8, 10, 211);
+    cat.idSlashTickWide  = readButtonObjectIDFromTab(ui, 10, 8, 11, 211);
+
+    // Фото 5: Вкладка 10, страница 10 (11-я точка снизу)
+    cat.idDoubleDots    = readButtonObjectIDFromTab(ui, 10, 10, 0, 211);
+    cat.idThinLineLong  = readButtonObjectIDFromTab(ui, 10, 10, 1, 211);
+    cat.idGradLine      = readButtonObjectIDFromTab(ui, 10, 10, 2, 211);
+    cat.idThinLineShort = readButtonObjectIDFromTab(ui, 10, 10, 3, 211);
+    cat.idArcThin       = readButtonObjectIDFromTab(ui, 10, 10, 4, 211);
+    cat.idCircleDot     = readButtonObjectIDFromTab(ui, 10, 10, 5, 211);
+    cat.idSmallCross    = readButtonObjectIDFromTab(ui, 10, 10, 6, 211);
+    cat.idSmallTriangle = readButtonObjectIDFromTab(ui, 10, 10, 7, 211);
+    cat.idShortDash     = readButtonObjectIDFromTab(ui, 10, 10, 8, 211);
+    cat.idChevron       = readButtonObjectIDFromTab(ui, 10, 10, 9, 211);
+    cat.idArcThickLarge = readButtonObjectIDFromTab(ui, 10, 10, 10, 211);
+    cat.idArcThickSmall = readButtonObjectIDFromTab(ui, 10, 10, 11, 211);
+
+    // Фото 6: Вкладка 10, страница 0 (разные виды глоу, включая мелкий контурный неон)
+    cat.idGlowEdgeFull  = readButtonObjectIDFromTab(ui, 10, 0, 1, 1888);
+    cat.idGlowCorner    = readButtonObjectIDFromTab(ui, 10, 0, 2, 1888);
+    cat.idGlowEdgeSmall = readButtonObjectIDFromTab(ui, 10, 0, 4, 1888);
+    cat.idGlowCircle    = 1888;
+
+    return cat;
+}
+
+// ============================================================================
+// Автоматический поиск первого незаполненного блока слоев (Editor Layer)
 // ============================================================================
 template <typename EditorLayerT>
 static int findFirstFreeEditorLayerBlock(EditorLayerT* editorLayer, int neededConsecutive = 4) {
@@ -374,7 +481,7 @@ static int findFirstFreeEditorLayerBlock(EditorLayerT* editorLayer, int neededCo
 }
 
 // ============================================================================
-// Определение цветовой палитры по стилю, промпту и выделенным блокам
+// Генерация НОВОЙ цветовой палитры при каждой генерации (с единым цветом на слот)
 // ============================================================================
 static std::string toLowerASCII(std::string s) {
     for (char& c : s) {
@@ -399,65 +506,96 @@ static ccColor3B mixTowardWhite(ccColor3B c, float whiteMix) {
     };
 }
 
-static StylePalette buildCohesivePalette(
+static StylePalette buildDynamicPalette(
     DecorStyle style,
     std::string const& rawPrompt,
     ContourAnalysis const& contour,
-    int baseChannelStart = 900
+    std::mt19937& rng
 ) {
     StylePalette pal;
     std::string p = toLowerASCII(rawPrompt);
 
-    // 1. Базовый цвет по выбранному стилю
-    switch (style) {
-        case DecorStyle::Neon:
-            pal.masterColor = ccColor3B{ 115, 255, 25 }; // Яркий кислотно-зеленый неон как на референсах
-            break;
-        case DecorStyle::Modern:
-            pal.masterColor = ccColor3B{ 45, 215, 255 }; // Чистый голубой модерн
-            break;
-        case DecorStyle::Hell:
-            pal.masterColor = ccColor3B{ 255, 48, 22 };  // Адский красно-огненный
-            break;
-        case DecorStyle::Reality:
-            pal.masterColor = ccColor3B{ 50, 230, 115 }; // Изумрудно-природный
-            break;
-    }
-
-    // 2. Если у выделенных объектов уже был свой цвет — отталкиваемся от него
-    if (contour.hasCustomSelectionColor) {
-        pal.masterColor = contour.selectionColor;
-    }
-
-    // 3. Если пользователь явно указал цвет в промпте — приоритет промпту
-    if (p.find("green") != std::string::npos || p.find("зелен") != std::string::npos || p.find("лайм") != std::string::npos) {
-        pal.masterColor = ccColor3B{ 115, 255, 25 };
-    } else if (p.find("cyan") != std::string::npos || p.find("голуб") != std::string::npos || p.find("бирюз") != std::string::npos) {
-        pal.masterColor = ccColor3B{ 35, 240, 255 };
-    } else if (p.find("blue") != std::string::npos || p.find("син") != std::string::npos) {
-        pal.masterColor = ccColor3B{ 55, 135, 255 };
-    } else if (p.find("purple") != std::string::npos || p.find("фиолет") != std::string::npos || p.find("пурпур") != std::string::npos) {
-        pal.masterColor = ccColor3B{ 185, 65, 255 };
-    } else if (p.find("pink") != std::string::npos || p.find("розов") != std::string::npos || p.find("маджент") != std::string::npos) {
-        pal.masterColor = ccColor3B{ 255, 65, 185 };
-    } else if (p.find("red") != std::string::npos || p.find("красн") != std::string::npos || p.find("алый") != std::string::npos) {
-        pal.masterColor = ccColor3B{ 255, 42, 32 };
-    } else if (p.find("orange") != std::string::npos || p.find("оранж") != std::string::npos) {
-        pal.masterColor = ccColor3B{ 255, 140, 25 };
-    } else if (p.find("yellow") != std::string::npos || p.find("желт") != std::string::npos || p.find("золот") != std::string::npos) {
-        pal.masterColor = ccColor3B{ 255, 235, 35 };
-    }
-
-    // 4. Строим 6 фиксированных градаций от темного к светлому (один слот = один цвет)
-    pal.slotColors[static_cast<int>(ColorSlot::DarkFill)] = ccColor3B{
-        static_cast<GLubyte>(std::clamp(pal.masterColor.r * 0.08f + 4.f, 4.f, 28.f)),
-        static_cast<GLubyte>(std::clamp(pal.masterColor.g * 0.09f + 6.f, 6.f, 34.f)),
-        static_cast<GLubyte>(std::clamp(pal.masterColor.b * 0.08f + 4.f, 4.f, 28.f))
+    // Наборы разнообразных сочных цветов для каждого стиля (чтобы каждая генерация меняла цвет!)
+    ccColor3B const neonPresets[8] = {
+        { 110, 255,  25 }, // Ядовито-лаймовый неон
+        {  25, 245, 255 }, // Электрический циан
+        { 255,  35, 175 }, // Неоновая фуксия/розовый
+        { 165,  55, 255 }, // Ультрафиолет
+        { 255, 230,  25 }, // Кибер-желтый
+        {  35, 255, 145 }, // Кислотно-мятный
+        { 255,  95,  25 }, // Неоново-оранжевый
+        {  55, 130, 255 }  // Лазерно-синий
     };
-    pal.slotColors[static_cast<int>(ColorSlot::Dark3D)]           = scaleRGB(pal.masterColor, 0.25f);
-    pal.slotColors[static_cast<int>(ColorSlot::MidTone)]          = scaleRGB(pal.masterColor, 0.58f);
+    ccColor3B const modernPresets[6] = {
+        {  45, 215, 255 }, // Чистый лазурный
+        { 255, 105,  95 }, // Пастельно-коралловый
+        {  85, 235, 175 }, // Мятный модерн
+        { 140, 110, 255 }, // Индиго
+        { 255, 195,  55 }, // Янтарный
+        { 245,  95, 185 }  // Розовый кварц
+    };
+    ccColor3B const hellPresets[6] = {
+        { 255,  42,  22 }, // Кроваво-алый
+        { 255, 115,  15 }, // Лавово-оранжевый
+        { 235,  20,  95 }, // Багрово-пурпурный
+        { 255, 175,  25 }, // Серно-огненный
+        { 210,  25,  25 }, // Темный рубин
+        { 255,  65,  55 }  // Адское пламя
+    };
+    ccColor3B const realityPresets[6] = {
+        {  50, 235, 115 }, // Изумрудный лес
+        {  40, 215, 195 }, // Биолюминесцентная бирюза
+        { 145, 235,  45 }, // Солнечный мох
+        {  75, 185, 255 }, // Горный ледник
+        { 245, 165,  45 }, // Золотая осень
+        { 115, 245, 165 }  // Нефрит
+    };
+
+    // Выбираем новый случайный цвет, гарантированно отличный от прошлой генерации
+    int poolSize = (style == DecorStyle::Neon) ? 8 : 6;
+    std::uniform_int_distribution<int> dist(0, poolSize - 1);
+    int chosenIdx = dist(rng);
+    if (chosenIdx == g_lastColorIndex) {
+        chosenIdx = (chosenIdx + 1 + (dist(rng) % (poolSize - 1))) % poolSize;
+    }
+    g_lastColorIndex = chosenIdx;
+
+    switch (style) {
+        case DecorStyle::Neon:    pal.masterColor = neonPresets[chosenIdx]; break;
+        case DecorStyle::Modern:  pal.masterColor = modernPresets[chosenIdx]; break;
+        case DecorStyle::Hell:    pal.masterColor = hellPresets[chosenIdx]; break;
+        case DecorStyle::Reality: pal.masterColor = realityPresets[chosenIdx]; break;
+    }
+
+    // Если пользователь явно написал желаемый цвет в промпте — берем его
+    if (p.find("green") != std::string::npos || p.find("зелен") != std::string::npos || p.find("лайм") != std::string::npos) {
+        pal.masterColor = ccColor3B{ 110, 255, 25 };
+    } else if (p.find("cyan") != std::string::npos || p.find("голуб") != std::string::npos || p.find("бирюз") != std::string::npos) {
+        pal.masterColor = ccColor3B{ 25, 245, 255 };
+    } else if (p.find("blue") != std::string::npos || p.find("син") != std::string::npos) {
+        pal.masterColor = ccColor3B{ 55, 130, 255 };
+    } else if (p.find("purple") != std::string::npos || p.find("фиолет") != std::string::npos || p.find("пурпур") != std::string::npos) {
+        pal.masterColor = ccColor3B{ 170, 55, 255 };
+    } else if (p.find("pink") != std::string::npos || p.find("розов") != std::string::npos) {
+        pal.masterColor = ccColor3B{ 255, 45, 180 };
+    } else if (p.find("red") != std::string::npos || p.find("красн") != std::string::npos || p.find("алый") != std::string::npos) {
+        pal.masterColor = ccColor3B{ 255, 40, 30 };
+    } else if (p.find("orange") != std::string::npos || p.find("оранж") != std::string::npos) {
+        pal.masterColor = ccColor3B{ 255, 135, 20 };
+    } else if (p.find("yellow") != std::string::npos || p.find("желт") != std::string::npos || p.find("золот") != std::string::npos) {
+        pal.masterColor = ccColor3B{ 255, 230, 30 };
+    }
+
+    // 6 гармоничных ступеней яркости от темной подложки до яркого неона
+    pal.slotColors[static_cast<int>(ColorSlot::DarkFill)] = ccColor3B{
+        static_cast<GLubyte>(std::clamp(pal.masterColor.r * 0.14f + 6.f, 8.f, 45.f)),
+        static_cast<GLubyte>(std::clamp(pal.masterColor.g * 0.14f + 6.f, 8.f, 45.f)),
+        static_cast<GLubyte>(std::clamp(pal.masterColor.b * 0.14f + 6.f, 8.f, 45.f))
+    };
+    pal.slotColors[static_cast<int>(ColorSlot::Dark3D)]           = scaleRGB(pal.masterColor, 0.34f);
+    pal.slotColors[static_cast<int>(ColorSlot::MidTone)]          = scaleRGB(pal.masterColor, 0.64f);
     pal.slotColors[static_cast<int>(ColorSlot::BrightMain)]       = pal.masterColor;
-    pal.slotColors[static_cast<int>(ColorSlot::HighlightOutline)] = mixTowardWhite(pal.masterColor, 0.58f);
+    pal.slotColors[static_cast<int>(ColorSlot::HighlightOutline)] = mixTowardWhite(pal.masterColor, 0.52f);
     pal.slotColors[static_cast<int>(ColorSlot::AdditiveGlow)]     = pal.masterColor;
 
     pal.slotOpacity[static_cast<int>(ColorSlot::DarkFill)]         = 255;
@@ -465,18 +603,17 @@ static StylePalette buildCohesivePalette(
     pal.slotOpacity[static_cast<int>(ColorSlot::MidTone)]          = 255;
     pal.slotOpacity[static_cast<int>(ColorSlot::BrightMain)]       = 255;
     pal.slotOpacity[static_cast<int>(ColorSlot::HighlightOutline)] = 255;
-    pal.slotOpacity[static_cast<int>(ColorSlot::AdditiveGlow)]     = 68;
+    pal.slotOpacity[static_cast<int>(ColorSlot::AdditiveGlow)]     = 115;
 
     for (int i = 0; i < 6; ++i) {
         pal.slotBlending[i] = (i == static_cast<int>(ColorSlot::AdditiveGlow));
-        pal.slotChannelID[i] = baseChannelStart + i;
     }
 
     return pal;
 }
 
 // ============================================================================
-// Точное считывание выделенного контура (клетки 30x30 + шипы)
+// Считывание выделенного контура (клетки 30x30 + шипы)
 // ============================================================================
 static bool isSpikeOrHazardObjectID(int id) {
     switch (id) {
@@ -528,7 +665,6 @@ static void fillEnclosedInteriorCells(std::set<std::pair<int, int>>& cells) {
         }
     }
 
-    // Любая клетка внутри замкнутого контура, не достижимая снаружи, является внутренней частью постройки
     for (int gx = minGX; gx <= maxGX; ++gx) {
         for (int gy = minGY; gy <= maxGY; ++gy) {
             if (!outsideVisited.count({ gx, gy })) {
@@ -554,7 +690,6 @@ static ContourAnalysis analyzeSelectedContour(EditorUI* ui) {
     }
 
     if (rawList.empty()) {
-        // Если ничего не выделено, берем аккуратный контур 3x2 в центре камеры
         if (ui->m_editorLayer && ui->m_editorLayer->m_objectLayer) {
             auto winSize = CCDirector::sharedDirector()->getWinSize();
             CCPoint worldCenter = ui->m_editorLayer->m_objectLayer->convertToNodeSpace(
@@ -572,12 +707,6 @@ static ContourAnalysis analyzeSelectedContour(EditorUI* ui) {
         for (GameObject* obj : rawList) {
             int id = readObjID(obj);
             CCPoint pos = obj->getPosition();
-
-            ccColor3B c = obj->getColor();
-            if ((c.r < 245 || c.g < 245 || c.b < 245) && (c.r > 15 || c.g > 15 || c.b > 15)) {
-                info.hasCustomSelectionColor = true;
-                info.selectionColor = c;
-            }
 
             if (isSpikeOrHazardObjectID(id)) {
                 SelectedSpikeInfo sp;
@@ -630,7 +759,7 @@ static ContourAnalysis analyzeSelectedContour(EditorUI* ui) {
 }
 
 // ============================================================================
-// Разбиение выделенных клеток на связные острова (отдельные блоки, колонны, платформы)
+// Разбиение клеток на связные острова (отдельные кубы, платформы, колонны)
 // ============================================================================
 struct StructureIsland {
     std::set<std::pair<int, int>> cells;
@@ -681,79 +810,79 @@ static std::vector<StructureIsland> extractIslands(std::set<std::pair<int, int>>
 }
 
 // ============================================================================
-// Генератор структуры строго внутри выделенного контура (по референсам пользователя)
+// Процедурный генератор разнообразных конструкций с использованием готовых
+// блоков из редактора (3D, глаз, череп, скобы, дуги, мелкий двусторонний неон)
 // ============================================================================
-static void addRectPiece(
+static void addObjSpec(
     std::vector<GeneratedObjectSpec>& out,
+    int objectId,
     float x, float y,
     float sx, float sy,
     float rot,
     LayerRole role,
     ColorSlot slot,
-    int zOrder
+    int zOrder,
+    int priorityTier = 1,
+    bool flipX = false,
+    bool flipY = false,
+    GLubyte opacity = 255
 ) {
     GeneratedObjectSpec s;
-    s.objectId = 211;
+    s.objectId = (objectId > 0) ? objectId : 211;
     s.x = x;
     s.y = y;
     s.scaleX = sx;
     s.scaleY = sy;
     s.rotation = rot;
+    s.flipX = flipX;
+    s.flipY = flipY;
     s.layerRole = role;
     s.colorSlot = slot;
     s.zOrder = zOrder;
+    s.priorityTier = priorityTier;
+    s.customOpacity = opacity;
     s.noTouch = true;
     s.noGlow = true;
     out.push_back(s);
 }
 
-static void addHollowMicroSquare(
-    std::vector<GeneratedObjectSpec>& out,
-    float x, float y,
-    float outerScale,
-    ColorSlot frameSlot
-) {
-    // Внешний светящийся квадратик (как на референсах колонны и платформ)
-    addRectPiece(out, x, y, outerScale, outerScale, 0.f, LayerRole::InnerDetail, frameSlot, 6);
-    // Темная сердцевина внутри квадратика
-    addRectPiece(out, x, y, outerScale * 0.52f, outerScale * 0.52f, 0.f, LayerRole::InnerDetail, ColorSlot::DarkFill, 7);
-}
-
-static void addEyeEmblemInCell(std::vector<GeneratedObjectSpec>& out, float cx, float cy) {
-    // Ромбовидно-миндалевидный неоновый глаз внутри одиночного блока 1x1 (как на референсе 1)
-    addRectPiece(out, cx, cy, 0.44f, 0.44f, 45.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 5);
-    addRectPiece(out, cx, cy, 0.54f, 0.28f, 0.f,  LayerRole::InnerDetail, ColorSlot::BrightMain, 5);
-    // Темная радужка
-    addRectPiece(out, cx, cy, 0.25f, 0.25f, 45.f, LayerRole::InnerDetail, ColorSlot::DarkFill, 6);
-    // Два вертикальных светящихся зрачка-точки внутри глаза (точно как на скриншоте!)
-    addRectPiece(out, cx, cy + 2.3f, 0.07f, 0.07f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 7);
-    addRectPiece(out, cx, cy - 2.3f, 0.07f, 0.07f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 7);
-}
-
-static void addSkullEmblemInCell(std::vector<GeneratedObjectSpec>& out, float cx, float cy) {
-    // Пиксельно-геометрический неоновый череп в правом верхнем углу платформы (как на референсе 1)
-    addRectPiece(out, cx,        cy + 1.5f, 0.42f, 0.28f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6);
-    addRectPiece(out, cx,        cy + 5.2f, 0.30f, 0.14f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6);
-    addRectPiece(out, cx - 0.8f, cy - 4.0f, 0.24f, 0.14f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6);
-    // Глазницы и носовая впадина
-    addRectPiece(out, cx - 3.2f, cy + 1.2f, 0.10f, 0.10f, 0.f, LayerRole::InnerDetail, ColorSlot::DarkFill, 7);
-    addRectPiece(out, cx + 2.8f, cy + 1.2f, 0.10f, 0.10f, 0.f, LayerRole::InnerDetail, ColorSlot::DarkFill, 7);
-    addRectPiece(out, cx - 0.2f, cy - 1.8f, 0.06f, 0.08f, 0.f, LayerRole::InnerDetail, ColorSlot::DarkFill, 7);
-}
-
-static std::vector<GeneratedObjectSpec> generateContourAwareDecor(
+static std::vector<GeneratedObjectSpec> generateVariedContourDecor(
     ContourAnalysis const& contour,
+    EditorTabCatalog const& cat,
     DecorStyle style,
-    int averageTargetCount,
-    std::string const& rawPrompt
+    int targetCount,
+    std::string const& rawPrompt,
+    std::mt19937& rng
 ) {
-    std::vector<GeneratedObjectSpec> result;
+    std::vector<GeneratedObjectSpec> candidates;
     std::string p = toLowerASCII(rawPrompt);
 
-    // Коэффициент детализации от среднего значения (по умолчанию 80 = 1.0x)
-    float densityFactor = std::clamp(static_cast<float>(averageTargetCount) / 80.f, 0.45f, 2.2f);
-    bool wantGrass = (style == DecorStyle::Neon || style == DecorStyle::Reality || p.find("трав") != std::string::npos || p.find("grass") != std::string::npos);
-    bool want3D = (p.find("no 3d") == std::string::npos && p.find("без 3д") == std::string::npos);
+    // Выбираем новый архитектурный архетип (0..4), отличный от прошлой генерации
+    std::uniform_int_distribution<int> archDist(0, 4);
+    int archetype = archDist(rng);
+    if (archetype == g_lastArchetypeIndex) {
+        archetype = (archetype + 1 + (archDist(rng) % 4)) % 5;
+    }
+    g_lastArchetypeIndex = archetype;
+
+    // Режим мелкого контура неона (Фото 6):
+    // 0 = снаружи мелкий неон + мягкое свечение
+    // 1 = ДВУСТОРОННИЙ мелкий неон (и снаружи, и внутри контура!)
+    // 2 = внутри мелкий неон + снаружи угловой/градиентный неон
+    std::uniform_int_distribution<int> neonModeDist(0, 2);
+    int neonBorderMode = neonModeDist(rng);
+
+    // Случайный выбор готовых эмблем из Фото 3 (глаз, череп, вихрь, ключ, сердце, молния, призрак, перекрестие)
+    int const emblemPool[8] = {
+        cat.idEye, cat.idSkull, cat.idSwirl, cat.idKey,
+        cat.idLightning, cat.idCrossCircle, cat.idHeart, cat.idGhost
+    };
+    std::uniform_int_distribution<int> embDist(0, 7);
+    int primaryEmblemID = (style == DecorStyle::Hell) ? cat.idSkull : cat.idEye;
+    int secondaryEmblemID = emblemPool[embDist(rng)];
+    if (rng() % 2 == 0) {
+        primaryEmblemID = emblemPool[embDist(rng)];
+    }
 
     auto islands = extractIslands(contour.occupiedCells);
 
@@ -761,6 +890,9 @@ static std::vector<GeneratedObjectSpec> generateContourAwareDecor(
         int cols = isl.cols();
         int rows = isl.rows();
         bool isSingleCube = (isl.cells.size() == 1);
+
+        // Для каждого острова можно слегка варьировать под-стиль
+        int islArch = (archetype + (isl.minGX & 3)) % 5;
 
         for (auto const& [gx, gy] : isl.cells) {
             float cx = gx * 30.f + 15.f;
@@ -775,224 +907,266 @@ static std::vector<GeneratedObjectSpec> generateContourAwareDecor(
             int localRow = gy - isl.minGY;
 
             // ================================================================
-            // 1. Слой +0 (Fill): Темное контрастное заполнение строго в клетке
+            // Слой +0 (Fill, Tier 0): Темное контрастное заполнение внутри клетки
             // ================================================================
-            addRectPiece(result, cx, cy, 1.00f, 1.00f, 0.f, LayerRole::Fill, ColorSlot::DarkFill, 1);
+            addObjSpec(candidates, 211, cx, cy, 1.00f, 1.00f, 0.f, LayerRole::Fill, ColorSlot::DarkFill, 1, 0);
+
+            // Внутренняя подложка средней темноты (меняет форму по архетипу)
+            if (islArch == 0 || islArch == 3) {
+                addObjSpec(candidates, 211, cx, cy, 0.82f, 0.82f, 0.f, LayerRole::Fill, ColorSlot::Dark3D, 2, 1);
+                addObjSpec(candidates, 211, cx, cy, 0.70f, 0.70f, 0.f, LayerRole::Fill, ColorSlot::DarkFill, 3, 1);
+            } else if (islArch == 1) {
+                // Шахматные/решетчатые тех-секции
+                addObjSpec(candidates, cat.idHashtag, cx, cy, 0.85f, 0.85f, 0.f, LayerRole::Fill, ColorSlot::Dark3D, 2, 1);
+            } else if (islArch == 2) {
+                // Ромбовидная темная подложка
+                addObjSpec(candidates, 211, cx, cy, 0.62f, 0.62f, 45.f, LayerRole::Fill, ColorSlot::Dark3D, 2, 1);
+            }
 
             // ================================================================
-            // 2. Слой +1 (InnerDetail): Внутренняя геометрия по референсам
+            // Слой +1 (InnerDetail): Готовые декор-блоки из Фото 3, 4, 5
             // ================================================================
             if (isSingleCube) {
-                // Одиночный блок 1x1: внутренний контур + 4 угловых микро-квадрата + глаз в центре
-                addRectPiece(result, cx, cy, 0.84f, 0.84f, 0.f, LayerRole::InnerDetail, ColorSlot::Dark3D, 2);
-                addRectPiece(result, cx, cy, 0.74f, 0.74f, 0.f, LayerRole::InnerDetail, ColorSlot::DarkFill, 3);
+                // Одиночный куб 1x1: готовый глаз/эмблема из Фото 3 + угловые детали из Фото 4 и 5
+                int cubeEmblem = (rng() % 3 == 0) ? secondaryEmblemID : cat.idEye;
+                addObjSpec(candidates, cubeEmblem, cx, cy, 0.82f, 0.82f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6, 1);
 
-                if (densityFactor >= 0.65f) {
-                    addHollowMicroSquare(result, cx - 8.2f, cy + 8.2f, 0.15f, ColorSlot::MidTone);
-                    addHollowMicroSquare(result, cx + 8.2f, cy + 8.2f, 0.15f, ColorSlot::MidTone);
-                    addHollowMicroSquare(result, cx - 8.2f, cy - 8.2f, 0.15f, ColorSlot::MidTone);
-                    addHollowMicroSquare(result, cx + 8.2f, cy - 8.2f, 0.15f, ColorSlot::MidTone);
+                // Готовые полые квадратики 回 (Фото 4, слот 4) или скобы ╔ (Фото 4, слот 6) по углам
+                bool useBrackets = (rng() % 2 == 0);
+                float const offsX[4] = { -8.5f,  8.5f, -8.5f,  8.5f };
+                float const offsY[4] = {  8.5f,  8.5f, -8.5f, -8.5f };
+                float const rots[4]  = {  0.f,  90.f, 270.f, 180.f };
+                for (int cIdx = 0; cIdx < 4; ++cIdx) {
+                    if (useBrackets) {
+                        addObjSpec(candidates, cat.idBracketCorner, cx + offsX[cIdx], cy + offsY[cIdx], 0.52f, 0.52f, rots[cIdx], LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 2);
+                    } else {
+                        addObjSpec(candidates, cat.idHollowSquare, cx + offsX[cIdx], cy + offsY[cIdx], 0.65f, 0.65f, 0.f, LayerRole::InnerDetail, ColorSlot::MidTone, 6, 2);
+                    }
                 }
-                addEyeEmblemInCell(result, cx, cy);
+
+                // Двойной диагональный блик // из Фото 4
+                addObjSpec(candidates, cat.idDiagDouble1, cx - 3.f, cy + 3.f, 0.65f, 0.65f, 0.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 7, 3);
             } else {
-                // Многоклеточная структура (платформа 3x2 или высокая колонна 3x5 как на референсе 2)
-                // Вертикальные тех-стойки внутри каждой клетки
-                addRectPiece(result, cx - 10.5f, cy, 0.10f, 0.98f, 0.f, LayerRole::InnerDetail, ColorSlot::Dark3D, 2);
-                addRectPiece(result, cx + 10.5f, cy, 0.10f, 0.98f, 0.f, LayerRole::InnerDetail, ColorSlot::Dark3D, 2);
-
-                if (densityFactor >= 0.75f) {
-                    // Горизонтальные внутренние перемычки
-                    addRectPiece(result, cx, cy, 0.72f, 0.06f, 0.f, LayerRole::InnerDetail, ColorSlot::Dark3D, 2);
-                }
-
-                // Верхняя светящаяся шапка-полоса вдоль открытого верха структуры
+                // Многоклеточная конструкция: 5 разных процедурных архетипов!
                 if (topOpen) {
-                    addRectPiece(result, cx, cy + 10.2f, 0.96f, 0.28f, 0.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4);
-                    addRectPiece(result, cx, cy + 11.0f, 0.86f, 0.14f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 5);
-                    if ( localCol > 0 ) {
-                        addRectPiece(result, cx - 14.5f, cy + 10.2f, 0.06f, 0.28f, 0.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6);
+                    // Верхняя светящаяся полоса-шапка (использует готовые полу-блоки и градиентные линии)
+                    addObjSpec(candidates, cat.id3DHalfStrip, cx, cy + 9.5f, 0.96f, 0.45f, 0.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1);
+                    addObjSpec(candidates, cat.idGradLine,    cx, cy + 12.0f, 0.95f, 1.0f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 5, 1);
+                }
+
+                if (islArch == 0) {
+                    // Архетип 0: Концентрические арки ∏ (Фото 4), диагональные блики // и готовый череп/глаз (Фото 3)
+                    addObjSpec(candidates, cat.idParallelLines, cx, cy, 0.90f, 0.95f, 90.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1);
+                    if (topOpen) {
+                        addObjSpec(candidates, cat.idBracketArch, cx, cy - 2.f, 0.90f, 0.90f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 5, 1);
+                    }
+                    if (localCol == 0 && localRow == rows - 1) {
+                        addObjSpec(candidates, cat.idDiagDouble1, cx, cy, 0.88f, 0.88f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6, 1);
+                    }
+                    if (localCol == cols - 1 && localRow == rows - 1) {
+                        addObjSpec(candidates, cat.idSkull, cx, cy - 1.5f, 0.78f, 0.78f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6, 1);
+                    }
+                    // Готовые полые квадратики 回 (Фото 4)
+                    addObjSpec(candidates, cat.idHollowSquare, cx - 7.f, cy - 2.f, 0.75f, 0.75f, 0.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 2);
+                    addObjSpec(candidates, cat.idHollowSquare, cx + 7.f, cy + 3.f, 0.75f, 0.75f, 0.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 3);
+                }
+                else if (islArch == 1) {
+                    // Архетип 1: Кибер-решетка с перекрестиями ╬, Т-скобами ╩ (Фото 4), точками •. и крестиками × (Фото 5)
+                    addObjSpec(candidates, cat.idBracketCross, cx, cy, 0.85f, 0.85f, 0.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1);
+                    if ((localCol + localRow) % 2 == 0) {
+                        addObjSpec(candidates, primaryEmblemID, cx, cy, 0.68f, 0.68f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6, 1);
+                    } else {
+                        addObjSpec(candidates, cat.idSmallCross, cx - 6.f, cy + 6.f, 0.75f, 0.75f, 0.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 2);
+                        addObjSpec(candidates, cat.idSmallCross, cx + 6.f, cy - 6.f, 0.75f, 0.75f, 0.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 2);
+                        addObjSpec(candidates, cat.idDoubleDots, cx + 6.f, cy + 6.f, 0.80f, 0.80f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6, 3);
+                    }
+                    if (bottomOpen) {
+                        addObjSpec(candidates, cat.idBracketT, cx, cy - 6.f, 0.85f, 0.85f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 5, 2);
                     }
                 }
+                else if (islArch == 2) {
+                    // Архетип 2: Дуговой реактор из готовых дуг ╭, кругов ●, шевронов > и треугольников ▲ (Фото 5)
+                    float arcRot = static_cast<float>(((localCol + localRow * 2) % 4) * 90);
+                    addObjSpec(candidates, cat.idArcThickLarge, cx, cy, 0.88f, 0.88f, arcRot, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1);
+                    addObjSpec(candidates, cat.idArcThin,       cx, cy, 0.65f, 0.65f, arcRot + 180.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 5, 2);
 
-                // Диагональные блики 45° в левой верхней части структуры (как на референсе 1 и 2)
-                if (localCol == 0 && localRow == rows - 1) {
-                    addRectPiece(result, cx - 1.5f, cy + 1.5f, 0.68f, 0.14f, 45.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 5);
-                    if (densityFactor >= 0.8f) {
-                        addRectPiece(result, cx + 4.5f, cy - 4.5f, 0.48f, 0.06f, 45.f, LayerRole::InnerDetail, ColorSlot::MidTone, 5);
+                    if (localCol == cols / 2 && localRow == rows / 2) {
+                        addObjSpec(candidates, cat.idEye, cx, cy, 0.85f, 0.85f, 0.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 7, 1);
+                    } else {
+                        addObjSpec(candidates, cat.idCircleDot, cx, cy, 0.55f, 0.55f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6, 2);
                     }
+                    addObjSpec(candidates, cat.idChevron, cx - 7.f, cy, 0.65f, 0.65f, 0.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 3);
+                    addObjSpec(candidates, cat.idChevron, cx + 7.f, cy, 0.65f, 0.65f, 180.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 3);
+                }
+                else if (islArch == 3) {
+                    // Архетип 3: Цепи 8 (Фото 3), диагональные лучи / (Фото 4) и угловые скобы ╔
+                    addObjSpec(candidates, cat.idDiagThick, cx, cy, 0.88f, 0.88f, (localCol % 2 == 0) ? 0.f : 90.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1);
+                    addObjSpec(candidates, cat.idChainLink, cx, cy, 0.72f, 0.72f, (rows > cols) ? 90.f : 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 5, 1);
+                    addObjSpec(candidates, cat.idBracketCorner, cx - 7.5f, cy + 7.5f, 0.65f, 0.65f, 0.f,   LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 2);
+                    addObjSpec(candidates, cat.idBracketCorner, cx + 7.5f, cy - 7.5f, 0.65f, 0.65f, 180.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 2);
+                    addObjSpec(candidates, cat.idSlashTickSmall, cx + 6.f, cy + 6.f, 0.75f, 0.75f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6, 3);
+                }
+                else {
+                    // Архетип 4: Кирпично-неоновый храм с готовыми эмблемами (череп, глаз, кость, молния, вихрь из Фото 3)
+                    addObjSpec(candidates, cat.id3DBrickStrip, cx, cy + 5.f, 0.90f, 0.85f, 0.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1);
+                    addObjSpec(candidates, cat.id3DBrickStrip, cx, cy - 5.f, 0.90f, 0.85f, 0.f, LayerRole::InnerDetail, ColorSlot::Dark3D, 3, 2);
+
+                    int cellEmb = ((localCol + localRow) % 2 == 0) ? primaryEmblemID : secondaryEmblemID;
+                    addObjSpec(candidates, cellEmb, cx, cy, 0.75f, 0.75f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6, 1);
+                    addObjSpec(candidates, cat.idSmallTriangle, cx - 8.f, cy - 8.f, 0.60f, 0.60f, 0.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 3);
+                    addObjSpec(candidates, cat.idSmallTriangle, cx + 8.f, cy - 8.f, 0.60f, 0.60f, 0.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 3);
                 }
 
-                // Концентрическая внутренняя арка в центральной части колонны/платформы
-                bool isCenterCol = (cols >= 3 && localCol == cols / 2) || (cols == 2 && (localCol == 0 || localCol == 1));
-                if (isCenterCol && localRow < rows) {
-                    // Стенки внутренней арки
-                    addRectPiece(result, cx - 6.5f, cy, 0.14f, 0.98f, 0.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4);
-                    addRectPiece(result, cx + 6.5f, cy, 0.14f, 0.98f, 0.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4);
-                    addRectPiece(result, cx - 4.5f, cy, 0.05f, 0.98f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 5);
-                    addRectPiece(result, cx + 4.5f, cy, 0.05f, 0.98f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 5);
-
-                    // Свод внутренней арки со скошенными углами 45° (точно как на референсе 2!)
-                    if (localRow == rows - 1) {
-                        addRectPiece(result, cx,        cy + 4.5f, 0.46f, 0.10f, 0.f,   LayerRole::InnerDetail, ColorSlot::BrightMain, 5);
-                        addRectPiece(result, cx - 5.2f, cy + 2.2f, 0.22f, 0.08f, 45.f,  LayerRole::InnerDetail, ColorSlot::BrightMain, 5);
-                        addRectPiece(result, cx + 5.2f, cy + 2.2f, 0.22f, 0.08f, -45.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 5);
-                    } else if (densityFactor >= 0.85f) {
-                        // Внутренний диагональный блик в сердцевине колонны
-                        addRectPiece(result, cx, cy + 3.0f, 0.30f, 0.09f, 45.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 5);
-                    }
-                }
-
-                // Симметричные полые светящиеся микро-квадраты 回 по бокам арки (как на референсе 2)
-                if (densityFactor >= 0.65f && localRow >= (std::max)(0, rows - 3)) {
-                    if (localCol == 0) {
-                        addHollowMicroSquare(result, cx - 6.5f, cy - 2.0f, 0.17f, ColorSlot::HighlightOutline);
-                        if (cols >= 3 && localRow == rows - 2) {
-                            addHollowMicroSquare(result, cx + 6.5f, cy + 4.0f, 0.17f, ColorSlot::HighlightOutline);
-                        }
-                    } else if (localCol == cols - 1) {
-                        addHollowMicroSquare(result, cx + 6.5f, cy - 2.0f, 0.17f, ColorSlot::HighlightOutline);
-                        if (cols >= 3 && localRow == rows - 2) {
-                            addHollowMicroSquare(result, cx - 6.5f, cy + 4.0f, 0.17f, ColorSlot::HighlightOutline);
-                        }
-                    }
-                }
-
-                // Акцентный череп/эмблема в правом верхнем углу широкой платформы (как на референсе 1)
-                if (cols >= 2 && rows >= 2 && localCol == cols - 1 && localRow == rows - 1 && style != DecorStyle::Modern) {
-                    addSkullEmblemInCell(result, cx - 1.5f, cy - 2.5f);
-                }
+                // Дополнительные микро-детали (Tier 3) для высоких значений количества блоков (120..300)
+                addObjSpec(candidates, cat.idShortDash,     cx,        cy + 12.8f, 0.65f, 0.65f, 0.f,  LayerRole::InnerDetail, ColorSlot::HighlightOutline, 7, 3);
+                addObjSpec(candidates, cat.idDoubleDots,    cx - 9.f,  cy - 9.f,   0.70f, 0.70f, 0.f,  LayerRole::InnerDetail, ColorSlot::BrightMain,       7, 3);
+                addObjSpec(candidates, cat.idArcThickSmall, cx + 8.5f, cy + 8.5f,  0.55f, 0.55f, 90.f, LayerRole::InnerDetail, ColorSlot::MidTone,          6, 3);
             }
 
             // ================================================================
-            // 3. Слой +2 (Outline3D): Четкий внешний контур и 3D-объем по границе
+            // Слой +2 (Outline3D): Внешний контур + готовые 3D-блоки из Фото 2
             // ================================================================
             if (topOpen) {
-                addRectPiece(result, cx, cy + 14.1f, 1.02f, 0.07f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11);
+                addObjSpec(candidates, cat.idThinLineLong, cx, cy + 14.2f, 1.0f, 1.0f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0);
             }
             if (bottomOpen) {
-                addRectPiece(result, cx, cy - 14.1f, 1.02f, 0.07f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11);
+                addObjSpec(candidates, cat.idThinLineLong, cx, cy - 14.2f, 1.0f, 1.0f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0);
             }
             if (leftOpen) {
-                addRectPiece(result, cx - 14.1f, cy, 0.07f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11);
+                addObjSpec(candidates, cat.idThinLineLong, cx - 14.2f, cy, 1.0f, 1.0f, 90.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0);
             }
             if (rightOpen) {
-                addRectPiece(result, cx + 14.1f, cy, 0.07f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11);
+                addObjSpec(candidates, cat.idThinLineLong, cx + 14.2f, cy, 1.0f, 1.0f, 90.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0);
             }
 
-            // 3D-экструзия на внешней правой и верхней гранях (как на кубиках в референсе 1)
-            if (want3D && rightOpen) {
-                addRectPiece(result, cx + 18.2f, cy + 1.5f, 0.22f, 0.98f, 0.f,  LayerRole::Outline3D, ColorSlot::Dark3D, 9);
-                addRectPiece(result, cx + 21.4f, cy + 2.4f, 0.05f, 1.00f, 0.f,  LayerRole::Outline3D, ColorSlot::HighlightOutline, 10);
-                addRectPiece(result, cx + 18.2f, cy - 12.6f, 0.26f, 0.05f, 24.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 10);
+            // Готовые 3D-блоки из Фото 2 на внешних гранях (справа и сверху)
+            if (rightOpen) {
+                int side3DID = (islArch == 4) ? cat.id3DBrickTrap : cat.id3DTrapTop;
+                addObjSpec(candidates, side3DID, cx + 19.5f, cy, 0.35f, 0.98f, 90.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 1);
+                addObjSpec(candidates, cat.idThinLineLong, cx + 21.5f, cy + 2.f, 0.98f, 0.98f, 90.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 10, 1);
                 if (topOpen) {
-                    addRectPiece(result, cx + 18.0f, cy + 16.0f, 0.26f, 0.06f, 28.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11);
-                    if (isSingleCube) {
-                        addRectPiece(result, cx + 2.5f, cy + 17.5f, 0.96f, 0.16f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9);
-                        addRectPiece(result, cx + 4.0f, cy + 19.8f, 0.98f, 0.05f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 10);
-                        addRectPiece(result, cx - 12.6f, cy + 17.2f, 0.24f, 0.05f, 28.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 10);
-                    }
+                    addObjSpec(candidates, cat.id3DTriCorner, cx + 18.5f, cy + 17.5f, 0.45f, 0.45f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 10, 1);
                 }
+            }
+            if (topOpen && isSingleCube) {
+                addObjSpec(candidates, cat.id3DTrapTop, cx + 2.f, cy + 18.5f, 0.96f, 0.32f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 1);
+                addObjSpec(candidates, cat.idThinLineLong, cx + 3.5f, cy + 20.5f, 0.98f, 0.98f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 10, 1);
             }
 
             // ================================================================
-            // 4. Слой +3 (NeonAndGrass): Декоративная трава, неоновые капли и мягкий глоу
+            // Слой +3 (NeonAndGrass): Мелкий контурный неон (Фото 6) ИНОГДА с двух сторон + трава
             // ================================================================
-            if (topOpen && wantGrass) {
-                int const grassIDs[3] = { 406, 407, 408 };
-                GeneratedObjectSpec g1;
-                g1.objectId = grassIDs[(gx + gy + 100) % 3];
-                g1.x = cx - 5.5f;
-                g1.y = cy + 16.5f;
-                g1.scaleX = 0.65f;
-                g1.scaleY = 0.68f;
-                g1.layerRole = LayerRole::NeonAndGrass;
-                g1.colorSlot = ColorSlot::BrightMain;
-                g1.zOrder = 14;
-                result.push_back(g1);
+            bool doDoubleSided = (neonBorderMode == 1) || (neonBorderMode == 2 && ((gx + gy) % 2 == 0));
 
-                if (densityFactor >= 0.8f) {
-                    GeneratedObjectSpec g2 = g1;
-                    g2.objectId = grassIDs[(gx + gy + 101) % 3];
-                    g2.x = cx + 5.5f;
-                    g2.scaleX = 0.52f;
-                    g2.scaleY = 0.58f;
-                    g2.flipX = true;
-                    result.push_back(g2);
+            if (topOpen) {
+                // Снаружи контура (мелкий неон из Фото 6)
+                addObjSpec(candidates, cat.idGlowEdgeSmall, cx - 7.5f, cy + 18.0f, 1.0f, 0.75f, 0.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 1, false, false, 115);
+                addObjSpec(candidates, cat.idGlowEdgeSmall, cx + 7.5f, cy + 18.0f, 1.0f, 0.75f, 0.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 2, false, false, 115);
+                // Внутри контура (развернутый на 180° мелкий неон)
+                if (doDoubleSided) {
+                    addObjSpec(candidates, cat.idGlowEdgeSmall, cx - 7.5f, cy + 11.5f, 1.0f, 0.70f, 180.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 2, false, false, 95);
+                    addObjSpec(candidates, cat.idGlowEdgeSmall, cx + 7.5f, cy + 11.5f, 1.0f, 0.70f, 180.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 3, false, false, 95);
+                }
+
+                // Декоративная трава на верхней грани
+                if (style != DecorStyle::Modern) {
+                    int const grassIDs[3] = { 406, 407, 408 };
+                    int gID = grassIDs[(gx + gy + rng()) % 3];
+                    addObjSpec(candidates, gID, cx - 5.f, cy + 16.5f, 0.65f, 0.68f, 0.f, LayerRole::NeonAndGrass, ColorSlot::BrightMain, 15, 1);
+                    addObjSpec(candidates, gID, cx + 5.5f, cy + 16.2f, 0.52f, 0.55f, 0.f, LayerRole::NeonAndGrass, ColorSlot::BrightMain, 15, 2, true, false);
                 }
             }
 
-            // Неоновые капли снизу висячих блоков (как под блоком справа на референсе 1)
-            if (bottomOpen && cy > 55.f && densityFactor >= 0.75f && style == DecorStyle::Neon) {
-                addRectPiece(result, cx - 4.5f, cy - 17.5f, 0.06f, 0.22f, 0.f, LayerRole::NeonAndGrass, ColorSlot::BrightMain, 14);
-                addRectPiece(result, cx + 3.5f, cy - 16.8f, 0.06f, 0.16f, 0.f, LayerRole::NeonAndGrass, ColorSlot::BrightMain, 14);
+            if (bottomOpen) {
+                // Снаружи нижней грани
+                addObjSpec(candidates, cat.idGlowEdgeSmall, cx - 7.5f, cy - 18.0f, 1.0f, 0.75f, 180.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 2, false, false, 110);
+                addObjSpec(candidates, cat.idGlowEdgeSmall, cx + 7.5f, cy - 18.0f, 1.0f, 0.75f, 180.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 3, false, false, 110);
+                // Внутри нижней грани
+                if (doDoubleSided) {
+                    addObjSpec(candidates, cat.idGlowEdgeSmall, cx, cy - 11.5f, 1.5f, 0.65f, 0.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 2, false, false, 90);
+                }
             }
 
-            // Мягкое неоновое свечение строго по внешним краям контура
-            if (topOpen || leftOpen || rightOpen || bottomOpen) {
-                GeneratedObjectSpec glow;
-                glow.objectId = 1888;
-                glow.x = cx;
-                glow.y = cy;
-                glow.scaleX = 1.25f;
-                glow.scaleY = 1.25f;
-                glow.layerRole = LayerRole::NeonAndGrass;
-                glow.colorSlot = ColorSlot::AdditiveGlow;
-                glow.customOpacity = 62;
-                glow.zOrder = -2;
-                result.push_back(glow);
+            if (leftOpen) {
+                // Снаружи левой грани
+                addObjSpec(candidates, cat.idGlowEdgeSmall, cx - 18.0f, cy, 1.4f, 0.75f, 270.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 1, false, false, 110);
+                // Внутри левой грани
+                if (doDoubleSided) {
+                    addObjSpec(candidates, cat.idGlowEdgeSmall, cx - 11.5f, cy, 1.4f, 0.65f, 90.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 2, false, false, 90);
+                }
+            }
+
+            if (rightOpen) {
+                // Снаружи правой грани
+                addObjSpec(candidates, cat.idGlowEdgeSmall, cx + 18.0f, cy, 1.4f, 0.75f, 90.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 1, false, false, 110);
+                // Внутри правой грани
+                if (doDoubleSided) {
+                    addObjSpec(candidates, cat.idGlowEdgeSmall, cx + 11.5f, cy, 1.4f, 0.65f, 270.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 2, false, false, 90);
+                }
+            }
+
+            // Мягкое фоновое свечение на внешних углах
+            if ((topOpen && leftOpen) || (topOpen && rightOpen)) {
+                addObjSpec(candidates, cat.idGlowCircle, cx, cy, 1.15f, 1.15f, 0.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, -2, 2, false, false, 65);
             }
         }
     }
 
     // ========================================================================
-    // 5. Многослойное декорирование выделенных шипов (Nested Neon Spikes + Glow)
+    // Декорирование выделенных шипов (вложенные шипы + мелкий неон у основания)
     // ========================================================================
     for (auto const& sp : contour.spikes) {
-        // Три вложенных шипа внутри контура выделенного шипа (как на обоих референсах!)
         float const scales[3] = { 0.72f, 0.46f, 0.22f };
         ColorSlot const slots[3] = {
             ColorSlot::BrightMain,
             ColorSlot::MidTone,
             ColorSlot::HighlightOutline
         };
-
         for (int k = 0; k < 3; ++k) {
-            GeneratedObjectSpec innerSp;
-            innerSp.objectId = sp.objectId;
-            innerSp.x = sp.x;
-            innerSp.y = sp.y;
-            innerSp.rotation = sp.rotation;
-            innerSp.scaleX = sp.scaleX * scales[k];
-            innerSp.scaleY = sp.scaleY * scales[k];
-            innerSp.flipX = sp.flipX;
-            innerSp.flipY = sp.flipY;
-            innerSp.layerRole = LayerRole::Outline3D;
-            innerSp.colorSlot = slots[k];
-            innerSp.zOrder = 11 + k;
-            innerSp.noTouch = true;
-            innerSp.noGlow = true;
-            result.push_back(innerSp);
+            addObjSpec(
+                candidates, sp.objectId,
+                sp.x, sp.y,
+                sp.scaleX * scales[k], sp.scaleY * scales[k],
+                sp.rotation,
+                LayerRole::Outline3D, slots[k],
+                11 + k, (k < 2) ? 0 : 2,
+                sp.flipX, sp.flipY
+            );
         }
-
-        // Мягкое неоновое свечение вокруг шипа на слое неона
-        GeneratedObjectSpec spGlow;
-        spGlow.objectId = 1888;
-        spGlow.x = sp.x;
-        spGlow.y = sp.y;
-        spGlow.scaleX = 1.20f * sp.scaleX;
-        spGlow.scaleY = 1.20f * sp.scaleY;
-        spGlow.layerRole = LayerRole::NeonAndGrass;
-        spGlow.colorSlot = ColorSlot::AdditiveGlow;
-        spGlow.customOpacity = 68;
-        spGlow.zOrder = -1;
-        result.push_back(spGlow);
+        addObjSpec(
+            candidates, cat.idGlowEdgeSmall,
+            sp.x, sp.y - 8.f,
+            1.2f * sp.scaleX, 0.85f * sp.scaleY,
+            sp.rotation,
+            LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow,
+            14, 1, false, false, 115
+        );
     }
 
-    return result;
+    // ========================================================================
+    // Точный контроль количества блоков (targetCount реально меняет плотность!)
+    // ========================================================================
+    std::stable_sort(candidates.begin(), candidates.end(), [](GeneratedObjectSpec const& a, GeneratedObjectSpec const& b) {
+        return a.priorityTier < b.priorityTier;
+    });
+
+    // Обязательный минимум — темное заполнение и внешний контур (Tier 0),
+    // а количество деталей (Tier 1..3) напрямую масштабируется от выбранного пользователем числа
+    int minRequired = 0;
+    for (auto const& c : candidates) {
+        if (c.priorityTier == 0) minRequired++;
+    }
+
+    int desiredTotal = (std::max)(minRequired + 4, targetCount);
+    if (static_cast<int>(candidates.size()) > desiredTotal) {
+        candidates.resize(desiredTotal);
+    }
+
+    return candidates;
 }
 
 // ============================================================================
-// Спавн сгенерированных объектов с привязкой к слоям и цветовой палитре
+// Спавн сгенерированных объектов в LevelEditorLayer
 // ============================================================================
 struct SpawnSummary {
     int createdCount = 0;
@@ -1011,11 +1185,7 @@ static SpawnSummary spawnContourDecorInEditor(
     auto* editorLayer = ui->m_editorLayer;
     summary.firstLayer = findFirstFreeEditorLayerBlock(editorLayer, 4);
 
-    // Синхронизируем палитру с цветовыми каналами уровня
-    syncPaletteWithLevelChannels(editorLayer, palette);
-
-    // Окрашиваем исходные блоки контура в темный базовый цвет, а исходные шипы — в яркий контур,
-    // чтобы стандартные белые текстуры не просвечивали и хитбоксы оставались на своих местах
+    // Окрашиваем исходные выделенные блоки и шипы в цвета палитры через нативный HSV
     for (GameObject* baseObj : contour.solidObjects) {
         if (!baseObj) continue;
         writeObjEditorLayers(baseObj, summary.firstLayer + static_cast<int>(LayerRole::Fill), 0);
@@ -1050,7 +1220,7 @@ static SpawnSummary spawnContourDecorInEditor(
 }
 
 // ============================================================================
-// Всплывающее меню ИИ-декоратора на базе geode::Popup (Geode v5 / GD 2.2081)
+// Всплывающее меню ИИ-декоратора (Geode v5 / GD 2.2081)
 // ============================================================================
 class AIDecorPopup : public geode::Popup {
 protected:
@@ -1078,7 +1248,7 @@ protected:
 
         int freeLayer = (ui && ui->m_editorLayer) ? findFirstFreeEditorLayerBlock(ui->m_editorLayer, 4) : 1;
         std::string regionStr = fmt::format(
-            "Contour: {} cells, {} spikes | Auto Layers: {}-{} (Fill/Detail/3D/Neon)",
+            "Contour: {} cells, {} spikes | Free Layers: {}-{} (Fill/Deco/3D/Neon)",
             m_contour.cellCount(), m_contour.spikeCount(), freeLayer, freeLayer + 3
         );
         auto regionLabel = CCLabelBMFont::create(regionStr.c_str(), "chatFont.fnt");
@@ -1087,9 +1257,8 @@ protected:
         regionLabel->setPosition(CCPoint{ center.x, center.y + 92.f });
         m_mainLayer->addChild(regionLabel);
 
-        // 1. Кнопки выбора стиля: Neon, Modern, Hell, Reality
-        auto styleHeader = CCLabelBMFont::create("1. Choose Style:", "bigFont.fnt");
-        styleHeader->setScale(0.42f);
+        auto styleHeader = CCLabelBMFont::create("1. Choose Style (New Random Color & Pattern Each Click):", "bigFont.fnt");
+        styleHeader->setScale(0.38f);
         styleHeader->setPosition(CCPoint{ center.x, center.y + 68.f });
         m_mainLayer->addChild(styleHeader);
 
@@ -1107,9 +1276,8 @@ protected:
             m_buttonMenu->addChild(btn);
         }
 
-        // 2. Регулятор средней плотности блоков
-        auto countHeader = CCLabelBMFont::create("2. Avg Detail Guide (Auto-Scales to Contour):", "bigFont.fnt");
-        countHeader->setScale(0.38f);
+        auto countHeader = CCLabelBMFont::create("2. Target Detail Budget (20 - 300):", "bigFont.fnt");
+        countHeader->setScale(0.4f);
         countHeader->setPosition(CCPoint{ center.x - 55.f, center.y + 6.f });
         m_mainLayer->addChild(countHeader);
 
@@ -1131,18 +1299,17 @@ protected:
         plusBtn->setPosition(CCPoint{ center.x + 155.f, center.y + 6.f });
         m_buttonMenu->addChild(plusBtn);
 
-        // 3. Поле ИИ-чата (цвет, детали, трава, 3D)
-        auto chatHeader = CCLabelBMFont::create("3. AI Prompt (color: green/cyan/red/purple, grass, 3d):", "bigFont.fnt");
-        chatHeader->setScale(0.37f);
+        auto chatHeader = CCLabelBMFont::create("3. Optional Prompt (or leave empty for random color/design):", "bigFont.fnt");
+        chatHeader->setScale(0.36f);
         chatHeader->setPosition(CCPoint{ center.x, center.y - 26.f });
         m_mainLayer->addChild(chatHeader);
 
-        m_promptInput = TextInput::create(360.f, "e.g. neon green, extra grass, cyan glow, skull...", "chatFont.fnt");
+        m_promptInput = TextInput::create(360.f, "Leave empty for random color, or type: green, cyan, purple, red...", "chatFont.fnt");
         m_promptInput->setMaxCharCount(240);
         m_promptInput->setPosition(CCPoint{ center.x, center.y - 56.f });
         m_mainLayer->addChild(m_promptInput);
 
-        m_statusLabel = CCLabelBMFont::create("Strict contour mode: fills & details stay inside selected blocks!", "chatFont.fnt");
+        m_statusLabel = CCLabelBMFont::create("Uses native 3D blocks, Eye/Skull/Emblems & 2-sided small neon!", "chatFont.fnt");
         m_statusLabel->setScale(0.56f);
         m_statusLabel->setColor(ccColor3B{ 200, 255, 200 });
         m_statusLabel->setPosition(CCPoint{ center.x, center.y - 86.f });
@@ -1168,30 +1335,32 @@ protected:
                 m_styleSprites[i]->setColor((i == tag) ? ccColor3B{ 120, 255, 160 } : ccColor3B{ 210, 210, 210 });
             }
         }
-        m_statusLabel->setString(fmt::format("Style: {} (strict per-layer color shading)", styleNames[tag]).c_str());
+        m_statusLabel->setString(fmt::format("Style: {} (new color & structure on every click)", styleNames[tag]).c_str());
     }
 
     void onAdjustCount(CCObject* sender) {
         int delta = static_cast<CCNode*>(sender)->getTag();
         int current = numFromString<int>(m_countInput->getString()).unwrapOr(m_targetBlockCount);
-        m_targetBlockCount = std::clamp(current + delta, 20, 300);
+        m_targetBlockCount = std::clamp(current + delta, 15, 350);
         m_countInput->setString(std::to_string(m_targetBlockCount));
     }
 
     void onGenerate(CCObject*) {
         m_targetBlockCount = std::clamp(
             numFromString<int>(m_countInput->getString()).unwrapOr(80),
-            20, 300
+            15, 350
         );
         std::string userPrompt = m_promptInput ? std::string(m_promptInput->getString()) : "";
 
-        StylePalette palette = buildCohesivePalette(m_selectedStyle, userPrompt, m_contour, 900);
-        auto specs = generateContourAwareDecor(m_contour, m_selectedStyle, m_targetBlockCount, userPrompt);
+        std::mt19937 rng(std::random_device{}());
+        EditorTabCatalog catalog = loadEditorTabCatalog(m_editorUI);
+        StylePalette palette = buildDynamicPalette(m_selectedStyle, userPrompt, m_contour, rng);
+        auto specs = generateVariedContourDecor(m_contour, catalog, m_selectedStyle, m_targetBlockCount, userPrompt, rng);
         SpawnSummary summary = spawnContourDecorInEditor(m_editorUI, m_contour, specs, palette);
 
         Notification::create(
             fmt::format(
-                "Built {} pieces on Layers {}-{}!",
+                "Built {} blocks on Layers {}-{}!",
                 summary.createdCount,
                 summary.firstLayer,
                 summary.firstLayer + 3
@@ -1215,7 +1384,7 @@ public:
 };
 
 // ============================================================================
-// Перехват Right Alt и поддержание цветов/блендинга в редакторе уровней
+// Перехват клавиши Right Alt в редакторе уровней (EditorUI)
 // ============================================================================
 class $modify(AIDecorEditorUI, EditorUI) {
     struct Fields {
@@ -1224,25 +1393,11 @@ class $modify(AIDecorEditorUI, EditorUI) {
 
     bool init(LevelEditorLayer* editorLayer) {
         if (!EditorUI::init(editorLayer)) return false;
-        g_liveColoredObjects.clear();
         this->schedule(schedule_selector(AIDecorEditorUI::checkRightAltKey), 0.0f);
         return true;
     }
 
     void checkRightAltKey(float) {
-        // Поддерживаем точные цвета и аддитивное свечение в редакторе, чтобы GD не сбрасывал их в белый
-        if (!g_liveColoredObjects.empty()) {
-            for (size_t i = 0; i < g_liveColoredObjects.size();) {
-                auto& item = g_liveColoredObjects[i];
-                if (!item.obj || !item.obj->getParent()) {
-                    g_liveColoredObjects.erase(g_liveColoredObjects.begin() + i);
-                    continue;
-                }
-                enforceVisualColorOnNode(item.obj, item.color, item.opacity, item.additiveBlend);
-                ++i;
-            }
-        }
-
 #ifdef GEODE_IS_WINDOWS
         bool isDown = (GetAsyncKeyState(VK_RMENU) & 0x8000) != 0;
         if (isDown && !m_fields->m_rightAltWasDown) {
