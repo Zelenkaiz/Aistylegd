@@ -1,56 +1,79 @@
+cmake_minimum_required(VERSION 3.21)
+
+set(CMAKE_CXX_STANDARD 23)
+
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if ("${CMAKE_SYSTEM_NAME}" STREQUAL "iOS" OR IOS)
+
+    set(CMAKE_OSX_ARCHITECTURES "arm64")
+
+else()
+
+    set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64")
+
+endif()
+
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 
 
-Вы достигли лимита на использование
-Задачи снова станут доступны 12 нояб. в 06:57. Чтобы увеличить лимит, перейдите на другой тариф.
+
+project(AIStyleDecorator VERSION 1.0.1)
 
 
-Значок JSON-файла
-mod
-{
-  "geode": "5.6.0",
-  "gd": {
-    "win": "2.2081",
-    "android": "2.2081",
-    "mac": "2.2081",
-    "ios": "2.2081"
-  },
-  "id": "dev.aidecorator",
-  "name": "AI Style Decorator",
-  "version": "v1.0.1",
-  "developer": "Creator",
-  "description": "AI-powered automatic block & air decoration in the Level Editor (Neon, Modern, Hell, Reality) opened via Right Alt.",
-  "settings": {
-    "ai-api-url": {
-      "type": "string",
-      "name": "AI API Endpoint URL",
-      "description": "OpenAI-compatible chat completions endpoint (e.g., https://api.openai.com/v1/chat/completions or local Ollama http://localhost:11434/v1/chat/completions). Leave empty or without key to use the built-in offline AI procedural engine.",
-      "default": "https://api.openai.com/v1/chat/completions"
-    },
-    "ai-api-key": {
-      "type": "string",
-      "name": "AI API Key",
-      "description": "Your API key for cloud LLM generation. If left empty, the mod uses its built-in smart procedural generator with prompt parsing.",
-      "default": ""
-    },
-    "ai-model": {
-      "type": "string",
-      "name": "AI Model Name",
-      "description": "Model name to request (e.g., gpt-4o-mini, gemini-2.5-flash, llama3).",
-      "default": "gpt-4o-mini"
-    },
-    "default-block-count": {
-      "type": "int",
-      "name": "Default Block Count",
-      "description": "Default target number of decoration objects to generate inside the selected area.",
-      "default": 80,
-      "min": 10,
-      "max": 500
-    },
-    "clear-previous-decor": {
-      "type": "bool",
-      "name": "Tag Generated Decor in Group 999",
-      "description": "Automatically assigns group ID 999 to all generated decoration objects so you can easily select or delete them.",
-      "default": true
-    }
-  }
-}
+
+add_compile_definitions(NOMINMAX)
+
+
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
+
+    set(SOURCES src/main.cpp)
+
+elseif (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/main.cpp")
+
+    set(SOURCES main.cpp)
+
+else()
+
+    file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS src/*.cpp)
+
+endif()
+
+
+
+add_library(${PROJECT_NAME} SHARED ${SOURCES})
+
+
+
+if (NOT DEFINED ENV{GEODE_SDK})
+
+    message(FATAL_ERROR "Unable to find Geode SDK! Please define GEODE_SDK environment variable to point to Geode")
+
+else()
+
+    message(STATUS "Found Geode: $ENV{GEODE_SDK}")
+
+endif()
+
+
+
+add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
+
+
+
+if (TARGET GeodeBindings)
+
+    target_compile_options(GeodeBindings PRIVATE
+
+        -include "${GEODE_LOADER_PATH}/include/Geode/DefaultInclude.hpp"
+
+        -include "${GEODE_LOADER_PATH}/include/Geode/Geode.hpp"
+
+    )
+
+endif()
+
+
+
+setup_geode_mod(${PROJECT_NAME})
