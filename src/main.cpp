@@ -7,6 +7,7 @@
 #include <Geode/ui/Popup.hpp>
 #include <Geode/ui/TextInput.hpp>
 #include <Geode/utils/web.hpp>
+#include <Geode/utils/async.hpp>
 #include <random>
 #include <sstream>
 #include <algorithm>
@@ -277,9 +278,9 @@ static int spawnGeneratedObjectsInEditor(EditorUI* ui, std::vector<GeneratedObje
 }
 
 // ============================================================================
-// Всплывающее меню ИИ-декоратора на базе geode::Popup (Geode v4.9.0)
+// Всплывающее меню ИИ-декоратора на базе geode::Popup (Geode v5 / GD 2.2081)
 // ============================================================================
-class AIDecorPopup : public geode::Popup<EditorUI*, SelectionBounds> {
+class AIDecorPopup : public geode::Popup {
 protected:
     EditorUI* m_editorUI = nullptr;
     SelectionBounds m_bounds;
@@ -290,9 +291,11 @@ protected:
     TextInput* m_countInput = nullptr;
     CCLabelBMFont* m_statusLabel = nullptr;
     std::vector<ButtonSprite*> m_styleSprites;
-    EventListener<web::WebTask> m_webListener;
+    async::TaskHolder<web::WebResponse> m_webListener;
 
-    bool setup(EditorUI* ui, SelectionBounds bounds) override {
+    bool init(EditorUI* ui, SelectionBounds bounds) {
+        if (!Popup::init(420.f, 280.f)) return false;
+
         m_editorUI = ui;
         m_bounds = bounds;
         m_targetBlockCount = static_cast<int>(Mod::get()->getSettingValue<int64_t>("default-block-count"));
@@ -467,10 +470,11 @@ protected:
         req.header("Authorization", fmt::format("Bearer {}", apiKey));
         req.bodyJSON(body);
 
-        m_webListener.bind([this, userPrompt](web::WebTask::Event* e) {
-            if (web::WebResponse* res = e->getValue()) {
-                if (res->ok()) {
-                    auto jsonRes = res->json();
+        m_webListener.spawn(
+            req.post(apiUrl),
+            [this, userPrompt](web::WebResponse res) {
+                if (res.ok()) {
+                    auto jsonRes = res.json();
                     if (jsonRes.isOk()) {
                         auto root = jsonRes.unwrap();
                         std::vector<GeneratedObjectSpec> aiSpecs;
@@ -505,15 +509,13 @@ protected:
                 }
                 runProceduralGeneration(userPrompt);
             }
-        });
-
-        m_webListener.setFilter(req.post(apiUrl));
+        );
     }
 
 public:
     static AIDecorPopup* create(EditorUI* ui, SelectionBounds bounds) {
         auto ret = new AIDecorPopup();
-        if (ret && ret->initAnchored(420.f, 280.f, ui, bounds)) {
+        if (ret && ret->init(ui, bounds)) {
             ret->autorelease();
             return ret;
         }
