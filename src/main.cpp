@@ -472,7 +472,7 @@ protected:
 
         m_webListener.spawn(
             req.post(apiUrl),
-            [this, userPrompt](web::WebResponse res) {
+            [this, userPrompt](auto res) {
                 if (res.ok()) {
                     auto jsonRes = res.json();
                     if (jsonRes.isOk()) {
