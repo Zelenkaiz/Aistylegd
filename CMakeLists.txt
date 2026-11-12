@@ -1,43 +1,40 @@
-{
-    "geode": "5.6.0",
-    "gd": {
-        "win": "2.2081",
-        "android": "2.2081",
-        "mac": "2.2081",
-        "ios": "2.2081"
-    },
-    "id": "dev.aidecorator",
-    "name": "AI Style Decorator",
-    "version": "v1.0.2",
-    "developer": "Creator",
-    "description": "AI-powered automatic block & air decoration in the Level Editor (Neon, Modern, Hell, Reality) opened via Right Alt.",
-    "settings": {
-        "ai-api-url": {
-            "type": "string",
-            "name": "AI API Endpoint URL",
-            "default": "https://api.openai.com/v1/chat/completions"
-        },
-        "ai-api-key": {
-            "type": "string",
-            "name": "AI API Key",
-            "default": ""
-        },
-        "ai-model": {
-            "type": "string",
-            "name": "AI Model Name",
-            "default": "gpt-4o-mini"
-        },
-        "default-block-count": {
-            "type": "int",
-            "name": "Default Block Count",
-            "default": 80,
-            "min": 10,
-            "max": 500
-        },
-        "clear-previous-decor": {
-            "type": "bool",
-            "name": "Tag Generated Decor in Group 999",
-            "default": true
-        }
-    }
-}
+cmake_minimum_required(VERSION 3.21)
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if ("${CMAKE_SYSTEM_NAME}" STREQUAL "iOS" OR IOS)
+    set(CMAKE_OSX_ARCHITECTURES "arm64")
+else()
+    set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64")
+endif()
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+
+project(AIStyleDecorator VERSION 1.0.1)
+
+add_compile_definitions(NOMINMAX)
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
+    set(SOURCES src/main.cpp)
+elseif (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/main.cpp")
+    set(SOURCES main.cpp)
+else()
+    file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS src/*.cpp)
+endif()
+
+add_library(${PROJECT_NAME} SHARED ${SOURCES})
+
+if (NOT DEFINED ENV{GEODE_SDK})
+    message(FATAL_ERROR "Unable to find Geode SDK! Please define GEODE_SDK environment variable to point to Geode")
+else()
+    message(STATUS "Found Geode: $ENV{GEODE_SDK}")
+endif()
+
+add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
+
+if (TARGET GeodeBindings)
+    target_compile_options(GeodeBindings PRIVATE
+        -include "${GEODE_LOADER_PATH}/include/Geode/DefaultInclude.hpp"
+        -include "${GEODE_LOADER_PATH}/include/Geode/Geode.hpp"
+    )
+endif()
+
+setup_geode_mod(${PROJECT_NAME})
