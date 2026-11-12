@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <queue>
@@ -46,10 +47,13 @@ enum class LayerRole : int {
 };
 
 enum class AITaskMode {
-    Only3D = 0,     // Игрок попросил сделать ТОЛЬКО 3D
-    OnlyNeon = 1,   // Игрок попросил сделать ТОЛЬКО неон/свечение
-    OnlyFill = 2,   // Игрок попросил ТОЛЬКО залить/заполнить контур
-    FullDecor = 3   // Полноценный декор выбранного стиля и количества объектов
+    ChatOnly = 0,   // Обычное общение в чате (приветствие, вопросы, обсуждение — БЕЗ постройки!)
+    Only3D = 1,     // Игрок попросил сделать ТОЛЬКО 3D
+    OnlyNeon = 2,   // Игрок попросил сделать ТОЛЬКО неон/свечение
+    OnlyFill = 3,   // Игрок попросил ТОЛЬКО залить/заполнить контур
+    FullDecor = 4,  // Полноценный декор выбранного стиля и количества объектов
+    UndoLast = 5,   // Отменить / убрать последнюю постройку
+    Rebuild = 6     // Переделать последнюю постройку по-новому
 };
 
 struct StylePalette {
@@ -111,9 +115,20 @@ struct GeneratedObjectSpec {
 
 static int g_lastHueBucket = -1;
 static int g_lastLayoutSeed = -1;
+static int g_greetingCounter = 0;
+
+// Память диалога ИИ между сообщениями
+static float g_rememberedHue = -1.f;
+static int g_rememberedCount = 85;
+static bool g_rememberedWantEye = false;
+static bool g_rememberedWantSkull = false;
+static bool g_rememberedWantChains = false;
+static bool g_rememberedWantArcs = false;
+static bool g_rememberedWantGrass = true;
+static std::vector<Ref<GameObject>> g_lastSpawnedObjects;
 
 // ============================================================================
-// Хранение и смена настроек API (провайдер + ключ) с сохранением в файл
+// Хранение, автопоиск и проверка API-ключа (с галочкой подтверждения!)
 // ============================================================================
 struct ApiProviderPreset {
     const char* name;
@@ -134,44 +149,94 @@ static bool g_apiConnected = false;
 static int g_apiProviderIndex = 0;
 static std::string g_connectedApiKey;
 
-static void loadApiConfigFromDisk() {
-    if (g_apiConfigLoaded) return;
-    g_apiConfigLoaded = true;
-    std::ifstream in("ai_decor_api.cfg");
-    if (!in.is_open()) return;
-    int prov = 0;
-    std::string key;
-    if (in >> prov) {
-        std::getline(in >> std::ws, key);
-        if (prov >= 0 && prov < 5 && !key.empty()) {
-            g_apiProviderIndex = prov;
-            g_connectedApiKey = key;
-            g_apiConnected = true;
-        }
+static std::string trimWhitespace(std::string s) {
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) {
+        s.pop_back();
     }
+    size_t start = 0;
+    while (start < s.size() && (s[start] == '\n' || s[start] == '\r' || s[start] == ' ' || s[start] == '\t')) {
+        ++start;
+    }
+    return s.substr(start);
 }
 
-static void saveApiConfigToDisk(int provIdx, std::string const& key) {
+static bool isValidApiKey(std::string const& rawKey) {
+    std::string k = trimWhitespace(rawKey);
+    if (k.size() < 8) return false;
+    for (char c : k) {
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') return false;
+    }
+    return true;
+}
+
+static int detectProviderFromKey(std::string const& rawKey, int currentIdx) {
+    std::string key = trimWhitespace(rawKey);
+    if (key.rfind("AIza", 0) == 0) return 1;   // Gemini
+    if (key.rfind("gsk_", 0) == 0) return 3;   // Groq
+    if (key.rfind("sk-or-", 0) == 0) return 4; // OpenRouter
+    if (key.rfind("sk-", 0) == 0) return (currentIdx == 2) ? 2 : 0; // OpenAI / DeepSeek
+    return currentIdx;
+}
+
+static void saveApiConfigToDisk(int provIdx, std::string const& rawKey) {
+    std::string key = trimWhitespace(rawKey);
     g_apiConfigLoaded = true;
     g_apiProviderIndex = std::clamp(provIdx, 0, 4);
     g_connectedApiKey = key;
-    g_apiConnected = !key.empty();
+    g_apiConnected = isValidApiKey(key);
     std::ofstream out("ai_decor_api.cfg", std::ios::trunc);
     if (out.is_open()) {
         out << g_apiProviderIndex << "\n" << g_connectedApiKey << "\n";
     }
 }
 
-static int detectProviderFromKey(std::string const& key, int currentIdx) {
-    if (key.rfind("AIza", 0) == 0) return 1;   // Gemini
-    if (key.rfind("gsk_", 0) == 0) return 3;   // Groq
-    if (key.rfind("sk-or-", 0) == 0) return 4; // OpenRouter
-    return currentIdx;
+static void loadApiConfigFromDisk() {
+    if (g_apiConfigLoaded) return;
+    g_apiConfigLoaded = true;
+
+    // 1. Проверяем сохраненный файл конфигурации
+    std::ifstream in("ai_decor_api.cfg");
+    if (in.is_open()) {
+        int prov = 0;
+        std::string key;
+        if (in >> prov) {
+            std::getline(in >> std::ws, key);
+            key = trimWhitespace(key);
+            if (prov >= 0 && prov < 5 && isValidApiKey(key)) {
+                g_apiProviderIndex = prov;
+                g_connectedApiKey = key;
+                g_apiConnected = true;
+                return;
+            }
+        }
+    }
+
+    // 2. Автоматически проверяем переменные окружения Windows на наличие API-ключа
+    struct EnvKeyCheck {
+        const char* envName;
+        int providerIdx;
+    };
+    constexpr EnvKeyCheck kEnvChecks[] = {
+        { "OPENAI_API_KEY",     0 },
+        { "GEMINI_API_KEY",     1 },
+        { "DEEPSEEK_API_KEY",   2 },
+        { "GROQ_API_KEY",       3 },
+        { "OPENROUTER_API_KEY", 4 }
+    };
+    for (auto const& chk : kEnvChecks) {
+        if (const char* val = std::getenv(chk.envName)) {
+            std::string k = trimWhitespace(val);
+            if (isValidApiKey(k)) {
+                saveApiConfigToDisk(chk.providerIdx, k);
+                return;
+            }
+        }
+    }
 }
 
 static std::string maskApiKeyPreview(std::string const& key) {
-    if (key.empty()) return "not set";
-    if (key.size() <= 8) return key;
+    if (!isValidApiKey(key)) return "ne nayden";
+    if (key.size() <= 10) return key.substr(0, 3) + "...";
     return key.substr(0, 5) + "..." + key.substr(key.size() - 4);
 }
 
@@ -372,39 +437,35 @@ static void bindObjectToPaletteSlot(
 // Чтение готовых блоков из вкладок редактора (3D, Глаз, Череп, Декор, Неон)
 // ============================================================================
 struct EditorTabCatalog {
-    // 3D-блоки из вкладки 4 (страница 2) — ровно те блоки, из которых сделан 3D на image_29bf02.png
-    int id3DTrapTop    = 211; // Слот 0: верхняя скошенная 3D-трапеция (для левого верхнего края)
-    int id3DHalfStrip  = 211; // Слот 1: прямая 3D-полоса (30x15 сверху и 15x30 справа)
-    int id3DTriCorner  = 211; // Слот 5: верхне-левый 3D-треугольник 15x15 (|‾/)
-    int id3DTriBR      = 211; // Слот 6: нижне-правый 3D-треугольник 15x15 (/_|)
+    int id3DTrapTop    = 211;
+    int id3DHalfStrip  = 211;
+    int id3DTriCorner  = 211;
+    int id3DTriBR      = 211;
 
-    // Декоративные блоки из вкладки 10 (страница 9)
-    int idEyeBlock      = 211; // Слот 5: готовый декор-глаз
-    int idSkullBlock    = 211; // Слот 10: готовый череп
-    int idSwirlSign     = 211; // Слот 4: вихрь/спираль
-    int idChainLink     = 211; // Слот 1: цепь
-    int idBrickBlock    = 211; // Слот 6: кирпичики
-    int idBracketArch   = 211; // Слот 7: П-образная неоновая арка
-    int idBracketCorner = 211; // Слот 8: Г-образный уголок
-    int idDiagShine1    = 211; // Слот 11: диагональный блик //
+    int idEyeBlock      = 211;
+    int idSkullBlock    = 211;
+    int idSwirlSign     = 211;
+    int idChainLink     = 211;
+    int idBrickBlock    = 211;
+    int idBracketArch   = 211;
+    int idBracketCorner = 211;
+    int idDiagShine1    = 211;
 
-    // Готовые тонкие линии, градиент, дуги, точки, крестики из вкладки 10 (страница 10)
-    int idThinLineLong  = 211; // Слот 0
-    int idGradLine      = 1888;// Слот 2: градиентная неоновая полоса
-    int idCornerMark    = 211; // Слот 3
-    int idParallelLines = 211; // Слот 4
-    int idArcThin       = 211; // Слот 6
-    int idCircleRing    = 211; // Слот 7
-    int idCircleDot     = 211; // Слот 8
-    int idSmallCross    = 211; // Слот 9
-    int idSmallTriangle = 211; // Слот 10
-    int idChevron       = 211; // Слот 11
-    int idHollowSquare  = 211; // Слот 13
-    int idDiagThin      = 211; // Слот 14
-    int idShortDash     = 211; // Слот 15
-    int idDoubleDots    = 211; // Слот 17
+    int idThinLineLong  = 211;
+    int idGradLine      = 1888;
+    int idCornerMark    = 211;
+    int idParallelLines = 211;
+    int idArcThin       = 211;
+    int idCircleRing    = 211;
+    int idCircleDot     = 211;
+    int idSmallCross    = 211;
+    int idSmallTriangle = 211;
+    int idChevron       = 211;
+    int idHollowSquare  = 211;
+    int idDiagThin      = 211;
+    int idShortDash     = 211;
+    int idDoubleDots    = 211;
 
-    // Настоящие объекты неона
     int idGlowEdgeSmall = 1888;
     int idGlowBeam      = 1888;
     int idGlowCircle    = 1888;
@@ -497,7 +558,6 @@ static EditorTabCatalog loadEditorTabCatalog(EditorUIType* ui) {
             }
         }
 
-        // Вкладка 4 (3D), страница 2 (точные блоки 3D со скриншота image_29bf02.png!)
         if (best3DBar.size() >= 20) {
             cat.id3DTrapTop   = getSlotObjectID(best3DBar, 1, 0, 211);
             cat.id3DHalfStrip = getSlotObjectID(best3DBar, 1, 1, 211);
@@ -505,7 +565,6 @@ static EditorTabCatalog loadEditorTabCatalog(EditorUIType* ui) {
             cat.id3DTriBR     = getSlotObjectID(best3DBar, 1, 6, 211);
         }
 
-        // Вкладка 10 (Декор), страницы 9 и 10
         if (bestDecorBar.size() >= 115) {
             cat.idChainLink     = getSlotObjectID(bestDecorBar, 8, 1, 211);
             cat.idSwirlSign     = getSlotObjectID(bestDecorBar, 8, 4, 211);
@@ -575,11 +634,11 @@ static int findFirstFreeEditorLayerBlock(LevelEditorLayer* editorLayer, int need
 }
 
 // ============================================================================
-// Умный ИИ-анализатор русских и английских команд игрока в чате
+// Живой диалоговый ИИ Чат-Бот (не строит на «привет», общается и понимает контекст!)
 // ============================================================================
 struct ChatBotPlan {
-    AITaskMode taskMode = AITaskMode::FullDecor;
-    int targetCount = 80;
+    AITaskMode taskMode = AITaskMode::ChatOnly;
+    int targetCount = 85;
     float preferredHue = -1.f;
     bool wantEye = false;
     bool wantSkull = false;
@@ -588,7 +647,8 @@ struct ChatBotPlan {
     bool wantGrass = true;
     bool want3D = true;
     bool wantNeon = true;
-    std::string botResponse;
+    std::string replyLine1;
+    std::string replyLine2;
 };
 
 static std::string toLowerASCII(std::string s) {
@@ -606,7 +666,6 @@ static bool containsAny(std::string const& text, std::initializer_list<const cha
 }
 
 static int extractObjectCountFromChat(std::string s) {
-    // Исключаем "3d" / "3д" / "3l", чтобы цифра 3 из "3d" не считалась количеством объектов
     for (const char* token : { "3d", "3l", "3\xD0\xB4", "3\xD0\x94" }) {
         size_t tLen = std::strlen(token);
         for (size_t pos = 0; (pos = s.find(token, pos)) != std::string::npos;) {
@@ -634,14 +693,89 @@ static int extractObjectCountFromChat(std::string s) {
     return foundNumber;
 }
 
-static ChatBotPlan parseUserChatCommand(std::string const& rawMessage) {
+static ChatBotPlan analyzeConversationAndTask(std::string const& rawMessage, int selectedCells) {
     ChatBotPlan plan;
-    std::string p = toLowerASCII(rawMessage);
+    plan.targetCount  = g_rememberedCount;
+    plan.preferredHue = g_rememberedHue;
+    plan.wantEye      = g_rememberedWantEye;
+    plan.wantSkull    = g_rememberedWantSkull;
+    plan.wantChains   = g_rememberedWantChains;
+    plan.wantArcs     = g_rememberedWantArcs;
+    plan.wantGrass    = g_rememberedWantGrass;
+
+    std::string p = trimWhitespace(toLowerASCII(rawMessage));
+
+    // 0. Пустое сообщение — НЕ строим, вежливо спрашиваем!
+    if (p.empty()) {
+        plan.taskMode = AITaskMode::ChatOnly;
+        plan.replyLine1 = "II: Napishi mne, chto budem stroit, ili pozdorovaysya!";
+        plan.replyLine2 = "Naprimer: 'privet', 'chto posovetuesh?', 'sdelay 3d' ili 'neon 90'.";
+        return plan;
+    }
 
     int extractedCount = extractObjectCountFromChat(p);
-    if (extractedCount > 0) {
-        plan.targetCount = std::clamp(extractedCount, 10, 450);
+
+    // Определяем цвет, если игрок упомянул его
+    float mentionedHue = -1.f;
+    std::string colorName;
+    if (containsAny(p, { "zelen", "laym", "green", "lime", "зелен", "лайм", "ptkty" })) {
+        mentionedHue = 112.f; colorName = "zeleniy";
+    } else if (containsAny(p, { "golub", "biryuz", "tsian", "cyan", "голуб", "бирюз", "циан", "ujke," })) {
+        mentionedHue = 186.f; colorName = "goluboy";
+    } else if (containsAny(p, { "sin", "blue", "син", "cby" })) {
+        mentionedHue = 222.f; colorName = "siniy";
+    } else if (containsAny(p, { "fiolet", "purpur", "purple", "violet", "фиолет", "пурпур", "abjktn" })) {
+        mentionedHue = 278.f; colorName = "fioletoviy";
+    } else if (containsAny(p, { "rozov", "fuksi", "pink", "magenta", "розов", "фукси", "hjpjd" })) {
+        mentionedHue = 322.f; colorName = "rozoviy";
+    } else if (containsAny(p, { "krasn", "aliy", "red", "красн", "алый", "rhfcy" })) {
+        mentionedHue = 6.f; colorName = "krasniy";
+    } else if (containsAny(p, { "oranzh", "orange", "оранж", "jhfy;" })) {
+        mentionedHue = 28.f; colorName = "oranzheviy";
+    } else if (containsAny(p, { "zhelt", "zolot", "yellow", "gold", "желт", "золот", ";tkn" })) {
+        mentionedHue = 52.f; colorName = "zheltiy";
     }
+
+    if (mentionedHue >= 0.f) {
+        g_rememberedHue = mentionedHue;
+        plan.preferredHue = mentionedHue;
+    }
+    if (extractedCount > 0) {
+        g_rememberedCount = std::clamp(extractedCount, 10, 450);
+        plan.targetCount = g_rememberedCount;
+    }
+
+    // Проверяем ключевые намерения в сообщении
+    bool isGreeting = containsAny(p, {
+        "privet", "ghbdtn", "привет", "zdrast", "zdorov", "zdarova", "здрав", "здаров",
+        "hello", "hi", "hey", "qq", " ку", "ку ", "hay", "хай", "dobriy", "добрый"
+    }) || p == "ku" || p == "ку" || p == "q" || p == "й";
+
+    bool isHowAreYou = containsAny(p, {
+        "kak dela", "rfr ltkf", "как дела", "kak ti", "как ты", "che kak", "че как",
+        "ti kto", "kto ti", "ты кто", "кто ты", "ti tut", "ты тут", "zhivoy", "живой"
+    });
+
+    bool isHelpOrQuestion = containsAny(p, {
+        "chto budem", "что будем", "chto ti umeesh", "что ты умеешь", "pomogi", "помоги",
+        "help", "sovet", "posovet", "посовет", "kakie stili", "какие стили",
+        "chto mozhno", "что можно", "kak polzovat", "как пользоват", "?"
+    });
+
+    bool isThanksOrPraise = containsAny(p, {
+        "spasibo", "спасибо", "sps", "спс", "kruto", "круто", "klass", "класс",
+        "imba", "имба", "krasivo", "красиво", "molodets", "молодец", "top", "топ", "kayf", "кайф"
+    });
+
+    bool isUndoCommand = containsAny(p, {
+        "uberi", "убери", "udali", "удали", "otmeni", "отмени", "ochisti", "очисти",
+        "undo", "clear", "nazad", "назад"
+    });
+
+    bool isRebuildCommand = containsAny(p, {
+        "peredelay", "переделай", "drugoe", "другое", "drugoy", "другой",
+        "zanovo", "заново", "esche raz", "еще раз", "ploho", "плохо", "ne nrav", "не нрав"
+    });
 
     bool mentions3D = containsAny(p, {
         "3d", "3д", "3Д", "3l", "tri d", "trid", "obem", "obyem", "объем", "объём"
@@ -652,66 +786,162 @@ static ChatBotPlan parseUserChatCommand(std::string const& rawMessage) {
     bool mentionsFill = containsAny(p, {
         "fill", "zapoln", "zaley", "zaliv", "fon", "заполн", "залей", "залив", "фон"
     });
-    bool mentionsDecorOrStyle = containsAny(p, {
-        "decor", "dekor", "stil", "style", "modern", "hell", "adsk", "real",
-        "eye", "glaz", "skull", "cherep", "arch", "ark", "dug", "arc", "chain",
-        "tsep", "cep", "uzor", "struktur", "postroy", "ukras", "random",
-        "декор", "стил", "модерн", "адск", "реали", "глаз", "череп", "арк", "дуг", "цеп", "узор", "структур"
+    bool mentionsDecorStyle = containsAny(p, {
+        "decor", "dekor", "декор", "modern", "модерн", "hell", "adsk", "адск",
+        "real", "реали", "eye", "glaz", "глаз", "ukfp", "skull", "cherep", "череп", "xthtg",
+        "arch", "ark", "арк", "dug", "arc", "дуг", "chain", "tsep", "cep", "цеп", "uzor", "узор"
     });
+    bool mentionsActionVerb = containsAny(p, {
+        "sdelay", "сделай", "cltkfq", "postroy", "построй", "gjcnhjq", "stroy", "строй",
+        "ukras", "украс", "zadekor", "задекор", "dobav", "добавь", "delay", "делай",
+        "davay", "давай", "nachinay", "начинай", "sozday", "создай", "generir", "генерир"
+    }) || p == "go" || p == "го" || p == "ok" || p == "ок";
 
-    // 1. Если игрок просит сделать 3D (например "sdelay 3d", "сделай 3д", "3d") и не просит полный декор:
-    // ИИ строит СТРОГО ТОЛЬКО 3D из готовых 3D-блоков!
-    if (mentions3D && !mentionsDecorOrStyle && !mentionsNeon && !mentionsFill && extractedCount <= 0) {
-        plan.taskMode = AITaskMode::Only3D;
-        plan.botResponse = "II: Zadacha ponyatna! Stroyu strogo cherniy 3D-obyem i beliy kontur po referensu.";
+    // 1. Отмена последней постройки
+    if (isUndoCommand) {
+        plan.taskMode = AITaskMode::UndoLast;
         return plan;
     }
 
-    // 2. Если игрок просит только неон/свечение
-    if (mentionsNeon && !mentionsDecorOrStyle && !mentions3D && !mentionsFill && extractedCount <= 0) {
-        plan.taskMode = AITaskMode::OnlyNeon;
-        plan.botResponse = "II: Zadacha ponyatna! Dobavlyayu tolko dvustoronniy konturniy neon i svechenie.";
+    // 2. Переделать постройку заново
+    if (isRebuildCommand) {
+        plan.taskMode = AITaskMode::Rebuild;
         return plan;
     }
 
-    // 3. Если игрок просит только залить/заполнить структуру
-    if (mentionsFill && !mentionsDecorOrStyle && !mentions3D && !mentionsNeon) {
-        plan.taskMode = AITaskMode::OnlyFill;
-        plan.botResponse = "II: Zadacha ponyatna! Polnostyu zalivayu vnutrennyuyu oblast strukturi.";
+    // 3. Если игрок просто поздоровался ("привет", "здарова", "ку") и НЕ просит сразу строить:
+    if (isGreeting && !mentions3D && !mentionsNeon && !mentionsFill && !mentionsDecorStyle && extractedCount <= 0) {
+        plan.taskMode = AITaskMode::ChatOnly;
+        g_greetingCounter++;
+        int variant = g_greetingCounter % 3;
+        if (variant == 0) {
+            plan.replyLine1 = fmt::format(
+                "II: Privet! Chto budem stroit? Vizhu videlenniy kontur ({} kletok).",
+                selectedCells
+            );
+            plan.replyLine2 = "Napishi stil dekora i kolichestvo obyektov, ili prosto skazhi 'sdelay 3d'!";
+        } else if (variant == 1) {
+            plan.replyLine1 = fmt::format(
+                "II: Zdarova! Kontur iz {} kletok gotov. Kakuyu zadachu vipolnyaem?",
+                selectedCells
+            );
+            plan.replyLine2 = "Mogu postroit cherniy 3D-obyem, dvustoronniy neon ili polniy dekor s glazom/cherepom!";
+        } else {
+            plan.replyLine1 = "II: Privet-privet! Ya na svyazi i zhdu tvoyu zadachu.";
+            plan.replyLine2 = fmt::format(
+                "Skazhi chto stroim v konture ({} kl.): '3d', 'neon', 'adskiy 100' ili sprosi sovet!",
+                selectedCells
+            );
+        }
         return plan;
     }
 
-    // 4. Иначе — полноценный декор по стилю и количеству объектов из сообщения
-    plan.taskMode = AITaskMode::FullDecor;
-
-    if (containsAny(p, { "zelen", "zel", "laym", "green", "lime", "зелен", "лайм", "ptkty" })) {
-        plan.preferredHue = 112.f;
-    } else if (containsAny(p, { "golub", "biryuz", "tsian", "cyan", "голуб", "бирюз", "циан", "ujke," })) {
-        plan.preferredHue = 186.f;
-    } else if (containsAny(p, { "sin", "blue", "син", "cby" })) {
-        plan.preferredHue = 222.f;
-    } else if (containsAny(p, { "fiolet", "purpur", "purple", "violet", "фиолет", "пурпур", "abjktn" })) {
-        plan.preferredHue = 278.f;
-    } else if (containsAny(p, { "rozov", "fuksi", "pink", "magenta", "розов", "фукси", "hjpjd" })) {
-        plan.preferredHue = 322.f;
-    } else if (containsAny(p, { "krasn", "aliy", "adsk", "hell", "red", "красн", "адск", "rhfcy" })) {
-        plan.preferredHue = 6.f;
-    } else if (containsAny(p, { "oranzh", "orange", "оранж", "jhfy;" })) {
-        plan.preferredHue = 28.f;
-    } else if (containsAny(p, { "zhelt", "zolot", "yellow", "gold", "желт", "золот", ";tkn" })) {
-        plan.preferredHue = 52.f;
+    // 4. Если игрок спрашивает "как дела" / "ты кто"
+    if (isHowAreYou && !mentions3D && !mentionsNeon && !mentionsFill && !mentionsDecorStyle) {
+        plan.taskMode = AITaskMode::ChatOnly;
+        plan.replyLine1 = "II: Vse otlichno! Ya tvoy II-pomoschnik po avto-postroyke v Geometry Dash.";
+        plan.replyLine2 = fmt::format(
+            "U tebya videleno {} kletok — chto budem stroit? (3D, neon ili dekor?)",
+            selectedCells
+        );
+        return plan;
     }
 
-    if (containsAny(p, { "glaz", "eye", "глаз", "ukfp" })) plan.wantEye = true;
-    if (containsAny(p, { "cherep", "adsk", "skull", "hell", "череп", "адск", "xthtg" })) plan.wantSkull = true;
-    if (containsAny(p, { "tsep", "cep", "chain", "цеп" })) plan.wantChains = true;
-    if (containsAny(p, { "dug", "krug", "arc", "дуг", "круг" })) plan.wantArcs = true;
-    if (containsAny(p, { "modern", "bez trav", "no grass", "модерн", "без трав" })) plan.wantGrass = false;
+    // 5. Если игрок спрашивает совет / "что будем строить?" / "что ты умеешь?"
+    if (isHelpOrQuestion && !mentionsActionVerb) {
+        plan.taskMode = AITaskMode::ChatOnly;
+        int recCount = std::clamp(selectedCells * 10, 45, 160);
+        plan.replyLine1 = fmt::format(
+            "II: Dlya tvoego kontura ({} kletok) sovetuyu ~{} obyektov!",
+            selectedCells, recCount
+        );
+        plan.replyLine2 = fmt::format(
+            "Poprobuy napisat: 'sdelay 3d', 'postroy neon {}' ili 'adskiy s cherepom {}'!",
+            recCount, recCount
+        );
+        return plan;
+    }
+
+    // 6. Если игрок благодарит или хвалит ("спасибо", "круто", "имба")
+    if (isThanksOrPraise && !mentionsActionVerb && !mentions3D && !mentionsNeon && !mentionsDecorStyle) {
+        plan.taskMode = AITaskMode::ChatOnly;
+        plan.replyLine1 = "II: Vsegda pozhaluysta! Rad, chto tebe ponravilos!";
+        plan.replyLine2 = "Esli zahochesh izmenit tsvet ili peredelat — prosto napishi 'peredelay' ili noviy stil.";
+        return plan;
+    }
+
+    // 7. Если игрок назвал ТОЛЬКО цвет (например "зеленый" / "хочу красный цвет") без команды строить:
+    if (mentionedHue >= 0.f && !mentions3D && !mentionsNeon && !mentionsFill && !mentionsDecorStyle && !mentionsActionVerb && extractedCount <= 0) {
+        plan.taskMode = AITaskMode::ChatOnly;
+        plan.replyLine1 = fmt::format("II: Otlichno, zapomnil {} tsvet dlya postroyki!", colorName);
+        plan.replyLine2 = "Teper skazhi, chto imenno stroim: 'tolko neon', 'dekor 90' ili 'adskiy s cherepom'!";
+        return plan;
+    }
+
+    // 8. Если игрок назвал ТОЛЬКО количество объектов (например "100" или "100 объектов") без стиля:
+    if (extractedCount > 0 && !mentions3D && !mentionsNeon && !mentionsFill && !mentionsDecorStyle && !mentionsActionVerb) {
+        plan.taskMode = AITaskMode::ChatOnly;
+        plan.replyLine1 = fmt::format("II: Zapomnil: budem delat ~{} obyektov!", plan.targetCount);
+        plan.replyLine2 = "V kakom stile stroim? Napishi 'neon', 'adskiy s cherepom', 'modern s glazom' ili 'stroy'!";
+        return plan;
+    }
+
+    // 9. Если игрок написал что-то непонятное без единой команды постройки:
+    if (!mentions3D && !mentionsNeon && !mentionsFill && !mentionsDecorStyle && !mentionsActionVerb) {
+        plan.taskMode = AITaskMode::ChatOnly;
+        plan.replyLine1 = "II: Ya gotov stroit, no utochni zadachu, chtobi ya ne stroil lishnego!";
+        plan.replyLine2 = "Napishi: 'sdelay 3d', 'tolko neon', 'zapolni' ili 'postroy dekor 90 obyektov'.";
+        return plan;
+    }
+
+    // ========================================================================
+    // ЗДЕСЬ ИГРОК ДАЛ ЧЕТКУЮ КОМАНДУ СТРОИТЬ! Определяем какую именно:
+    // ========================================================================
+    if (containsAny(p, { "glaz", "eye", "глаз", "ukfp" })) {
+        plan.wantEye = true; g_rememberedWantEye = true;
+    }
+    if (containsAny(p, { "cherep", "adsk", "skull", "hell", "череп", "адск", "xthtg" })) {
+        plan.wantSkull = true; g_rememberedWantSkull = true;
+        if (plan.preferredHue < 0.f) plan.preferredHue = 6.f;
+    }
+    if (containsAny(p, { "tsep", "cep", "chain", "цеп" })) {
+        plan.wantChains = true; g_rememberedWantChains = true;
+    }
+    if (containsAny(p, { "dug", "krug", "arc", "дуг", "круг" })) {
+        plan.wantArcs = true; g_rememberedWantArcs = true;
+    }
+    if (containsAny(p, { "modern", "bez trav", "no grass", "модерн", "без трав" })) {
+        plan.wantGrass = false; g_rememberedWantGrass = false;
+    }
     if (containsAny(p, { "bez 3d", "no 3d", "без 3д" })) plan.want3D = false;
     if (containsAny(p, { "bez neon", "no neon", "без неон" })) plan.wantNeon = false;
 
-    plan.botResponse = fmt::format(
-        "II: Stroyu novuyu unikalnuyu strukturu (~{} obyektov, polniy kontur + 3D + neon)!",
+    // A) Задача "ТОЛЬКО 3D" ("сделай 3д", "построй 3д", "3d")
+    if (mentions3D && !mentionsDecorStyle && !mentionsNeon && !mentionsFill && extractedCount <= 0) {
+        plan.taskMode = AITaskMode::Only3D;
+        plan.replyLine1 = "II: Vipolnyayu! Postroil cherniy 3D-obyem i beliy kontur po tvoemu referensu.";
+        return plan;
+    }
+
+    // B) Задача "ТОЛЬКО НЕОН" ("сделай неон", "только неон")
+    if (mentionsNeon && !mentionsDecorStyle && !mentions3D && !mentionsFill && extractedCount <= 0 &&
+        containsAny(p, { "tolko", "только", "sdelay neon", "сделай неон", "dobav neon", "добавь неон" })) {
+        plan.taskMode = AITaskMode::OnlyNeon;
+        plan.replyLine1 = "II: Vipolnyayu! Dobavil dvustoronniy konturniy neon i myagkoe svechenie.";
+        return plan;
+    }
+
+    // C) Задача "ТОЛЬКО ЗАЛИВКА" ("заполни", "залей")
+    if (mentionsFill && !mentionsDecorStyle && !mentions3D && !mentionsNeon) {
+        plan.taskMode = AITaskMode::OnlyFill;
+        plan.replyLine1 = "II: Vipolnyayu! Polnostyu zalil vnutrennyuyu oblast strukturi.";
+        return plan;
+    }
+
+    // D) Полноценный декор структуры
+    plan.taskMode = AITaskMode::FullDecor;
+    plan.replyLine1 = fmt::format(
+        "II: Gotovo! Postroil novuyu unikalnuyu strukturu (~{} obyektov, 3D + neon)!",
         plan.targetCount
     );
     return plan;
@@ -1012,7 +1242,7 @@ static std::vector<GeneratedObjectSpec> generateByAITask(
     auto islands = splitIntoIslands(contour.occupiedCells);
     int totalCells = (std::max)(1, contour.cellCount());
 
-    // 1. РЕЖИМ "ТОЛЬКО 3D" (строит эталонный черный 3D-объем и белую обводку со скриншота image_29bf02.png!)
+    // 1. РЕЖИМ "ТОЛЬКО 3D" (эталонный черный 3D-объем и белая обводка со скриншота image_29bf02.png)
     if (plan.taskMode == AITaskMode::Only3D) {
         for (auto const& isl : islands) {
             for (auto const& [gx, gy] : isl.cells) {
@@ -1024,22 +1254,18 @@ static std::vector<GeneratedObjectSpec> generateByAITask(
                 bool leftOpen   = (contour.occupiedCells.count({ gx - 1, gy }) == 0);
                 bool rightOpen  = (contour.occupiedCells.count({ gx + 1, gy }) == 0);
 
-                // Четкая белая линия контура
                 if (topOpen)    addSpec(result, 211, cx, cy + 14.2f, 1.02f, 0.06f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0);
                 if (leftOpen)   addSpec(result, 211, cx - 14.2f, cy, 0.06f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0);
                 if (rightOpen)  addSpec(result, 211, cx + 14.2f, cy, 0.06f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0);
                 if (bottomOpen && gy > 0) addSpec(result, 211, cx, cy - 14.2f, 1.02f, 0.06f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0);
 
-                // Верхний 3D: слева скошенная трапеция (Slot 0), далее прямая 3D-полоса (Slot 1)
                 if (topOpen) {
                     int top3DId = leftOpen ? cat.id3DTrapTop : cat.id3DHalfStrip;
                     addSpec(result, top3DId, cx, cy + 22.5f, 1.00f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0);
                 }
-                // Правый 3D: прямая 3D-полоса (Slot 1), повернутая на 90°
                 if (rightOpen) {
                     addSpec(result, cat.id3DHalfStrip, cx + 22.5f, cy, 1.00f, 1.00f, 90.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0);
                 }
-                // Верхний правый угол 15x15 (cx + 22.5f, cy + 22.5f): два треугольника (Slot 5 + Slot 6)
                 if (topOpen && rightOpen) {
                     addSpec(result, cat.id3DTriCorner, cx + 22.5f, cy + 22.5f, 1.00f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0);
                     addSpec(result, cat.id3DTriBR,     cx + 22.5f, cy + 22.5f, 1.00f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0);
@@ -1308,12 +1534,26 @@ static std::vector<GeneratedObjectSpec> generateByAITask(
 }
 
 // ============================================================================
-// Спавн сгенерированных объектов в LevelEditorLayer
+// Спавн и отмена сгенерированных объектов в LevelEditorLayer
 // ============================================================================
 struct SpawnSummary {
     int createdCount = 0;
     int firstLayer = 1;
 };
+
+static int undoLastSpawnedObjects() {
+    int removed = 0;
+    for (auto& obj : g_lastSpawnedObjects) {
+        if (obj && obj->getParent()) {
+            writeObjScale(static_cast<GameObject*>(obj), 0.f, 0.f);
+            obj->setPosition(CCPoint{ -99999.f, -99999.f });
+            obj->setOpacity(0);
+            removed++;
+        }
+    }
+    g_lastSpawnedObjects.clear();
+    return removed;
+}
 
 static SpawnSummary spawnContourDecorInEditor(
     EditorUI* ui,
@@ -1327,6 +1567,8 @@ static SpawnSummary spawnContourDecorInEditor(
 
     auto* editorLayer = ui->m_editorLayer;
     summary.firstLayer = findFirstFreeEditorLayerBlock(editorLayer, 4);
+
+    g_lastSpawnedObjects.clear();
 
     if (taskMode == AITaskMode::FullDecor || taskMode == AITaskMode::OnlyFill) {
         for (GameObject* baseObj : contour.solidObjects) {
@@ -1359,6 +1601,7 @@ static SpawnSummary spawnContourDecorInEditor(
         writeObjEditorLayers(obj, assignedLayer, 0);
         bindObjectToPaletteSlot(obj, palette, s.colorSlot, s.customOpacity);
 
+        g_lastSpawnedObjects.push_back(obj);
         summary.createdCount++;
     }
 
@@ -1382,12 +1625,12 @@ static constexpr RusKeyEntry kRusKeyTable[] = {
     { 'P', "z",   'p', 'P' }, { 0xDB, "h",  '[', '{' }, { 0xDD, "",   ']', '}' },
     { 'A', "f",   'a', 'A' }, { 'S', "y",   's', 'S' }, { 'D', "v",   'd', 'D' },
     { 'F', "a",   'f', 'F' }, { 'G', "p",   'g', 'G' }, { 'H', "r",   'h', 'H' },
-    { 'J', "o",   'j', 'J' }, { 'K', "l",   'k', 'K' }, { 'L', "d",   'l', 'L' },
+    { 'J', "o",   'j', 'J' }, { 'K', "l",   'k', 'K' }, { 'L', "d",   'd', 'D' },
     { 0xBA, "zh", ';', ':' }, { 0xDE, "e",  '\'', '"' },
     { 'Z', "ya",  'z', 'Z' }, { 'X', "ch",  'x', 'X' }, { 'C', "s",   'c', 'C' },
     { 'V', "m",   'v', 'V' }, { 'B', "i",   'b', 'B' }, { 'N', "t",   'n', 'N' },
     { 'M', "",    'm', 'M' }, { 0xBC, "b",  ',', '<' }, { 0xBE, "yu", '.', '>' },
-    { 0xBF, ".",  '/', '?' }, { 0xBD, "-",  '-', '_' }
+    { 0xBF, "?",  '/', '?' }, { 0xBD, "-",  '-', '_' }
 };
 
 static std::string readWindowsClipboardText() {
@@ -1405,16 +1648,11 @@ static std::string readWindowsClipboardText() {
         CloseClipboard();
     }
 #endif
-    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' ' || out.back() == '\t')) {
-        out.pop_back();
-    }
-    return out;
+    return trimWhitespace(out);
 }
 
 // ============================================================================
-// СЕРОЕ МЕНЮ МОДА (на проверенных CCLabelBMFont + CCScale9Sprite + Popup):
-// 1. Сначала окно подключения/смены API (с выбором провайдера и вставкой ключа)
-// 2. После подключения — серое окно ЧАТА с кнопкой «Change API / Smenit API»
+// СЕРОЕ МЕНЮ МОДА С ЗЕЛЕНОЙ ГАЛОЧКОЙ API И ЖИВЫМ ЧАТ-БОТОМ
 // ============================================================================
 class AIDecorPopup;
 static AIDecorPopup* g_activePopup = nullptr;
@@ -1432,6 +1670,11 @@ protected:
     CCLabelBMFont* m_inputDisplayLabel = nullptr;
     CCLabelBMFont* m_langBadgeLabel = nullptr;
     CCLabelBMFont* m_providerBtnLabel = nullptr;
+    CCLabelBMFont* m_apiFoundTextLabel = nullptr;
+    CCScale9Sprite* m_checkBoxBg = nullptr;
+    CCNode* m_checkTickContainer = nullptr;
+    CCSprite* m_nativeCheckSprite = nullptr;
+
     CCLabelBMFont* m_chatLine1 = nullptr;
     CCLabelBMFont* m_chatLine2 = nullptr;
     CCLabelBMFont* m_chatLine3 = nullptr;
@@ -1446,7 +1689,7 @@ protected:
         loadApiConfigFromDisk();
         m_providerIdx = g_apiProviderIndex;
         m_isApiStage = forceApiStage || !g_apiConnected;
-        m_russianLayout = !m_isApiStage; // В окне API по умолчанию ENG, в чате — RUS!
+        m_russianLayout = !m_isApiStage;
 
         if (m_isApiStage && !g_connectedApiKey.empty()) {
             m_inputBuffer = g_connectedApiKey;
@@ -1461,7 +1704,7 @@ protected:
         auto size = m_mainLayer->getContentSize();
         auto center = CCPoint{ size.width / 2.f, size.height / 2.f };
 
-        // Полностью серый корпус меню
+        // Серый корпус меню
         auto grayOuter = CCScale9Sprite::create("square02b_001.png");
         grayOuter->setContentSize(CCSize{ size.width, size.height });
         grayOuter->setColor(ccColor3B{ 62, 66, 74 });
@@ -1494,6 +1737,77 @@ protected:
         return true;
     }
 
+    // Создает визуальную ГАЛОЧКУ (зеленый значок ✓ + нативная иконка GD)
+    void createCheckmarkIndicator(CCPoint pos, bool initiallyChecked) {
+        m_checkBoxBg = CCScale9Sprite::create("square02b_001.png");
+        m_checkBoxBg->setContentSize(CCSize{ 22.f, 22.f });
+        m_checkBoxBg->setPosition(pos);
+        m_mainLayer->addChild(m_checkBoxBg);
+
+        m_checkTickContainer = CCNode::create();
+        m_checkTickContainer->setPosition(pos);
+        m_mainLayer->addChild(m_checkTickContainer);
+
+        // Векторная белая галочка ✓ из двух гладких плашек (гарантированно видна всегда!)
+        auto shortLeg = CCScale9Sprite::create("square02b_001.png");
+        shortLeg->setContentSize(CCSize{ 3.6f, 8.2f });
+        shortLeg->setColor(ccColor3B{ 255, 255, 255 });
+        shortLeg->setRotation(-40.f);
+        shortLeg->setPosition(CCPoint{ -3.0f, -1.5f });
+        m_checkTickContainer->addChild(shortLeg);
+
+        auto longLeg = CCScale9Sprite::create("square02b_001.png");
+        longLeg->setContentSize(CCSize{ 3.6f, 13.5f });
+        longLeg->setColor(ccColor3B{ 255, 255, 255 });
+        longLeg->setRotation(38.f);
+        longLeg->setPosition(CCPoint{ 2.5f, 1.0f });
+        m_checkTickContainer->addChild(longLeg);
+
+        // Плюс нативная зеленая галочка GD поверх, если загружена в кэше спрайтов
+        m_nativeCheckSprite = CCSprite::createWithSpriteFrameName("GJ_completesIcon_001.png");
+        if (m_nativeCheckSprite) {
+            m_nativeCheckSprite->setScale(0.68f);
+            m_nativeCheckSprite->setPosition(pos);
+            m_mainLayer->addChild(m_nativeCheckSprite);
+        }
+
+        setCheckmarkState(initiallyChecked);
+    }
+
+    void setCheckmarkState(bool checked) {
+        if (m_checkBoxBg) {
+            m_checkBoxBg->setColor(checked ? ccColor3B{ 40, 205, 95 } : ccColor3B{ 58, 62, 70 });
+        }
+        if (m_checkTickContainer) {
+            m_checkTickContainer->setScale(checked ? 1.0f : 0.0f);
+        }
+        if (m_nativeCheckSprite) {
+            m_nativeCheckSprite->setScale(checked ? 0.68f : 0.0f);
+        }
+    }
+
+    void updateApiCheckmarkAndStatus() {
+        if (!m_isApiStage) return;
+        bool keyFound = isValidApiKey(m_inputBuffer);
+        setCheckmarkState(keyFound);
+
+        if (m_apiFoundTextLabel) {
+            if (keyFound) {
+                int detProv = detectProviderFromKey(m_inputBuffer, m_providerIdx);
+                std::string msg = fmt::format(
+                    "API-klyuch nayden! Provider: {} ({})",
+                    kApiProviders[detProv].name,
+                    maskApiKeyPreview(m_inputBuffer)
+                );
+                m_apiFoundTextLabel->setString(msg.c_str());
+                m_apiFoundTextLabel->setColor(ccColor3B{ 115, 250, 155 });
+            } else {
+                m_apiFoundTextLabel->setString("API-klyuch esche ne nayden (vstavte klyuch Ctrl+V)");
+                m_apiFoundTextLabel->setColor(ccColor3B{ 225, 185, 125 });
+            }
+        }
+    }
+
     void restoreLockedContourPositions() {
         for (auto const& st : m_contour.lockedStates) {
             if (st.obj && st.obj->getParent()) {
@@ -1524,14 +1838,14 @@ protected:
         cardBg->setPosition(CCPoint{ center.x, center.y + 28.f });
         m_mainLayer->addChild(cardBg);
 
-        std::string statusLine = g_apiConnected
-            ? fmt::format("Tekuschiy API: {} (Key: {})", kApiProviders[m_providerIdx].name, maskApiKeyPreview(g_connectedApiKey))
-            : "Pered zapuskom moda podklyuchite II po API!";
-        auto notice1 = CCLabelBMFont::create(statusLine.c_str(), "chatFont.fnt");
-        notice1->setScale(0.60f);
-        notice1->setColor(g_apiConnected ? ccColor3B{ 165, 240, 195 } : ccColor3B{ 225, 232, 245 });
-        notice1->setPosition(CCPoint{ center.x, center.y + 54.f });
-        m_mainLayer->addChild(notice1);
+        // Галочка обнаружения API-ключа + текстовый статус рядом с ней
+        bool keyFoundNow = isValidApiKey(m_inputBuffer);
+        createCheckmarkIndicator(CCPoint{ center.x - 168.f, center.y + 54.f }, keyFoundNow);
+
+        m_apiFoundTextLabel = CCLabelBMFont::create("", "chatFont.fnt");
+        m_apiFoundTextLabel->setScale(0.57f);
+        m_apiFoundTextLabel->setPosition(CCPoint{ center.x + 14.f, center.y + 54.f });
+        m_mainLayer->addChild(m_apiFoundTextLabel);
 
         // Кнопка переключения провайдера API (OpenAI / Gemini / DeepSeek / Groq / OpenRouter)
         auto provBg = CCScale9Sprite::create("square02b_001.png");
@@ -1549,10 +1863,10 @@ protected:
         m_buttonMenu->addChild(provBtn);
 
         auto notice2 = CCLabelBMFont::create(
-            "Vstavte API-key (Ctrl+V ili knopkoy) i nazhmite Save / Connect API:",
+            "Vstavte API-klyuch (Ctrl+V) — zagoritsya ZELENAYA GALOCHKA, zatem Connect:",
             "chatFont.fnt"
         );
-        notice2->setScale(0.52f);
+        notice2->setScale(0.50f);
         notice2->setColor(ccColor3B{ 170, 178, 192 });
         notice2->setPosition(CCPoint{ center.x, center.y - 4.f });
         m_mainLayer->addChild(notice2);
@@ -1568,7 +1882,9 @@ protected:
         m_inputDisplayLabel->setScale(0.58f);
         m_inputDisplayLabel->setPosition(CCPoint{ center.x, center.y - 42.f });
         m_mainLayer->addChild(m_inputDisplayLabel);
+
         refreshInputLabel();
+        updateApiCheckmarkAndStatus();
 
         // Кнопки управления API: [Paste Ctrl+V] [Clear] [Save / Connect API]
         auto pasteSpr = ButtonSprite::create("Paste (Ctrl+V)");
@@ -1594,9 +1910,17 @@ protected:
     }
 
     void setupChatStageUI(CCPoint center) {
-        this->setTitle("II CHAT-BOT (Right Alt - Open/Close)");
+        this->setTitle("II CHAT-BOT");
 
-        // Кнопка смены API прямо в шапке серого окна чата!
+        // Зеленая галочка в шапке чата, подтверждающая, что API-ключ найден и активен!
+        createCheckmarkIndicator(CCPoint{ center.x - 178.f, center.y + 96.f }, isValidApiKey(g_connectedApiKey));
+        auto apiOkLbl = CCLabelBMFont::create("API OK", "chatFont.fnt");
+        apiOkLbl->setScale(0.48f);
+        apiOkLbl->setColor(ccColor3B{ 115, 250, 155 });
+        apiOkLbl->setPosition(CCPoint{ center.x - 144.f, center.y + 96.f });
+        m_mainLayer->addChild(apiOkLbl);
+
+        // Кнопка смены API прямо в шапке серого окна чата
         auto apiBg = CCScale9Sprite::create("square02b_001.png");
         apiBg->setContentSize(CCSize{ 88.f, 22.f });
         apiBg->setColor(ccColor3B{ 75, 80, 90 });
@@ -1636,34 +1960,33 @@ protected:
             : 1;
 
         std::string greeting1 = fmt::format(
-            "II ({} API: {}): Videleno {} kletok (sloi {}-{}).",
+            "II ({} API Nayden): Kontur {} kletok (sloi {}-{}).",
             kApiProviders[m_providerIdx].name,
-            maskApiKeyPreview(g_connectedApiKey),
             m_contour.cellCount(),
             freeLayer,
             freeLayer + 3
         );
         m_chatLine1 = CCLabelBMFont::create(greeting1.c_str(), "chatFont.fnt");
-        m_chatLine1->setScale(0.56f);
+        m_chatLine1->setScale(0.55f);
         m_chatLine1->setColor(ccColor3B{ 195, 205, 220 });
         m_chatLine1->setPosition(CCPoint{ center.x, center.y + 52.f });
         m_mainLayer->addChild(m_chatLine1);
 
         m_chatLine2 = CCLabelBMFont::create(
-            "Napishi zadachu, stil dekora i kolichestvo obyektov (ili 'smenit api'):",
+            "II: Privet! Chto budem stroit? Pozdorovaysya ili opishi zadachu!",
             "chatFont.fnt"
         );
         m_chatLine2->setScale(0.54f);
-        m_chatLine2->setColor(ccColor3B{ 170, 178, 192 });
+        m_chatLine2->setColor(ccColor3B{ 165, 240, 195 });
         m_chatLine2->setPosition(CCPoint{ center.x, center.y + 18.f });
         m_mainLayer->addChild(m_chatLine2);
 
         m_chatLine3 = CCLabelBMFont::create(
-            "Primeri: 'sdelay 3d', 'neon 90', 'adskiy stil s cherepom 120', 'glaz 80'",
+            "Mozhno pisat: 'privet', 'chto posovetuesh?', 'sdelay 3d', 'neon 90', 'otmeni'",
             "chatFont.fnt"
         );
-        m_chatLine3->setScale(0.50f);
-        m_chatLine3->setColor(ccColor3B{ 140, 150, 165 });
+        m_chatLine3->setScale(0.49f);
+        m_chatLine3->setColor(ccColor3B{ 145, 155, 170 });
         m_chatLine3->setPosition(CCPoint{ center.x, center.y - 16.f });
         m_mainLayer->addChild(m_chatLine3);
 
@@ -1701,7 +2024,7 @@ protected:
             if (m_isApiStage) {
                 m_inputDisplayLabel->setString("Paste API key (Ctrl+V) or type here...");
             } else {
-                m_inputDisplayLabel->setString("Napishi zadachu II na russkom (Enter - otpravit)...");
+                m_inputDisplayLabel->setString("Napishi soobschenie II na russkom (Enter - otpravit)...");
             }
             m_inputDisplayLabel->setColor(ccColor3B{ 145, 150, 162 });
         } else {
@@ -1712,6 +2035,9 @@ protected:
             shown += "|";
             m_inputDisplayLabel->setString(shown.c_str());
             m_inputDisplayLabel->setColor(ccColor3B{ 245, 248, 255 });
+        }
+        if (m_isApiStage) {
+            updateApiCheckmarkAndStatus();
         }
     }
 
@@ -1747,6 +2073,7 @@ protected:
             std::string provText = fmt::format("API Provider: {} (Click to change)", kApiProviders[m_providerIdx].name);
             m_providerBtnLabel->setString(provText.c_str());
         }
+        updateApiCheckmarkAndStatus();
     }
 
     void onPasteApiClicked(CCObject*) {
@@ -1769,9 +2096,14 @@ protected:
     }
 
     void onConnectApiClicked(CCObject*) {
-        std::string key = m_inputBuffer;
-        if (key.empty()) {
-            key = "ai-connected-key";
+        std::string key = trimWhitespace(m_inputBuffer);
+        if (!isValidApiKey(key)) {
+            if (m_apiFoundTextLabel) {
+                m_apiFoundTextLabel->setString("Oshibka: Snachala vvedite ili vstavte API-klyuch (Ctrl+V)!");
+                m_apiFoundTextLabel->setColor(ccColor3B{ 255, 115, 115 });
+            }
+            setCheckmarkState(false);
+            return;
         }
         m_providerIdx = detectProviderFromKey(key, m_providerIdx);
         saveApiConfigToDisk(m_providerIdx, key);
@@ -1781,15 +2113,65 @@ protected:
     void onSendChatClicked(CCObject*) {
         restoreLockedContourPositions();
 
-        std::string lowCmd = toLowerASCII(m_inputBuffer);
+        std::string userText = trimWhitespace(m_inputBuffer);
+        std::string lowCmd = toLowerASCII(userText);
+
         if (containsAny(lowCmd, { "smenit api", "pomenyat api", "izmenit api", "noviy api", "change api" }) ||
             lowCmd == "api" || lowCmd == "/api") {
             reopenWithStage(true);
             return;
         }
 
+        ChatBotPlan plan = analyzeConversationAndTask(userText, m_contour.cellCount());
+
+        // 1. Обычный разговор в чате (на "привет", вопросы, обсуждение — НИЧЕГО НЕ СТРОИМ!)
+        if (plan.taskMode == AITaskMode::ChatOnly) {
+            if (m_chatLine1 && m_chatLine2 && m_chatLine3) {
+                std::string shownUser = userText.empty() ? "Vi: ..." : ("Vi: " + userText);
+                m_chatLine1->setString(shownUser.c_str());
+                m_chatLine1->setColor(ccColor3B{ 235, 240, 250 });
+
+                m_chatLine2->setString(plan.replyLine1.c_str());
+                m_chatLine2->setColor(ccColor3B{ 165, 240, 195 });
+
+                m_chatLine3->setString(plan.replyLine2.c_str());
+                m_chatLine3->setColor(ccColor3B{ 200, 210, 225 });
+            }
+            m_inputBuffer.clear();
+            refreshInputLabel();
+            return;
+        }
+
+        // 2. Отмена последней постройки ("убери", "отмени", "удали")
+        if (plan.taskMode == AITaskMode::UndoLast) {
+            int removedCount = undoLastSpawnedObjects();
+            if (m_chatLine1 && m_chatLine2 && m_chatLine3) {
+                m_chatLine1->setString(("Vi: " + userText).c_str());
+                m_chatLine1->setColor(ccColor3B{ 235, 240, 250 });
+
+                std::string r1 = (removedCount > 0)
+                    ? fmt::format("II: Ubral poslednyuyu postroyku ({} obyektov)!", removedCount)
+                    : "II: Poka nechego otmenyat — mi esche nichego ne postroili.";
+                m_chatLine2->setString(r1.c_str());
+                m_chatLine2->setColor(ccColor3B{ 165, 240, 195 });
+
+                m_chatLine3->setString("II: Chto teper postroim? Opishi noviy stil ili napishi 'sdelay 3d'!");
+                m_chatLine3->setColor(ccColor3B{ 200, 210, 225 });
+            }
+            m_inputBuffer.clear();
+            refreshInputLabel();
+            return;
+        }
+
+        // 3. Переделать постройку ("переделай", "другой вариант")
+        if (plan.taskMode == AITaskMode::Rebuild) {
+            undoLastSpawnedObjects();
+            plan.taskMode = AITaskMode::FullDecor;
+            plan.replyLine1 = "II: Peredelal s novim tsvetom i drugim uzorom!";
+        }
+
+        // 4. Выполнение конкретной строительной задачи (Only3D / OnlyNeon / OnlyFill / FullDecor)
         std::mt19937 rng(std::random_device{}());
-        ChatBotPlan plan = parseUserChatCommand(m_inputBuffer);
         EditorTabCatalog catalog = loadEditorTabCatalog(m_editorUI);
         StylePalette palette = buildPaletteFromBotPlan(plan, rng);
 
@@ -1797,17 +2179,14 @@ protected:
         SpawnSummary summary = spawnContourDecorInEditor(m_editorUI, m_contour, specs, palette, plan.taskMode);
 
         if (m_chatLine1 && m_chatLine2 && m_chatLine3) {
-            std::string userLine = m_inputBuffer.empty()
-                ? "Vi: [Sdelat noviy sluchayniy dekor]"
-                : ("Vi: " + m_inputBuffer);
-            m_chatLine1->setString(userLine.c_str());
+            m_chatLine1->setString(("Vi: " + userText).c_str());
             m_chatLine1->setColor(ccColor3B{ 235, 240, 250 });
 
-            m_chatLine2->setString(plan.botResponse.c_str());
+            m_chatLine2->setString(plan.replyLine1.c_str());
             m_chatLine2->setColor(ccColor3B{ 165, 240, 195 });
 
             std::string statLine = fmt::format(
-                "Gotovo: sozdano {} obyektov na sloyah {}-{}. Nazhmi Right Alt chtobi zakrit.",
+                "Sozdano {} obyektov (sloi {}-{}). Napishi 'peredelay', 'otmeni' ili novuyu zadachu!",
                 summary.createdCount, summary.firstLayer, summary.firstLayer + 3
             );
             m_chatLine3->setString(statLine.c_str());
@@ -1833,13 +2212,11 @@ protected:
             return just;
         };
 
-        // Alt+Shift переключает раскладку RUS / ENG
         if (altDown && wasJustPressed(VK_SHIFT)) {
             onToggleLanguage(nullptr);
             return;
         }
 
-        // Ctrl+V вставляет текст из буфера обмена Windows
         if (ctrlDown && wasJustPressed('V')) {
             if (m_isApiStage) {
                 onPasteApiClicked(nullptr);
