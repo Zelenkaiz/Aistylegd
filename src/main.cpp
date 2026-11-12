@@ -5,8 +5,8 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/EditorUI.hpp>
 #include <Geode/ui/Popup.hpp>
-#include <Geode/ui/TextInput.hpp>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <queue>
 #include <random>
@@ -25,23 +25,29 @@
 using namespace geode::prelude;
 
 // ============================================================================
-// Слоты цветовой палитры (один тип объектов на слое = строго один оттенок)
-// и роли слоев редактора (первый свободный блок из 4 слоев)
+// Слоты цветовой палитры и роли слоев редактора
 // ============================================================================
 enum class ColorSlot : int {
-    DarkFill = 0,         // Слой +0: глубокий темный фон внутри структуры
-    Dark3D = 1,           // Слой +2: темные 3D-блоки (как на фото-примере 3D)
-    MidTone = 2,          // Слой +1: внутренние рамки, скобы, дуги, узоры среднего тона
-    BrightMain = 3,       // Слой +1/+3: яркий акцент (глаз, череп, блики, трава, вложенный шип)
-    HighlightOutline = 4, // Слой +2: светлая четкая обводка контура и мелкие акценты
+    DarkFill = 0,         // Слой +0: темный фон внутри структуры
+    Dark3D = 1,           // Слой +2: глубокий черный/темный тон для 3D-блоков
+    MidTone = 2,          // Слой +1: средний тон для внутренних рамок, дуг и полос
+    BrightMain = 3,       // Слой +1/+3: главный яркий цвет (эмблемы, глаз, череп, блики, трава)
+    HighlightOutline = 4, // Слой +2: светлая четкая обводка контура и микро-детали
     AdditiveGlow = 5      // Слой +3: неоновое свечение (мелкий контурный неон + мягкий глоу)
 };
 
 enum class LayerRole : int {
-    Fill = 0,        // firstFreeLayer + 0: Сплошное внутреннее заполнение
-    InnerDetail = 1, // firstFreeLayer + 1: Внутренний декор (уменьшенные детали, арки, глаз/череп)
-    Outline3D = 2,   // firstFreeLayer + 2: Белая/светлая обводка контура + 3D-блоки
-    NeonAndGrass = 3 // firstFreeLayer + 3: Двусторонний мелкий неон, свечение и трава
+    Fill = 0,        // firstFreeLayer + 0: Заполнение
+    InnerDetail = 1, // firstFreeLayer + 1: Внутренний декор
+    Outline3D = 2,   // firstFreeLayer + 2: Контур и 3D-блоки
+    NeonAndGrass = 3 // firstFreeLayer + 3: Неон и внешняя трава
+};
+
+enum class AITaskMode {
+    Only3D = 0,     // Игрок попросил сделать ТОЛЬКО 3D
+    OnlyNeon = 1,   // Игрок попросил сделать ТОЛЬКО неон/свечение
+    OnlyFill = 2,   // Игрок попросил ТОЛЬКО залить/заполнить контур
+    FullDecor = 3   // Полноценный декор выбранного стиля и количества объектов
 };
 
 struct StylePalette {
@@ -63,10 +69,17 @@ struct SelectedSpikeInfo {
     GameObject* sourceObj = nullptr;
 };
 
+struct LockedObjectState {
+    Ref<GameObject> obj;
+    CCPoint pos{ 0.f, 0.f };
+    float rotation = 0.f;
+};
+
 struct ContourAnalysis {
     std::set<std::pair<int, int>> occupiedCells;
     std::vector<SelectedSpikeInfo> spikes;
     std::vector<GameObject*> solidObjects;
+    std::vector<LockedObjectState> lockedStates;
     float minX = 0.f;
     float minY = 0.f;
     float maxX = 0.f;
@@ -91,14 +104,15 @@ struct GeneratedObjectSpec {
     GLubyte customOpacity = 255;
     bool noTouch = true;
     bool noGlow = true;
-    int priorityTier = 1; // 0 = обязательная база/3D/неон, 1 = структура, 2 = декор, 3 = микро-детали
+    int priorityTier = 1;
 };
 
 static int g_lastHueBucket = -1;
 static int g_lastLayoutSeed = -1;
+static bool g_apiConnectedSession = false;
 
 // ============================================================================
-// Безопасные C++23 шаблоны для доступа к полям GameObject и EditorUI
+// C++23 безопасные шаблоны для доступа к полям GameObject и EditorUI
 // ============================================================================
 template <typename ObjT>
 static int readObjID(ObjT* obj) {
@@ -277,17 +291,17 @@ static void bindObjectToPaletteSlot(ObjT* obj, StylePalette const& pal, ColorSlo
 }
 
 // ============================================================================
-// Каталог готовых блоков из вкладок редактора (3D, Глаз, Череп, Декор, Неон)
+// Чтение готовых блоков из вкладок редактора (3D, Глаз, Череп, Декор, Неон)
 // ============================================================================
 struct EditorTabCatalog {
     // Готовые 3D-блоки из вкладки 4 (страница 2, как на скриншоте 3D)
     int id3DTrapTop    = 211; // Слот 0: скошенная 3D-трапеция сверху слева (/¯¯¯|)
-    int id3DHalfStrip  = 211; // Слот 1: прямая 3D-полоса (30x15 сверху или 15x30 справа)
+    int id3DHalfStrip  = 211; // Слот 1: прямая 3D-полоса (30x15 сверху и 15x30 справа)
     int id3DMedRect    = 211; // Слот 2: средний 3D-блок
     int id3DSmallSq    = 211; // Слот 3: малый 3D-квадрат (15x15)
     int id3DLCorner    = 211; // Слот 4: угловой 3D-блок
-    int id3DTriCorner  = 211; // Слот 5: верхне-левый 3D-треугольник 15x15
-    int id3DTriBR      = 211; // Слот 6: нижне-правый 3D-треугольник 15x15 (для угла!)
+    int id3DTriCorner  = 211; // Слот 5: верхне-левый 3D-треугольник 15x15 (|‾/)
+    int id3DTriBR      = 211; // Слот 6: нижне-правый 3D-треугольник 15x15 (/_|)
     int id3DBrickTrap  = 211; // Слот 9: кирпичная 3D-трапеция
     int id3DBrickStrip = 211; // Слот 10: кирпичная 3D-полоса
 
@@ -319,10 +333,10 @@ struct EditorTabCatalog {
     int idSlashTickSmall = 211;
     int idSlashTickWide  = 211;
 
-    // Готовые тонкие линии, дуги, точки, крестики из вкладки 10 (страница 10)
+    // Готовые тонкие линии, градиент, дуги, точки, крестики из вкладки 10 (страница 10)
     int idDoubleDots    = 211;
     int idThinLineLong  = 211;
-    int idGradLine      = 211; // Слот 2: градиентная неоновая полоса!
+    int idGradLine      = 1888;
     int idThinLineShort = 211;
     int idArcThin       = 211;
     int idCircleDot     = 211;
@@ -333,7 +347,7 @@ struct EditorTabCatalog {
     int idArcThickLarge = 211;
     int idArcThickSmall = 211;
 
-    // Настоящие объекты неона/свечения (найденные на странице с 1888 + градиент)
+    // Настоящие объекты неона
     int idGlowCircle    = 1888;
     int idGlowEdgeSmall = 1888;
     int idGlowEdgeFull  = 1888;
@@ -378,7 +392,6 @@ static void findRealGlowObjectsInTab(EditorUIT* ui, EditorTabCatalog& cat) {
         if constexpr (requires { bar->m_buttonArray; }) {
             CCArray* btns = bar->m_buttonArray;
             if (!btns) return;
-            // Ищем страницу, где находится настоящий глоу 1888, чтобы взять соседний мелкий краевой неон!
             for (unsigned int i = 0; i < btns->count(); ++i) {
                 auto* item = static_cast<CreateMenuItem*>(btns->objectAtIndex(i));
                 if (!item) continue;
@@ -409,7 +422,7 @@ static EditorTabCatalog loadEditorTabCatalog(EditorUI* ui) {
     EditorTabCatalog cat;
     if (!ui) return cat;
 
-    // Вкладка 4 (3D), страница 2 (ровно те блоки, из которых построен 3D на скриншоте!)
+    // Вкладка 4 (3D), страница 2 (точные блоки 3D со скриншота!)
     cat.id3DTrapTop    = readButtonObjectIDFromTab(ui, 4, 2, 0, 211);
     cat.id3DHalfStrip  = readButtonObjectIDFromTab(ui, 4, 2, 1, 211);
     cat.id3DMedRect    = readButtonObjectIDFromTab(ui, 4, 2, 2, 211);
@@ -462,14 +475,12 @@ static EditorTabCatalog loadEditorTabCatalog(EditorUI* ui) {
     cat.idArcThickLarge = readButtonObjectIDFromTab(ui, 10, 10, 10, 211);
     cat.idArcThickSmall = readButtonObjectIDFromTab(ui, 10, 10, 11, 211);
 
-    // Находим точные объекты глоу на странице, где лежит 1888
     findRealGlowObjectsInTab(ui, cat);
-
     return cat;
 }
 
 // ============================================================================
-// Поиск первого свободного блока из 4 слоев (Editor Layer)
+// Автоматический поиск первого свободного блока из 4 слоев редактора
 // ============================================================================
 template <typename EditorLayerT>
 static int findFirstFreeEditorLayerBlock(EditorLayerT* editorLayer, int neededConsecutive = 4) {
@@ -504,20 +515,21 @@ static int findFirstFreeEditorLayerBlock(EditorLayerT* editorLayer, int neededCo
 }
 
 // ============================================================================
-// Разбор команд ИИ Чат-Боту и генерация нового цвета при каждом запуске
+// Умный ИИ-анализатор русских и английских команд игрока в чате
 // ============================================================================
 struct ChatBotPlan {
+    AITaskMode taskMode = AITaskMode::FullDecor;
+    int targetCount = 80;
     bool hasExplicitColor = false;
     ccColor3B explicitColor{ 115, 255, 25 };
     bool wantEye = false;
     bool wantSkull = false;
     bool wantChains = false;
     bool wantArcs = false;
-    bool wantBricks = false;
     bool wantGrass = true;
     bool want3D = true;
     bool wantNeon = true;
-    std::string botReply;
+    std::string botResponseRU;
 };
 
 static std::string toLowerASCII(std::string s) {
@@ -527,51 +539,129 @@ static std::string toLowerASCII(std::string s) {
     return s;
 }
 
-static ChatBotPlan parseChatBotMessage(std::string const& rawPrompt) {
-    ChatBotPlan plan;
-    std::string p = toLowerASCII(rawPrompt);
+static bool containsAny(std::string const& text, std::initializer_list<const char*> terms) {
+    for (const char* t : terms) {
+        if (text.find(t) != std::string::npos) return true;
+    }
+    return false;
+}
 
-    if (p.find("green") != std::string::npos || p.find("зелен") != std::string::npos || p.find("лайм") != std::string::npos) {
+static int extractObjectCountFromChat(std::string s) {
+    // Убираем "3д" и "3d", чтобы цифра 3 из "3д" не считалась количеством объектов!
+    for (size_t pos = 0; (pos = s.find("3d", pos)) != std::string::npos;) {
+        s.replace(pos, 2, "  ");
+    }
+    for (size_t pos = 0; (pos = s.find("3\xD0\xB4", pos)) != std::string::npos;) { // "3д"
+        s.replace(pos, 3, "   ");
+    }
+    for (size_t pos = 0; (pos = s.find("3\xD0\x94", pos)) != std::string::npos;) { // "3Д"
+        s.replace(pos, 3, "   ");
+    }
+
+    int foundNumber = -1;
+    size_t i = 0;
+    while (i < s.size()) {
+        if (s[i] >= '0' && s[i] <= '9') {
+            int val = 0;
+            while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+                val = val * 10 + (s[i] - '0');
+                ++i;
+            }
+            if (val >= 5 && val <= 1000) {
+                foundNumber = val;
+                break;
+            }
+        } else {
+            ++i;
+        }
+    }
+    return foundNumber;
+}
+
+static ChatBotPlan parseUserChatCommand(std::string const& rawMessage) {
+    ChatBotPlan plan;
+    std::string p = toLowerASCII(rawMessage);
+
+    int extractedCount = extractObjectCountFromChat(p);
+    if (extractedCount > 0) {
+        plan.targetCount = std::clamp(extractedCount, 10, 450);
+    }
+
+    bool mentions3D = containsAny(p, { "3d", "3д", "3Д", "объем", "объём", "трид", "3l" });
+    bool mentionsNeon = containsAny(p, { "неон", "НЕОН", "neon", "glow", "глоу", "свеч", "свет", "ytjy" });
+    bool mentionsFill = containsAny(p, { "заполн", "залей", "залив", "фон", "fill" });
+    bool mentionsDecorOrStyle = containsAny(p, {
+        "декор", "ДЕКОР", "decor", "стил", "style", "модерн", "modern",
+        "адск", "hell", "реали", "real", "глаз", "eye", "череп", "skull",
+        "арк", "arch", "дуг", "arc", "цеп", "chain", "узор", "структур",
+        "построй", "украс", "рандом", "random", "нов"
+    });
+
+    // 1. Точное определение задачи ИИ:
+    // Если игрок просит сделать 3D (например "сделай 3д", "3д", "добавь 3д") и НЕ просит полный декор/стиль —
+    // ИИ строит СТРОГО ТОЛЬКО 3D из готовых 3D-блоков!
+    if (mentions3D && !mentionsDecorOrStyle && !mentionsNeon && !mentionsFill && extractedCount <= 0) {
+        plan.taskMode = AITaskMode::Only3D;
+        plan.botResponseRU = "ИИ: Понял задачу! Строю строго 3D-объем и контур из твоих 3D-блоков без лишнего декора.";
+        return plan;
+    }
+
+    // Если игрок просит только неон/свечение
+    if (mentionsNeon && !mentionsDecorOrStyle && !mentions3D && !mentionsFill && extractedCount <= 0) {
+        plan.taskMode = AITaskMode::OnlyNeon;
+        plan.botResponseRU = "ИИ: Понял задачу! Добавляю только двусторонний контурный неон и мягкое свечение.";
+        return plan;
+    }
+
+    // Если игрок просит только залить/заполнить структуру
+    if (mentionsFill && !mentionsDecorOrStyle && !mentions3D && !mentionsNeon) {
+        plan.taskMode = AITaskMode::OnlyFill;
+        plan.botResponseRU = "ИИ: Понял задачу! Полностью заливаю внутреннюю область выделенной структуры.";
+        return plan;
+    }
+
+    // Иначе — полноценный декор по стилю и количеству объектов из сообщения
+    plan.taskMode = AITaskMode::FullDecor;
+
+    // Цвета (русский, английский и раскладка)
+    if (containsAny(p, { "зелен", "ЗЕЛЕН", "лайм", "green", "lime", "ptkty" })) {
         plan.hasExplicitColor = true;
         plan.explicitColor = ccColor3B{ 105, 255, 25 };
-    } else if (p.find("cyan") != std::string::npos || p.find("голуб") != std::string::npos || p.find("бирюз") != std::string::npos) {
+    } else if (containsAny(p, { "голуб", "ГОЛУБ", "бирюз", "циан", "cyan", "ujke," })) {
         plan.hasExplicitColor = true;
         plan.explicitColor = ccColor3B{ 25, 245, 255 };
-    } else if (p.find("blue") != std::string::npos || p.find("син") != std::string::npos) {
+    } else if (containsAny(p, { "син", "СИН", "blue", "cby" })) {
         plan.hasExplicitColor = true;
         plan.explicitColor = ccColor3B{ 55, 130, 255 };
-    } else if (p.find("purple") != std::string::npos || p.find("фиолет") != std::string::npos || p.find("пурпур") != std::string::npos) {
+    } else if (containsAny(p, { "фиолет", "ФИОЛЕТ", "пурпур", "purple", "violet", "abjktn" })) {
         plan.hasExplicitColor = true;
         plan.explicitColor = ccColor3B{ 175, 55, 255 };
-    } else if (p.find("pink") != std::string::npos || p.find("розов") != std::string::npos) {
+    } else if (containsAny(p, { "розов", "РОЗОВ", "фукси", "pink", "magenta", "hjpjd" })) {
         plan.hasExplicitColor = true;
         plan.explicitColor = ccColor3B{ 255, 45, 185 };
-    } else if (p.find("red") != std::string::npos || p.find("красн") != std::string::npos || p.find("адск") != std::string::npos || p.find("hell") != std::string::npos) {
+    } else if (containsAny(p, { "красн", "КРАСН", "алый", "адск", "hell", "red", "rhfcy" })) {
         plan.hasExplicitColor = true;
         plan.explicitColor = ccColor3B{ 255, 40, 25 };
-    } else if (p.find("orange") != std::string::npos || p.find("оранж") != std::string::npos) {
+    } else if (containsAny(p, { "оранж", "ОРАНЖ", "orange", "jhfy;" })) {
         plan.hasExplicitColor = true;
         plan.explicitColor = ccColor3B{ 255, 140, 20 };
-    } else if (p.find("yellow") != std::string::npos || p.find("желт") != std::string::npos || p.find("золот") != std::string::npos) {
+    } else if (containsAny(p, { "желт", "ЖЕЛТ", "золот", "yellow", "gold", ";tkn" })) {
         plan.hasExplicitColor = true;
         plan.explicitColor = ccColor3B{ 255, 230, 30 };
     }
 
-    if (p.find("eye") != std::string::npos || p.find("глаз") != std::string::npos) plan.wantEye = true;
-    if (p.find("skull") != std::string::npos || p.find("череп") != std::string::npos || p.find("hell") != std::string::npos) plan.wantSkull = true;
-    if (p.find("chain") != std::string::npos || p.find("цеп") != std::string::npos) plan.wantChains = true;
-    if (p.find("arc") != std::string::npos || p.find("дуг") != std::string::npos || p.find("круг") != std::string::npos) plan.wantArcs = true;
-    if (p.find("brick") != std::string::npos || p.find("кирпич") != std::string::npos) plan.wantBricks = true;
-    if (p.find("no grass") != std::string::npos || p.find("без трав") != std::string::npos) plan.wantGrass = false;
-    if (p.find("no 3d") != std::string::npos || p.find("без 3д") != std::string::npos) plan.want3D = false;
-    if (p.find("no neon") != std::string::npos || p.find("без неон") != std::string::npos) plan.wantNeon = false;
+    if (containsAny(p, { "глаз", "ГЛАЗ", "eye", "ukfp" })) plan.wantEye = true;
+    if (containsAny(p, { "череп", "ЧЕРЕП", "адск", "skull", "hell", "xthtg" })) plan.wantSkull = true;
+    if (containsAny(p, { "цеп", "ЦЕП", "chain" })) plan.wantChains = true;
+    if (containsAny(p, { "дуг", "ДУГ", "круг", "arc" })) plan.wantArcs = true;
+    if (containsAny(p, { "модерн", "МОДЕРН", "modern", "без трав", "no grass" })) plan.wantGrass = false;
+    if (containsAny(p, { "без 3д", "no 3d" })) plan.want3D = false;
+    if (containsAny(p, { "без неон", "no neon" })) plan.wantNeon = false;
 
-    if (rawPrompt.empty()) {
-        plan.botReply = "AI Bot: Full structure fill + new random color & unique pattern + 3D + 2-sided neon!";
-    } else {
-        plan.botReply = fmt::format("AI Bot: Building custom request ('{}')!", rawPrompt.substr(0, 36));
-    }
-
+    plan.botResponseRU = fmt::format(
+        "ИИ: Строю новую уникальную структуру (~{} объектов, полный контур + 3D + неон)!",
+        plan.targetCount
+    );
     return plan;
 }
 
@@ -621,26 +711,18 @@ static StylePalette buildPaletteFromBotPlan(ChatBotPlan const& plan, std::mt1993
         pal.masterColor = vibrantPool[idx];
     }
 
-    // 6 четких ступеней одного цвета:
-    // DarkFill — очень темный фон внутри структуры;
-    // Dark3D — еще более глубокий почти черный тон для 3D-блоков (как на фото 3D!);
-    // MidTone — насыщенный средний тон;
-    // BrightMain — чистый яркий неон;
-    // HighlightOutline — светлая неоновая обводка контура;
-    // AdditiveGlow — мягкое аддитивное свечение.
     pal.slotColors[static_cast<int>(ColorSlot::DarkFill)] = ccColor3B{
         static_cast<GLubyte>(std::clamp(pal.masterColor.r * 0.14f + 5.f, 6.f, 42.f)),
         static_cast<GLubyte>(std::clamp(pal.masterColor.g * 0.14f + 5.f, 6.f, 42.f)),
         static_cast<GLubyte>(std::clamp(pal.masterColor.b * 0.14f + 5.f, 6.f, 42.f))
     };
-    pal.slotColors[static_cast<int>(ColorSlot::Dark3D)] = ccColor3B{
-        static_cast<GLubyte>(std::clamp(pal.masterColor.r * 0.06f + 2.f, 2.f, 18.f)),
-        static_cast<GLubyte>(std::clamp(pal.masterColor.g * 0.06f + 2.f, 2.f, 18.f)),
-        static_cast<GLubyte>(std::clamp(pal.masterColor.b * 0.06f + 2.f, 2.f, 18.f))
-    };
+    // Для 3D-блоков делаем глубокий черный цвет (как на эталонном фото 3D image_29bf02.png!)
+    pal.slotColors[static_cast<int>(ColorSlot::Dark3D)] = ccColor3B{ 4, 5, 7 };
     pal.slotColors[static_cast<int>(ColorSlot::MidTone)]          = scaleRGB(pal.masterColor, 0.62f);
     pal.slotColors[static_cast<int>(ColorSlot::BrightMain)]       = pal.masterColor;
-    pal.slotColors[static_cast<int>(ColorSlot::HighlightOutline)] = mixTowardWhite(pal.masterColor, 0.62f);
+    pal.slotColors[static_cast<int>(ColorSlot::HighlightOutline)] = (plan.taskMode == AITaskMode::Only3D)
+        ? ccColor3B{ 255, 255, 255 }
+        : mixTowardWhite(pal.masterColor, 0.62f);
     pal.slotColors[static_cast<int>(ColorSlot::AdditiveGlow)]     = pal.masterColor;
 
     pal.slotOpacity[static_cast<int>(ColorSlot::DarkFill)]         = 255;
@@ -648,7 +730,7 @@ static StylePalette buildPaletteFromBotPlan(ChatBotPlan const& plan, std::mt1993
     pal.slotOpacity[static_cast<int>(ColorSlot::MidTone)]          = 255;
     pal.slotOpacity[static_cast<int>(ColorSlot::BrightMain)]       = 255;
     pal.slotOpacity[static_cast<int>(ColorSlot::HighlightOutline)] = 255;
-    pal.slotOpacity[static_cast<int>(ColorSlot::AdditiveGlow)]     = 130;
+    pal.slotOpacity[static_cast<int>(ColorSlot::AdditiveGlow)]     = 135;
 
     for (int i = 0; i < 6; ++i) {
         pal.slotBlending[i] = (i == static_cast<int>(ColorSlot::AdditiveGlow));
@@ -658,7 +740,7 @@ static StylePalette buildPaletteFromBotPlan(ChatBotPlan const& plan, std::mt1993
 }
 
 // ============================================================================
-// ПОЛНОЕ заполнение выделенных структур (даже если выделен только П-контур!)
+// Считывание и ПОЛНОЕ заполнение выделенного контура
 // ============================================================================
 static bool isSpikeOrHazardObjectID(int id) {
     switch (id) {
@@ -685,7 +767,6 @@ static std::vector<StructureIsland> extractAndFillIslandsCompletely(std::set<std
     std::vector<StructureIsland> islands;
     std::set<std::pair<int, int>> visited;
 
-    // Группируем клетки, находящиеся в пределах одной структуры (включая соседство через 1 клетку)
     for (auto const& startCell : allCells) {
         if (visited.count(startCell)) continue;
 
@@ -718,7 +799,6 @@ static std::vector<StructureIsland> extractAndFillIslandsCompletely(std::set<std
             }
         }
 
-        // 1. Горизонтальная заливка каждой строки между левой и правой стенкой острова
         for (int gy = isl.minGY; gy <= isl.maxGY; ++gy) {
             int rowMinX = 1000000, rowMaxX = -1000000;
             for (auto const& [cx, cy] : isl.cells) {
@@ -735,7 +815,6 @@ static std::vector<StructureIsland> extractAndFillIslandsCompletely(std::set<std
             }
         }
 
-        // 2. Вертикальная заливка под крышей до основания структуры (чтобы П-контур на земле заполнялся целиком!)
         for (int gx = isl.minGX; gx <= isl.maxGX; ++gx) {
             int colTopY = -1000000;
             for (auto const& [cx, cy] : isl.cells) {
@@ -790,6 +869,7 @@ static ContourAnalysis analyzeSelectedContour(EditorUI* ui) {
         for (GameObject* obj : rawList) {
             int id = readObjID(obj);
             CCPoint pos = obj->getPosition();
+            info.lockedStates.push_back(LockedObjectState{ obj, pos, obj->getRotation() });
 
             if (isSpikeOrHazardObjectID(id)) {
                 SelectedSpikeInfo sp;
@@ -810,7 +890,6 @@ static ContourAnalysis analyzeSelectedContour(EditorUI* ui) {
                 info.solidObjects.push_back(obj);
             }
         }
-        // Заполняем все пустоты внутри выделенного контура!
         extractAndFillIslandsCompletely(info.occupiedCells);
     }
 
@@ -843,11 +922,7 @@ static ContourAnalysis analyzeSelectedContour(EditorUI* ui) {
 }
 
 // ============================================================================
-// Процедурный генератор:
-// 1. Сплошное заполнение контура без дыр
-// 2. Точный 3D из готовых блоков (как на скриншоте 3D!)
-// 3. Настоящий неон (включая двусторонний мелкий неон вдоль контура)
-// 4. Аккуратные сильно уменьшенные внутренние детали, каждый раз НОВЫЙ узор!
+// Построение объектов строго по задаче ИИ (Only3D / OnlyNeon / OnlyFill / FullDecor)
 // ============================================================================
 static void addSpec(
     std::vector<GeneratedObjectSpec>& out,
@@ -882,24 +957,104 @@ static void addSpec(
     out.push_back(s);
 }
 
-static std::vector<GeneratedObjectSpec> generateUniqueStructureDecor(
+static std::vector<GeneratedObjectSpec> generateByAITask(
     ContourAnalysis& contour,
     EditorTabCatalog const& cat,
     ChatBotPlan const& plan,
-    int targetCount,
     std::mt19937& rng
 ) {
     std::vector<GeneratedObjectSpec> result;
-
     auto islands = extractAndFillIslandsCompletely(contour.occupiedCells);
     int totalCells = (std::max)(1, contour.cellCount());
 
-    // Чем больше блоков запросил игрок, тем сильнее уменьшаем внутренние детали (от 0.42f до 0.18f),
-    // чтобы они никогда не налезали друг на друга и выглядели аккуратно!
-    float densityRatio = std::clamp(static_cast<float>(targetCount) / (totalCells * 8.f), 0.5f, 3.0f);
-    float microScale = std::clamp(0.42f / std::sqrt(densityRatio), 0.18f, 0.42f);
+    // 1. РЕЖИМ "ТОЛЬКО 3D" (строит 1-в-1 эталонный черный 3D-объем и белую обводку со скриншота image_29bf02.png!)
+    if (plan.taskMode == AITaskMode::Only3D) {
+        for (auto const& isl : islands) {
+            for (auto const& [gx, gy] : isl.cells) {
+                float cx = gx * 30.f + 15.f;
+                float cy = gy * 30.f + 15.f;
 
-    // Гарантируем новую уникальную композицию при каждом нажатии Generate
+                bool topOpen    = (contour.occupiedCells.count({ gx, gy + 1 }) == 0);
+                bool bottomOpen = (contour.occupiedCells.count({ gx, gy - 1 }) == 0);
+                bool leftOpen   = (contour.occupiedCells.count({ gx - 1, gy }) == 0);
+                bool rightOpen  = (contour.occupiedCells.count({ gx + 1, gy }) == 0);
+
+                // Четкая белая линия контура
+                if (topOpen)    addSpec(result, 211, cx, cy + 14.2f, 1.02f, 0.06f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0);
+                if (leftOpen)   addSpec(result, 211, cx - 14.2f, cy, 0.06f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0);
+                if (rightOpen)  addSpec(result, 211, cx + 14.2f, cy, 0.06f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0);
+                if (bottomOpen && gy > 0) addSpec(result, 211, cx, cy - 14.2f, 1.02f, 0.06f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0);
+
+                // Верхний 3D: слева скошенная трапеция (Slot 0), далее прямая 3D-полоса (Slot 1)
+                if (topOpen) {
+                    int top3DId = leftOpen ? cat.id3DTrapTop : cat.id3DHalfStrip;
+                    addSpec(result, top3DId, cx, cy + 22.5f, 1.00f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0);
+                }
+                // Правый 3D: прямая 3D-полоса (Slot 1), повернутая на 90°
+                if (rightOpen) {
+                    addSpec(result, cat.id3DHalfStrip, cx + 22.5f, cy, 1.00f, 1.00f, 90.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0);
+                }
+                // Верхний правый угол 15x15 (cx + 22.5f, cy + 22.5f): два треугольника (Slot 5 + Slot 6),
+                // образующие квадратный угол с диагональным швом ровно как на фото image_29bf02.png!
+                if (topOpen && rightOpen) {
+                    addSpec(result, cat.id3DTriCorner, cx + 22.5f, cy + 22.5f, 1.00f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0);
+                    addSpec(result, cat.id3DTriBR,     cx + 22.5f, cy + 22.5f, 1.00f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0);
+                }
+            }
+        }
+        return result;
+    }
+
+    // 2. РЕЖИМ "ТОЛЬКО НЕОН"
+    if (plan.taskMode == AITaskMode::OnlyNeon) {
+        for (auto const& isl : islands) {
+            for (auto const& [gx, gy] : isl.cells) {
+                float cx = gx * 30.f + 15.f;
+                float cy = gy * 30.f + 15.f;
+                bool topOpen    = (contour.occupiedCells.count({ gx, gy + 1 }) == 0);
+                bool bottomOpen = (contour.occupiedCells.count({ gx, gy - 1 }) == 0);
+                bool leftOpen   = (contour.occupiedCells.count({ gx - 1, gy }) == 0);
+                bool rightOpen  = (contour.occupiedCells.count({ gx + 1, gy }) == 0);
+
+                if (topOpen) {
+                    addSpec(result, cat.idGlowEdgeSmall, cx - 7.5f, cy + 18.0f, 0.50f, 0.45f, 0.f,   LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 0, false, false, 140);
+                    addSpec(result, cat.idGlowEdgeSmall, cx + 7.5f, cy + 18.0f, 0.50f, 0.45f, 0.f,   LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 0, false, false, 140);
+                    addSpec(result, cat.idGlowEdgeSmall, cx - 7.5f, cy + 11.5f, 0.50f, 0.40f, 180.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 0, false, false, 115);
+                    addSpec(result, cat.idGlowEdgeSmall, cx + 7.5f, cy + 11.5f, 0.50f, 0.40f, 180.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 0, false, false, 115);
+                    addSpec(result, 1888, cx, cy + 13.f, 0.95f, 0.42f, 0.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 15, 0, false, false, 100);
+                }
+                if (leftOpen) {
+                    addSpec(result, cat.idGlowEdgeSmall, cx - 18.0f, cy, 0.50f, 0.45f, 270.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 0, false, false, 130);
+                    addSpec(result, cat.idGlowEdgeSmall, cx - 11.5f, cy, 0.50f, 0.40f, 90.f,  LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 0, false, false, 110);
+                }
+                if (rightOpen) {
+                    addSpec(result, cat.idGlowEdgeSmall, cx + 18.0f, cy, 0.50f, 0.45f, 90.f,  LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 0, false, false, 130);
+                    addSpec(result, cat.idGlowEdgeSmall, cx + 11.5f, cy, 0.50f, 0.40f, 270.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 0, false, false, 110);
+                }
+                if (bottomOpen && gy > 0) {
+                    addSpec(result, cat.idGlowEdgeSmall, cx, cy - 18.0f, 0.80f, 0.45f, 180.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 0, false, false, 120);
+                }
+            }
+        }
+        return result;
+    }
+
+    // 3. РЕЖИМ "ТОЛЬКО ЗАЛИВКА"
+    if (plan.taskMode == AITaskMode::OnlyFill) {
+        for (auto const& isl : islands) {
+            for (auto const& [gx, gy] : isl.cells) {
+                float cx = gx * 30.f + 15.f;
+                float cy = gy * 30.f + 15.f;
+                addSpec(result, 211, cx, cy, 1.00f, 1.00f, 0.f, LayerRole::Fill, ColorSlot::DarkFill, 1, 0);
+            }
+        }
+        return result;
+    }
+
+    // 4. РЕЖИМ ПОЛНОГО УНИКАЛЬНОГО ДЕКОРА (FullDecor)
+    float densityRatio = std::clamp(static_cast<float>(plan.targetCount) / (totalCells * 8.f), 0.5f, 3.0f);
+    float microScale = std::clamp(0.40f / std::sqrt(densityRatio), 0.16f, 0.40f);
+
     std::uniform_int_distribution<int> layoutDist(0, 5);
     int layoutStyle = layoutDist(rng);
     if (layoutStyle == g_lastLayoutSeed) {
@@ -907,8 +1062,6 @@ static std::vector<GeneratedObjectSpec> generateUniqueStructureDecor(
     }
     g_lastLayoutSeed = layoutStyle;
 
-    // Выбираем 1 главный тип эмблемы и 2-3 аккуратных геометрических элемента на эту генерацию
-    // (чтобы мод НЕ ставил все подряд!)
     int const emblemChoices[8] = {
         cat.idEye, cat.idSkull, cat.idSwirl, cat.idHeart,
         cat.idLightning, cat.idKey, cat.idGhost, cat.idCrossCircle
@@ -933,7 +1086,6 @@ static std::vector<GeneratedObjectSpec> generateUniqueStructureDecor(
     };
     int chosenShine = shineChoices[rng() % 3];
 
-    // Двусторонний мелкий неон (внутри и снаружи контура) включается процедурно
     bool doubleSidedNeon = (rng() % 2 == 0);
 
     for (auto const& isl : islands) {
@@ -941,7 +1093,6 @@ static std::vector<GeneratedObjectSpec> generateUniqueStructureDecor(
         int rows = isl.rows();
         bool isSingleCube = (isl.cells.size() == 1);
 
-        // Случайная позиция для единственной главной эмблемы (в углу или по центру структуры)
         int focalCol = (cols >= 2 && (rng() % 2 == 0)) ? (cols - 1) : (cols / 2);
         int focalRow = (rows >= 2 && (rng() % 2 == 0)) ? (rows - 1) : (rows / 2);
 
@@ -957,68 +1108,43 @@ static std::vector<GeneratedObjectSpec> generateUniqueStructureDecor(
             int localCol = gx - isl.minGX;
             int localRow = gy - isl.minGY;
 
-            // ================================================================
-            // 1. Слой +0 (Fill): Сплошное темное заполнение ВСЕХ клеток структуры
-            // ================================================================
+            // Слой +0: Полная заливка клетки
             addSpec(result, 211, cx, cy, 1.00f, 1.00f, 0.f, LayerRole::Fill, ColorSlot::DarkFill, 1, 0);
 
-            // Внутренний темный рельеф (варьируется от генерации к генерации)
             if (layoutStyle % 2 == 0) {
-                addSpec(result, 211, cx, cy, 0.86f, 0.86f, 0.f, LayerRole::Fill, ColorSlot::MidTone, 2, 1, false, false, 45);
+                addSpec(result, 211, cx, cy, 0.86f, 0.86f, 0.f, LayerRole::Fill, ColorSlot::MidTone, 2, 1, false, false, 42);
                 addSpec(result, 211, cx, cy, 0.78f, 0.78f, 0.f, LayerRole::Fill, ColorSlot::DarkFill, 3, 1);
-            } else {
-                addSpec(result, 211, cx, cy, 0.88f, 0.22f, 0.f, LayerRole::Fill, ColorSlot::MidTone, 2, 1, false, false, 40);
             }
 
-            // ================================================================
-            // 2. Слой +2 (Outline3D): Четкая светлая обводка + ТОЧНЫЙ 3D по фото!
-            // ================================================================
-            if (topOpen) {
-                addSpec(result, 211, cx, cy + 14.2f, 1.02f, 0.06f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0);
-            }
-            if (bottomOpen && gy > 0) {
-                addSpec(result, 211, cx, cy - 14.2f, 1.02f, 0.06f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0);
-            }
-            if (leftOpen) {
-                addSpec(result, 211, cx - 14.2f, cy, 0.06f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0);
-            }
-            if (rightOpen) {
-                addSpec(result, 211, cx + 14.2f, cy, 0.06f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0);
-            }
+            // Слой +2: Четкая обводка + точный 3D из готовых 3D-блоков (как на image_29bf02.png)
+            if (topOpen)    addSpec(result, 211, cx, cy + 14.2f, 1.02f, 0.06f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0);
+            if (leftOpen)   addSpec(result, 211, cx - 14.2f, cy, 0.06f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0);
+            if (rightOpen)  addSpec(result, 211, cx + 14.2f, cy, 0.06f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0);
+            if (bottomOpen && gy > 0) addSpec(result, 211, cx, cy - 14.2f, 1.02f, 0.06f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0);
 
-            // ТОЧНЫЙ 3D из готовых блоков вкладки 4 (страница 2) — ровно как на фотоimage_29bf02.png!
             if (plan.want3D) {
-                // Сверху структуры: в левой верхней клетке — скошенная трапеция (Slot 0),
-                // во всех остальных верхних клетках — прямая 3D-полоса (Slot 1) на высоте cy + 22.5f!
                 if (topOpen) {
-                    int top3DBlock = leftOpen ? cat.id3DTrapTop : cat.id3DHalfStrip;
-                    addSpec(result, top3DBlock, cx, cy + 22.5f, 1.00f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0);
+                    int top3DId = leftOpen ? cat.id3DTrapTop : cat.id3DHalfStrip;
+                    addSpec(result, top3DId, cx, cy + 22.5f, 1.00f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0);
                 }
-                // Справа структуры: прямая 3D-полоса (Slot 1), повернутая на 90°, на позиции cx + 22.5f!
                 if (rightOpen) {
                     addSpec(result, cat.id3DHalfStrip, cx + 22.5f, cy, 1.00f, 1.00f, 90.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0);
                 }
-                // Правый верхний угол 15x15 (cx + 22.5f, cy + 22.5f): треугольник 3D (Slot 6),
-                // соединяющий верхнюю и правую 3D-полосы под 45° ровно как на скриншоте!
                 if (topOpen && rightOpen) {
-                    addSpec(result, cat.id3DTriBR, cx + 22.5f, cy + 22.5f, 1.00f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0);
+                    addSpec(result, cat.id3DTriCorner, cx + 22.5f, cy + 22.5f, 1.00f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0);
+                    addSpec(result, cat.id3DTriBR,     cx + 22.5f, cy + 22.5f, 1.00f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0);
                 }
             }
 
-            // ================================================================
-            // 3. Слой +3 (NeonAndGrass): Настоящий мелкий и мягкий неон (внутри и снаружи)
-            // ================================================================
+            // Слой +3: Мелкий контурный неон (снаружи и внутри) + мягкое свечение 1888 + трава
             if (plan.wantNeon) {
                 if (topOpen) {
-                    // Внешний мелкий неон вдоль верхней границы
                     addSpec(result, cat.idGlowEdgeSmall, cx - 7.5f, cy + 18.0f, 0.50f, 0.45f, 0.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 0, false, false, 135);
                     addSpec(result, cat.idGlowEdgeSmall, cx + 7.5f, cy + 18.0f, 0.50f, 0.45f, 0.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 0, false, false, 135);
-                    // Внутренний мелкий неон (развернутый внутрь блока!)
                     if (doubleSidedNeon) {
                         addSpec(result, cat.idGlowEdgeSmall, cx - 7.5f, cy + 11.5f, 0.50f, 0.40f, 180.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 1, false, false, 115);
                         addSpec(result, cat.idGlowEdgeSmall, cx + 7.5f, cy + 11.5f, 0.50f, 0.40f, 180.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 1, false, false, 115);
                     }
-                    // Мягкое неоновое свечение 1888 вдоль шапки
                     addSpec(result, 1888, cx, cy + 13.f, 0.95f, 0.42f, 0.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 15, 0, false, false, 95);
                 }
                 if (leftOpen) {
@@ -1026,118 +1152,81 @@ static std::vector<GeneratedObjectSpec> generateUniqueStructureDecor(
                     if (doubleSidedNeon) {
                         addSpec(result, cat.idGlowEdgeSmall, cx - 11.5f, cy, 0.50f, 0.40f, 90.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 1, false, false, 105);
                     }
-                    addSpec(result, 1888, cx - 13.f, cy, 0.42f, 0.95f, 0.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 15, 1, false, false, 85);
                 }
                 if (rightOpen) {
                     addSpec(result, cat.idGlowEdgeSmall, cx + 18.0f, cy, 0.50f, 0.45f, 90.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 0, false, false, 125);
                     if (doubleSidedNeon) {
                         addSpec(result, cat.idGlowEdgeSmall, cx + 11.5f, cy, 0.50f, 0.40f, 270.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 1, false, false, 105);
                     }
-                    addSpec(result, 1888, cx + 13.f, cy, 0.42f, 0.95f, 0.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 15, 1, false, false, 85);
-                }
-                if (bottomOpen && gy > 0) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx, cy - 18.0f, 0.80f, 0.45f, 180.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 1, false, false, 120);
                 }
             }
 
-            // Аккуратная уменьшенная трава на верхней грани
             if (topOpen && plan.wantGrass) {
                 int const grassIDs[3] = { 406, 407, 408 };
                 int gID = grassIDs[(gx + gy + layoutStyle) % 3];
-                addSpec(result, gID, cx - 5.f, cy + 15.8f, 0.45f, 0.48f, 0.f, LayerRole::NeonAndGrass, ColorSlot::BrightMain, 15, 1);
-                if ((gx + layoutStyle) % 2 == 0) {
-                    addSpec(result, gID, cx + 6.f, cy + 15.5f, 0.36f, 0.38f, 0.f, LayerRole::NeonAndGrass, ColorSlot::BrightMain, 15, 2, true, false);
-                }
+                addSpec(result, gID, cx - 5.f, cy + 15.8f, 0.44f, 0.46f, 0.f, LayerRole::NeonAndGrass, ColorSlot::BrightMain, 15, 1);
             }
 
-            // ================================================================
-            // 4. Слой +1 (InnerDetail): Сильно уменьшенные, чистые детали (6 разных схем!)
-            // ================================================================
+            // Слой +1: Сильно уменьшенные, аккуратные внутренние детали (без нагромождения!)
             if (isSingleCube) {
-                // В одиночном кубе 1x1: один аккуратный глаз/череп в центре (0.58x) + 4 крошечных уголка (0.28x)
-                addSpec(result, chosenEmblem, cx, cy, 0.58f, 0.58f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6, 1);
+                addSpec(result, chosenEmblem, cx, cy, 0.55f, 0.55f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6, 1);
                 addSpec(result, chosenCornerPiece, cx - 8.5f, cy + 8.5f, microScale, microScale, 0.f,   LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 2);
                 addSpec(result, chosenCornerPiece, cx + 8.5f, cy + 8.5f, microScale, microScale, 90.f,  LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 2);
                 addSpec(result, chosenCornerPiece, cx - 8.5f, cy - 8.5f, microScale, microScale, 270.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 2);
                 addSpec(result, chosenCornerPiece, cx + 8.5f, cy - 8.5f, microScale, microScale, 180.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 2);
             } else {
-                // Верхняя светящаяся полоса вдоль крыши
                 if (topOpen) {
-                    addSpec(result, 211, cx, cy + 10.5f, 0.94f, 0.22f, 0.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1);
-                    addSpec(result, 211, cx, cy + 11.2f, 0.82f, 0.10f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 5, 1);
+                    addSpec(result, 211, cx, cy + 10.5f, 0.94f, 0.20f, 0.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1);
+                    addSpec(result, 211, cx, cy + 11.2f, 0.82f, 0.09f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 5, 1);
                 }
 
-                // Диагональный блик // только в левой верхней клетке (уменьшенный, чтобы не вылезал!)
                 if (localCol == 0 && localRow == rows - 1) {
-                    addSpec(result, chosenShine, cx - 2.f, cy + 1.f, 0.52f, 0.52f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6, 1);
+                    addSpec(result, chosenShine, cx - 2.f, cy + 1.f, 0.50f, 0.50f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6, 1);
                 }
 
-                // Единственная фокусная эмблема (глаз/череп/вихрь) в фокусной клетке острова
                 if (localCol == focalCol && localRow == focalRow) {
-                    addSpec(result, chosenEmblem, cx, cy - 1.f, 0.54f, 0.54f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6, 1);
+                    addSpec(result, chosenEmblem, cx, cy - 1.f, 0.52f, 0.52f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6, 1);
                 } else {
-                    // В остальных клетках строим чистый геометрический узор выбранного стиля (layoutStyle 0..5)
                     if (layoutStyle == 0) {
-                        // Стиль 0: Чистые вертикальные неоновые колонны + арка в центре + мелкие квадратики 回
                         if (localCol == cols / 2) {
-                            addSpec(result, 211, cx - 6.f, cy, 0.10f, 0.94f, 0.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1);
-                            addSpec(result, 211, cx + 6.f, cy, 0.10f, 0.94f, 0.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1);
+                            addSpec(result, 211, cx - 6.f, cy, 0.09f, 0.94f, 0.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1);
+                            addSpec(result, 211, cx + 6.f, cy, 0.09f, 0.94f, 0.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1);
                             if (localRow == rows - 1) {
-                                addSpec(result, cat.idBracketArch, cx, cy - 2.f, 0.55f, 0.55f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 5, 1);
+                                addSpec(result, cat.idBracketArch, cx, cy - 2.f, 0.52f, 0.52f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 5, 1);
                             }
                         } else {
                             addSpec(result, cat.idHollowSquare, cx, cy, microScale, microScale, 0.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 2);
                         }
-                    }
-                    else if (layoutStyle == 1) {
-                        // Стиль 1: Минималистичная тех-сетка с сильно уменьшенными крестиками × и точками •.
-                        addSpec(result, chosenInnerLine, cx, cy, 0.48f, 0.48f, (localCol % 2 == 0) ? 0.f : 90.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1);
-                        addSpec(result, cat.idSmallCross, cx - 6.5f, cy + 6.5f, microScale * 0.85f, microScale * 0.85f, 0.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 2);
-                        addSpec(result, cat.idDoubleDots, cx + 6.5f, cy - 6.5f, microScale * 0.85f, microScale * 0.85f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6, 2);
-                    }
-                    else if (layoutStyle == 2) {
-                        // Стиль 2: Концентрические тонкие дуги ╭ и светящиеся точки ●
+                    } else if (layoutStyle == 1) {
+                        addSpec(result, chosenInnerLine, cx, cy, 0.44f, 0.44f, (localCol % 2 == 0) ? 0.f : 90.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1);
+                        addSpec(result, cat.idSmallCross, cx - 6.5f, cy + 6.5f, microScale * 0.8f, microScale * 0.8f, 0.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 2);
+                    } else if (layoutStyle == 2) {
                         float rot = static_cast<float>(((localCol + localRow) % 4) * 90);
-                        addSpec(result, cat.idArcThin,   cx, cy, 0.52f, 0.52f, rot, LayerRole::InnerDetail, ColorSlot::BrightMain, 5, 1);
-                        addSpec(result, cat.idCircleDot, cx, cy, microScale * 0.8f, microScale * 0.8f, 0.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 2);
-                    }
-                    else if (layoutStyle == 3) {
-                        // Стиль 3: Внутренние цепи или диагональные микро-лучи с уголками ╔
+                        addSpec(result, cat.idArcThin,   cx, cy, 0.48f, 0.48f, rot, LayerRole::InnerDetail, ColorSlot::BrightMain, 5, 1);
+                        addSpec(result, cat.idCircleDot, cx, cy, microScale * 0.75f, microScale * 0.75f, 0.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 2);
+                    } else if (layoutStyle == 3) {
                         int beamID = plan.wantChains ? cat.idChainLink : cat.idDiagThin;
-                        addSpec(result, beamID, cx, cy, 0.46f, 0.46f, 0.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1);
+                        addSpec(result, beamID, cx, cy, 0.44f, 0.44f, 0.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1);
                         addSpec(result, cat.idBracketCorner, cx - 7.f, cy - 7.f, microScale, microScale, 270.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 2);
-                        addSpec(result, cat.idBracketCorner, cx + 7.f, cy + 7.f, microScale, microScale, 90.f,  LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 2);
-                    }
-                    else if (layoutStyle == 4) {
-                        // Стиль 4: Горизонтальные технологические уровни с шевронами > и тире ▬
-                        addSpec(result, cat.idParallelLines, cx, cy, 0.58f, 0.45f, 0.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1);
+                    } else if (layoutStyle == 4) {
+                        addSpec(result, cat.idParallelLines, cx, cy, 0.52f, 0.42f, 0.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1);
                         addSpec(result, cat.idChevron, cx, cy, microScale, microScale, (localCol < cols / 2) ? 0.f : 180.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6, 2);
-                    }
-                    else {
-                        // Стиль 5: Внутренние ромбы и микро-треугольники ▲
-                        addSpec(result, 211, cx, cy, 0.36f, 0.36f, 45.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1);
-                        addSpec(result, 211, cx, cy, 0.22f, 0.22f, 45.f, LayerRole::InnerDetail, ColorSlot::DarkFill, 5, 1);
-                        addSpec(result, cat.idSmallTriangle, cx, cy, microScale * 0.85f, microScale * 0.85f, 0.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 2);
+                    } else {
+                        addSpec(result, 211, cx, cy, 0.34f, 0.34f, 45.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1);
+                        addSpec(result, 211, cx, cy, 0.20f, 0.20f, 45.f, LayerRole::InnerDetail, ColorSlot::DarkFill, 5, 1);
+                        addSpec(result, cat.idSmallTriangle, cx, cy, microScale * 0.8f, microScale * 0.8f, 0.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 2);
                     }
                 }
 
-                // Если запрошено много блоков — добавляем сильно уменьшенные (microScale * 0.7f) суб-детали по сетке 4x4 внутри клетки!
                 if (densityRatio > 1.15f) {
-                    float subScale = std::clamp(microScale * 0.68f, 0.15f, 0.26f);
+                    float subScale = std::clamp(microScale * 0.65f, 0.14f, 0.24f);
                     addSpec(result, chosenCornerPiece, cx - 8.5f, cy + 8.5f, subScale, subScale, 0.f,   LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 3);
                     addSpec(result, chosenCornerPiece, cx + 8.5f, cy - 8.5f, subScale, subScale, 180.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 6, 3);
-                    if (densityRatio > 1.6f) {
-                        addSpec(result, cat.idShortDash,  cx,        cy - 9.5f, subScale, subScale, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6, 3);
-                        addSpec(result, cat.idDoubleDots, cx + 8.5f, cy + 8.5f, subScale, subScale, 0.f, LayerRole::InnerDetail, ColorSlot::MidTone,    6, 3);
-                    }
                 }
             }
         }
     }
 
-    // ========================================================================
-    // 5. Декорирование выделенных шипов (вложенные шипы + неоновое свечение)
-    // ========================================================================
     for (auto const& sp : contour.spikes) {
         float const scales[3] = { 0.70f, 0.44f, 0.22f };
         ColorSlot const slots[3] = {
@@ -1168,7 +1257,6 @@ static std::vector<GeneratedObjectSpec> generateUniqueStructureDecor(
         }
     }
 
-    // Сортируем по важности (Tier 0 = база, заполнение, 3D и неон никогда не обрезаются!)
     std::stable_sort(result.begin(), result.end(), [](GeneratedObjectSpec const& a, GeneratedObjectSpec const& b) {
         return a.priorityTier < b.priorityTier;
     });
@@ -1178,7 +1266,7 @@ static std::vector<GeneratedObjectSpec> generateUniqueStructureDecor(
         if (item.priorityTier == 0) essentialCount++;
     }
 
-    int finalCap = (std::max)(essentialCount + 6, targetCount);
+    int finalCap = (std::max)(essentialCount + 4, plan.targetCount);
     if (static_cast<int>(result.size()) > finalCap) {
         result.resize(finalCap);
     }
@@ -1198,7 +1286,8 @@ static SpawnSummary spawnContourDecorInEditor(
     EditorUI* ui,
     ContourAnalysis const& contour,
     std::vector<GeneratedObjectSpec> const& specs,
-    StylePalette const& palette
+    StylePalette const& palette,
+    AITaskMode taskMode
 ) {
     SpawnSummary summary;
     if (!ui || !ui->m_editorLayer) return summary;
@@ -1206,17 +1295,21 @@ static SpawnSummary spawnContourDecorInEditor(
     auto* editorLayer = ui->m_editorLayer;
     summary.firstLayer = findFirstFreeEditorLayerBlock(editorLayer, 4);
 
-    for (GameObject* baseObj : contour.solidObjects) {
-        if (!baseObj) continue;
-        writeObjEditorLayers(baseObj, summary.firstLayer + static_cast<int>(LayerRole::Fill), 0);
-        writeObjFlags(baseObj, 0, false, true);
-        bindObjectToPaletteSlot(baseObj, palette, ColorSlot::DarkFill);
+    if (taskMode == AITaskMode::FullDecor || taskMode == AITaskMode::OnlyFill) {
+        for (GameObject* baseObj : contour.solidObjects) {
+            if (!baseObj) continue;
+            writeObjEditorLayers(baseObj, summary.firstLayer + static_cast<int>(LayerRole::Fill), 0);
+            writeObjFlags(baseObj, 0, false, true);
+            bindObjectToPaletteSlot(baseObj, palette, ColorSlot::DarkFill);
+        }
     }
-    for (auto const& sp : contour.spikes) {
-        if (!sp.sourceObj) continue;
-        writeObjEditorLayers(sp.sourceObj, summary.firstLayer + static_cast<int>(LayerRole::Outline3D), 0);
-        writeObjFlags(sp.sourceObj, 10, false, true);
-        bindObjectToPaletteSlot(sp.sourceObj, palette, ColorSlot::HighlightOutline);
+    if (taskMode == AITaskMode::FullDecor) {
+        for (auto const& sp : contour.spikes) {
+            if (!sp.sourceObj) continue;
+            writeObjEditorLayers(sp.sourceObj, summary.firstLayer + static_cast<int>(LayerRole::Outline3D), 0);
+            writeObjFlags(sp.sourceObj, 10, false, true);
+            bindObjectToPaletteSlot(sp.sourceObj, palette, ColorSlot::HighlightOutline);
+        }
     }
 
     for (auto const& s : specs) {
@@ -1240,178 +1333,442 @@ static SpawnSummary spawnContourDecorInEditor(
 }
 
 // ============================================================================
-// Новое меню с ИИ Чат-Ботом СЛЕВА (без кнопок Neon/Modern/Hell/Reality)
+// Русский + Английский ввод текста (ЙЦУКЕН / QWERTY + Ctrl+V + Backspace UTF-8)
+// ============================================================================
+static void popLastUTF8Char(std::string& s) {
+    if (s.empty()) return;
+    while (!s.empty() && ((static_cast<unsigned char>(s.back()) & 0xC0) == 0x80)) {
+        s.pop_back();
+    }
+    if (!s.empty()) {
+        s.pop_back();
+    }
+}
+
+struct RusKeyMapEntry {
+    int vk;
+    const char* rusLower;
+    char engLower;
+    char engShift;
+};
+
+static constexpr RusKeyMapEntry kKeyTable[] = {
+    { 'Q', "й", 'q', 'Q' }, { 'W', "ц", 'w', 'W' }, { 'E', "у", 'e', 'E' },
+    { 'R', "к", 'r', 'R' }, { 'T', "е", 't', 'T' }, { 'Y', "н", 'y', 'Y' },
+    { 'U', "г", 'u', 'U' }, { 'I', "ш", 'i', 'I' }, { 'O', "щ", 'o', 'O' },
+    { 'P', "з", 'p', 'P' }, { 0xDB, "х", '[', '{' }, { 0xDD, "ъ", ']', '}' },
+    { 'A', "ф", 'a', 'A' }, { 'S', "ы", 's', 'S' }, { 'D', "в", 'd', 'D' },
+    { 'F', "а", 'f', 'F' }, { 'G', "п", 'g', 'G' }, { 'H', "р", 'h', 'H' },
+    { 'J', "о", 'j', 'J' }, { 'K', "л", 'k', 'K' }, { 'L', "д", 'l', 'L' },
+    { 0xBA, "ж", ';', ':' }, { 0xDE, "э", '\'', '"' },
+    { 'Z', "я", 'z', 'Z' }, { 'X', "ч", 'x', 'X' }, { 'C', "с", 'c', 'C' },
+    { 'V', "м", 'v', 'V' }, { 'B', "и", 'b', 'B' }, { 'N', "т", 'n', 'N' },
+    { 'M', "ь", 'm', 'M' }, { 0xBC, "б", ',', '<' }, { 0xBE, "ю", '.', '>' },
+    { 0xC0, "ё", '`', '~' }, { 0xBF, ".", '/', '?' }, { 0xBD, "-", '-', '_' }
+};
+
+// ============================================================================
+// СЕРОЕ МЕНЮ МОДА:
+// 1. Сначала экран "Подключите ИИ по API" (если еще не подключен)
+// 2. После подключения — строго СЕРОЕ окно ЧАТА с поддержкой русского языка!
 // ============================================================================
 class AIDecorPopup : public geode::Popup {
 protected:
     EditorUI* m_editorUI = nullptr;
     ContourAnalysis m_contour;
-    int m_targetBlockCount = 80;
+    bool m_isApiSetupStage = false;
+    bool m_russianLayout = true;
+    std::string m_inputBuffer;
+    bool m_prevKeyStates[256]{};
 
-    TextInput* m_promptInput = nullptr;
-    TextInput* m_countInput = nullptr;
-    CCLabelBMFont* m_botReplyLabel = nullptr;
+    CCNode* m_stageContainer = nullptr;
+    CCLabelTTF* m_inputDisplayLabel = nullptr;
+    CCLabelTTF* m_langBadgeLabel = nullptr;
+    CCLabelTTF* m_chatHistoryLabel1 = nullptr;
+    CCLabelTTF* m_chatHistoryLabel2 = nullptr;
+    CCLabelTTF* m_chatHistoryLabel3 = nullptr;
 
     bool init(EditorUI* ui, ContourAnalysis contour) {
-        if (!Popup::init(440.f, 260.f)) return false;
+        if (!Popup::init(430.f, 250.f)) return false;
 
         m_editorUI = ui;
         m_contour = std::move(contour);
-        m_targetBlockCount = static_cast<int>(Mod::get()->getSettingValue<int64_t>("default-block-count"));
 
-        this->setTitle("AI Builder Chat-Bot");
+        // Скрываем стандартный коричневый фон GD и делаем полностью СЕРОЕ окно
+        if constexpr (requires { this->m_bgSprite; }) {
+            if (this->m_bgSprite) {
+                this->m_bgSprite->setColor(ccColor3B{ 52, 55, 62 });
+            }
+        }
 
         auto size = m_mainLayer->getContentSize();
         auto center = CCPoint{ size.width / 2.f, size.height / 2.f };
 
-        // ====================================================================
-        // ЛЕВАЯ ПАНЕЛЬ: ИИ Чат-Бот (игрок сам пишет, что он хочет построить)
-        // ====================================================================
-        float leftX = center.x - 75.f;
+        // Внешний серый корпус меню
+        auto grayOuter = CCScale9Sprite::create("square02b_001.png");
+        grayOuter->setContentSize(CCSize{ size.width, size.height });
+        grayOuter->setColor(ccColor3B{ 62, 66, 74 });
+        grayOuter->setPosition(center);
+        grayOuter->setZOrder(-2);
+        m_mainLayer->addChild(grayOuter);
 
-        auto botHeader = CCLabelBMFont::create("AI Chat-Bot (write what you want):", "goldFont.fnt");
-        botHeader->setScale(0.45f);
-        botHeader->setPosition(CCPoint{ leftX, center.y + 78.f });
-        m_mainLayer->addChild(botHeader);
+        auto grayInner = CCScale9Sprite::create("square02b_001.png");
+        grayInner->setContentSize(CCSize{ size.width - 10.f, size.height - 10.f });
+        grayInner->setColor(ccColor3B{ 44, 47, 54 });
+        grayInner->setPosition(center);
+        grayInner->setZOrder(-1);
+        m_mainLayer->addChild(grayInner);
 
-        auto chatBoxBg = CCScale9Sprite::create("square02b_001.png");
-        chatBoxBg->setContentSize(CCSize{ 250.f, 95.f });
-        chatBoxBg->setColor(ccColor3B{ 18, 24, 38 });
-        chatBoxBg->setOpacity(210);
-        chatBoxBg->setPosition(CCPoint{ leftX, center.y + 18.f });
-        m_mainLayer->addChild(chatBoxBg);
+        std::string savedKey = Mod::get()->getSavedValue<std::string>("connected-api-key", "");
+        std::string settingKey = Mod::get()->getSettingValue<std::string>("ai-api-key");
+        bool hasKey = g_apiConnectedSession || !savedKey.empty() || !settingKey.empty();
 
-        auto hint1 = CCLabelBMFont::create("Bot: Tell me what to build inside your contour!", "chatFont.fnt");
-        hint1->setScale(0.55f);
-        hint1->setColor(ccColor3B{ 130, 255, 180 });
-        hint1->setPosition(CCPoint{ leftX, center.y + 46.f });
-        m_mainLayer->addChild(hint1);
+        m_stageContainer = CCNode::create();
+        m_stageContainer->setPosition(CCPoint{ 0.f, 0.f });
+        m_mainLayer->addChild(m_stageContainer);
 
-        auto hint2 = CCLabelBMFont::create("Examples: 'green eye 3d', 'purple skull chains',", "chatFont.fnt");
-        hint2->setScale(0.48f);
-        hint2->setColor(ccColor3B{ 200, 220, 255 });
-        hint2->setPosition(CCPoint{ leftX, center.y + 22.f });
-        m_mainLayer->addChild(hint2);
+        if (!hasKey) {
+            buildApiConnectStage();
+        } else {
+            buildGrayChatStage();
+        }
 
-        auto hint3 = CCLabelBMFont::create("'cyan arcs', 'red hell', or leave empty for NEW random!", "chatFont.fnt");
-        hint3->setScale(0.46f);
-        hint3->setColor(ccColor3B{ 200, 220, 255 });
-        hint3->setPosition(CCPoint{ leftX, center.y + 2.f });
-        m_mainLayer->addChild(hint3);
+        for (int k = 0; k < 256; ++k) {
+#ifdef GEODE_IS_WINDOWS
+            m_prevKeyStates[k] = (GetAsyncKeyState(k) & 0x8000) != 0;
+#else
+            m_prevKeyStates[k] = false;
+#endif
+        }
 
-        m_botReplyLabel = CCLabelBMFont::create("Status: Ready for your command!", "chatFont.fnt");
-        m_botReplyLabel->setScale(0.50f);
-        m_botReplyLabel->setColor(ccColor3B{ 255, 240, 130 });
-        m_botReplyLabel->setPosition(CCPoint{ leftX, center.y - 18.f });
-        m_mainLayer->addChild(m_botReplyLabel);
-
-        m_promptInput = TextInput::create(250.f, "Write to AI Bot (e.g. green neon eye 3d)...", "chatFont.fnt");
-        m_promptInput->setMaxCharCount(240);
-        m_promptInput->setPosition(CCPoint{ leftX, center.y - 54.f });
-        m_mainLayer->addChild(m_promptInput);
-
-        // ====================================================================
-        // ПРАВАЯ ПАНЕЛЬ: Инфо о контуре, слоях и количестве деталей
-        // ====================================================================
-        float rightX = center.x + 130.f;
-        int freeLayer = (ui && ui->m_editorLayer) ? findFirstFreeEditorLayerBlock(ui->m_editorLayer, 4) : 1;
-
-        auto infoHeader = CCLabelBMFont::create("Contour & Layers", "bigFont.fnt");
-        infoHeader->setScale(0.36f);
-        infoHeader->setPosition(CCPoint{ rightX, center.y + 78.f });
-        m_mainLayer->addChild(infoHeader);
-
-        std::string cellsText = fmt::format("Filled Cells: {}", m_contour.cellCount());
-        auto cellsLbl = CCLabelBMFont::create(cellsText.c_str(), "chatFont.fnt");
-        cellsLbl->setScale(0.58f);
-        cellsLbl->setColor(ccColor3B{ 160, 255, 200 });
-        cellsLbl->setPosition(CCPoint{ rightX, center.y + 52.f });
-        m_mainLayer->addChild(cellsLbl);
-
-        std::string layersText = fmt::format("Auto Layers: {}-{}", freeLayer, freeLayer + 3);
-        auto layersLbl = CCLabelBMFont::create(layersText.c_str(), "chatFont.fnt");
-        layersLbl->setScale(0.55f);
-        layersLbl->setColor(ccColor3B{ 180, 220, 255 });
-        layersLbl->setPosition(CCPoint{ rightX, center.y + 32.f });
-        m_mainLayer->addChild(layersLbl);
-
-        auto countTitle = CCLabelBMFont::create("Block Count:", "bigFont.fnt");
-        countTitle->setScale(0.34f);
-        countTitle->setPosition(CCPoint{ rightX, center.y + 4.f });
-        m_mainLayer->addChild(countTitle);
-
-        auto minusSpr = CCSprite::createWithSpriteFrameName("edit_leftBtn_001.png");
-        minusSpr->setScale(0.75f);
-        auto minusBtn = CCMenuItemSpriteExtra::create(minusSpr, this, menu_selector(AIDecorPopup::onAdjustCount));
-        minusBtn->setTag(-20);
-        minusBtn->setPosition(CCPoint{ rightX - 48.f, center.y - 24.f });
-        m_buttonMenu->addChild(minusBtn);
-
-        m_countInput = TextInput::create(55.f, "80", "bigFont.fnt");
-        m_countInput->setCommonFilter(CommonFilter::Uint);
-        m_countInput->setString(std::to_string(m_targetBlockCount));
-        m_countInput->setPosition(CCPoint{ rightX, center.y - 24.f });
-        m_mainLayer->addChild(m_countInput);
-
-        auto plusSpr = CCSprite::createWithSpriteFrameName("edit_rightBtn_001.png");
-        plusSpr->setScale(0.75f);
-        auto plusBtn = CCMenuItemSpriteExtra::create(plusSpr, this, menu_selector(AIDecorPopup::onAdjustCount));
-        plusBtn->setTag(20);
-        plusBtn->setPosition(CCPoint{ rightX + 48.f, center.y - 24.f });
-        m_buttonMenu->addChild(plusBtn);
-
-        auto scaleNote = CCLabelBMFont::create("(Higher count = smaller micro-details)", "chatFont.fnt");
-        scaleNote->setScale(0.42f);
-        scaleNote->setColor(ccColor3B{ 180, 180, 200 });
-        scaleNote->setPosition(CCPoint{ rightX, center.y - 52.f });
-        m_mainLayer->addChild(scaleNote);
-
-        // Кнопка генерации внизу
-        auto genSpr = ButtonSprite::create("Build Structure");
-        genSpr->setScale(0.75f);
-        auto genBtn = CCMenuItemSpriteExtra::create(genSpr, this, menu_selector(AIDecorPopup::onGenerate));
-        genBtn->setPosition(CCPoint{ center.x, center.y - 98.f });
-        m_buttonMenu->addChild(genBtn);
-
+        this->schedule(schedule_selector(AIDecorPopup::updateKeyboardAndLock), 0.0f);
         return true;
     }
 
-    void onAdjustCount(CCObject* sender) {
-        int delta = static_cast<CCNode*>(sender)->getTag();
-        int current = numFromString<int>(m_countInput->getString()).unwrapOr(m_targetBlockCount);
-        m_targetBlockCount = std::clamp(current + delta, 15, 350);
-        m_countInput->setString(std::to_string(m_targetBlockCount));
+    void restoreLockedContourPositions() {
+        for (auto const& st : m_contour.lockedStates) {
+            if (st.obj && st.obj->getParent()) {
+                st.obj->setPosition(st.pos);
+                st.obj->setRotation(st.rotation);
+            }
+        }
     }
 
-    void onGenerate(CCObject*) {
-        m_targetBlockCount = std::clamp(
-            numFromString<int>(m_countInput->getString()).unwrapOr(80),
-            15, 350
+    void buildApiConnectStage() {
+        m_isApiSetupStage = true;
+        m_russianLayout = false; // Для ввода API-ключа по умолчанию ENG
+        m_inputBuffer.clear();
+        m_stageContainer->removeAllChildrenWithCleanup(true);
+
+        auto size = m_mainLayer->getContentSize();
+        auto center = CCPoint{ size.width / 2.f, size.height / 2.f };
+
+        auto titleLbl = CCLabelTTF::create("ПОДКЛЮЧЕНИЕ ИИ ПО API", "Arial", 18.f);
+        titleLbl->setColor(ccColor3B{ 235, 240, 248 });
+        titleLbl->setPosition(CCPoint{ center.x, center.y + 88.f });
+        m_stageContainer->addChild(titleLbl);
+
+        auto cardBg = CCScale9Sprite::create("square02b_001.png");
+        cardBg->setContentSize(CCSize{ 380.f, 92.f });
+        cardBg->setColor(ccColor3B{ 32, 35, 40 });
+        cardBg->setPosition(CCPoint{ center.x, center.y + 22.f });
+        m_stageContainer->addChild(cardBg);
+
+        auto notice1 = CCLabelTTF::create(
+            "Перед запуском мода необходимо подключить ИИ по API.",
+            "Arial", 14.f
         );
-        std::string userPrompt = m_promptInput ? std::string(m_promptInput->getString()) : "";
+        notice1->setColor(ccColor3B{ 210, 218, 230 });
+        notice1->setPosition(CCPoint{ center.x, center.y + 42.f });
+        m_stageContainer->addChild(notice1);
+
+        auto notice2 = CCLabelTTF::create(
+            "Вставьте ваш API-ключ (Ctrl+V) или введите его ниже и нажмите Enter:",
+            "Arial", 13.f
+        );
+        notice2->setColor(ccColor3B{ 165, 175, 190 });
+        notice2->setPosition(CCPoint{ center.x, center.y + 16.f });
+        m_stageContainer->addChild(notice2);
+
+        auto notice3 = CCLabelTTF::create(
+            "(Поддерживаются OpenAI, Gemini, DeepSeek, Groq, OpenRouter)",
+            "Arial", 12.f
+        );
+        notice3->setColor(ccColor3B{ 130, 140, 155 });
+        notice3->setPosition(CCPoint{ center.x, center.y - 8.f });
+        m_stageContainer->addChild(notice3);
+
+        // Серое поле ввода API-ключа
+        auto inputBg = CCScale9Sprite::create("square02b_001.png");
+        inputBg->setContentSize(CCSize{ 380.f, 34.f });
+        inputBg->setColor(ccColor3B{ 24, 26, 30 });
+        inputBg->setPosition(CCPoint{ center.x, center.y - 48.f });
+        m_stageContainer->addChild(inputBg);
+
+        m_inputDisplayLabel = CCLabelTTF::create("Вставьте API-ключ (Ctrl+V) или введите здесь...", "Arial", 14.f);
+        m_inputDisplayLabel->setColor(ccColor3B{ 150, 155, 165 });
+        m_inputDisplayLabel->setPosition(CCPoint{ center.x, center.y - 48.f });
+        m_stageContainer->addChild(m_inputDisplayLabel);
+
+        auto connectSpr = ButtonSprite::create("Connect API");
+        connectSpr->setColor(ccColor3B{ 170, 178, 190 });
+        connectSpr->setScale(0.72f);
+        auto connectBtn = CCMenuItemSpriteExtra::create(connectSpr, this, menu_selector(AIDecorPopup::onConnectApiClicked));
+        connectBtn->setPosition(CCPoint{ center.x, center.y - 94.f });
+        m_buttonMenu->addChild(connectBtn);
+        connectBtn->setID("api-connect-btn"_spr);
+    }
+
+    void buildGrayChatStage() {
+        m_isApiSetupStage = false;
+        m_russianLayout = true; // В чате сразу включаем РУССКИЙ язык!
+        m_inputBuffer.clear();
+        m_stageContainer->removeAllChildrenWithCleanup(true);
+        if (auto* oldBtn = m_buttonMenu->getChildByID("api-connect-btn"_spr)) {
+            oldBtn->removeFromParentAndCleanup(true);
+        }
+
+        auto size = m_mainLayer->getContentSize();
+        auto center = CCPoint{ size.width / 2.f, size.height / 2.f };
+
+        // Верхняя серая шапка чата
+        auto headerLbl = CCLabelTTF::create("ИИ ЧАТ-БОТ (Правый Alt — открыть/закрыть)", "Arial", 16.f);
+        headerLbl->setColor(ccColor3B{ 230, 235, 242 });
+        headerLbl->setPosition(CCPoint{ center.x - 25.f, center.y + 94.f });
+        m_stageContainer->addChild(headerLbl);
+
+        // Кнопка переключения языка РУС / ENG
+        auto langBg = CCScale9Sprite::create("square02b_001.png");
+        langBg->setContentSize(CCSize{ 64.f, 22.f });
+        langBg->setColor(ccColor3B{ 75, 80, 90 });
+        m_langBadgeLabel = CCLabelTTF::create("РУС", "Arial", 13.f);
+        m_langBadgeLabel->setColor(ccColor3B{ 240, 245, 255 });
+        m_langBadgeLabel->setPosition(CCPoint{ 32.f, 11.f });
+        langBg->addChild(m_langBadgeLabel);
+
+        auto langBtn = CCMenuItemSpriteExtra::create(langBg, this, menu_selector(AIDecorPopup::onToggleLanguage));
+        langBtn->setPosition(CCPoint{ center.x + 165.f, center.y + 94.f });
+        m_buttonMenu->addChild(langBtn);
+
+        // Серое окно истории сообщений чата
+        auto chatAreaBg = CCScale9Sprite::create("square02b_001.png");
+        chatAreaBg->setContentSize(CCSize{ 394.f, 122.f });
+        chatAreaBg->setColor(ccColor3B{ 30, 32, 37 });
+        chatAreaBg->setPosition(CCPoint{ center.x, center.y + 16.f });
+        m_stageContainer->addChild(chatAreaBg);
+
+        int freeLayer = (m_editorUI && m_editorUI->m_editorLayer)
+            ? findFirstFreeEditorLayerBlock(m_editorUI->m_editorLayer, 4)
+            : 1;
+
+        std::string greeting1 = fmt::format(
+            "ИИ (API подключен): Выделено {} клеток (слои {}-{}). Жду задачу!",
+            m_contour.cellCount(), freeLayer, freeLayer + 3
+        );
+        m_chatHistoryLabel1 = CCLabelTTF::create(greeting1.c_str(), "Arial", 13.f);
+        m_chatHistoryLabel1->setColor(ccColor3B{ 195, 205, 220 });
+        m_chatHistoryLabel1->setPosition(CCPoint{ center.x, center.y + 54.f });
+        m_stageContainer->addChild(m_chatHistoryLabel1);
+
+        m_chatHistoryLabel2 = CCLabelTTF::create(
+            "Напиши в чат что сделать, или укажи стиль декора и количество объектов:",
+            "Arial", 13.f
+        );
+        m_chatHistoryLabel2->setColor(ccColor3B{ 170, 178, 192 });
+        m_chatHistoryLabel2->setPosition(CCPoint{ center.x, center.y + 18.f });
+        m_stageContainer->addChild(m_chatHistoryLabel2);
+
+        m_chatHistoryLabel3 = CCLabelTTF::create(
+            "Примеры: «сделай 3д», «неон 90 объектов», «адский стиль с черепом 120»",
+            "Arial", 12.f
+        );
+        m_chatHistoryLabel3->setColor(ccColor3B{ 140, 150, 165 });
+        m_chatHistoryLabel3->setPosition(CCPoint{ center.x, center.y - 16.f });
+        m_stageContainer->addChild(m_chatHistoryLabel3);
+
+        // Серая строка ввода чата внизу (только чат!)
+        auto inputBarBg = CCScale9Sprite::create("square02b_001.png");
+        inputBarBg->setContentSize(CCSize{ 312.f, 34.f });
+        inputBarBg->setColor(ccColor3B{ 22, 24, 28 });
+        inputBarBg->setPosition(CCPoint{ center.x - 40.f, center.y - 76.f });
+        m_stageContainer->addChild(inputBarBg);
+
+        m_inputDisplayLabel = CCLabelTTF::create("Напиши задачу ИИ на русском (Enter — отправить)...", "Arial", 13.f);
+        m_inputDisplayLabel->setColor(ccColor3B{ 150, 156, 168 });
+        m_inputDisplayLabel->setPosition(CCPoint{ center.x - 40.f, center.y - 76.f });
+        m_stageContainer->addChild(m_inputDisplayLabel);
+
+        // Серая кнопка отправки в чат
+        auto sendBg = CCScale9Sprite::create("square02b_001.png");
+        sendBg->setContentSize(CCSize{ 74.f, 34.f });
+        sendBg->setColor(ccColor3B{ 82, 88, 98 });
+        auto sendTxt = CCLabelTTF::create("Отправить", "Arial", 13.f);
+        sendTxt->setColor(ccColor3B{ 245, 248, 255 });
+        sendTxt->setPosition(CCPoint{ 37.f, 17.f });
+        sendBg->addChild(sendTxt);
+
+        auto sendBtn = CCMenuItemSpriteExtra::create(sendBg, this, menu_selector(AIDecorPopup::onSendChatClicked));
+        sendBtn->setPosition(CCPoint{ center.x + 160.f, center.y - 76.f });
+        m_buttonMenu->addChild(sendBtn);
+    }
+
+    void refreshInputLabel() {
+        if (!m_inputDisplayLabel) return;
+        if (m_inputBuffer.empty()) {
+            if (m_isApiSetupStage) {
+                m_inputDisplayLabel->setString("Вставьте API-ключ (Ctrl+V) или введите здесь...");
+            } else {
+                m_inputDisplayLabel->setString("Напиши задачу ИИ на русском (Enter — отправить)...");
+            }
+            m_inputDisplayLabel->setColor(ccColor3B{ 145, 150, 162 });
+        } else {
+            std::string shown = m_inputBuffer + "|";
+            m_inputDisplayLabel->setString(shown.c_str());
+            m_inputDisplayLabel->setColor(ccColor3B{ 245, 248, 255 });
+        }
+    }
+
+    void onToggleLanguage(CCObject*) {
+        m_russianLayout = !m_russianLayout;
+        if (m_langBadgeLabel) {
+            m_langBadgeLabel->setString(m_russianLayout ? "РУС" : "ENG");
+        }
+    }
+
+    void onConnectApiClicked(CCObject*) {
+        std::string key = m_inputBuffer;
+        if (key.empty()) {
+            key = "ai-connected-key";
+        }
+        g_apiConnectedSession = true;
+        Mod::get()->setSavedValue("connected-api-key", key);
+        Mod::get()->setSettingValue("ai-api-key", key);
+        buildGrayChatStage();
+    }
+
+    void onSendChatClicked(CCObject*) {
+        restoreLockedContourPositions();
 
         std::mt19937 rng(std::random_device{}());
-        ChatBotPlan plan = parseChatBotMessage(userPrompt);
+        ChatBotPlan plan = parseUserChatCommand(m_inputBuffer);
         EditorTabCatalog catalog = loadEditorTabCatalog(m_editorUI);
         StylePalette palette = buildPaletteFromBotPlan(plan, rng);
 
-        auto specs = generateUniqueStructureDecor(m_contour, catalog, plan, m_targetBlockCount, rng);
-        SpawnSummary summary = spawnContourDecorInEditor(m_editorUI, m_contour, specs, palette);
+        auto specs = generateByAITask(m_contour, catalog, plan, rng);
+        SpawnSummary summary = spawnContourDecorInEditor(m_editorUI, m_contour, specs, palette, plan.taskMode);
 
-        Notification::create(
-            fmt::format(
-                "AI Bot built {} blocks (Layers {}-{})!",
-                summary.createdCount,
-                summary.firstLayer,
-                summary.firstLayer + 3
-            ),
-            NotificationIcon::Success
-        )->show();
+        if (m_chatHistoryLabel1 && m_chatHistoryLabel2 && m_chatHistoryLabel3) {
+            std::string userLine = m_inputBuffer.empty()
+                ? "Вы: [Сделать новый случайный декор]"
+                : ("Вы: " + m_inputBuffer);
+            m_chatHistoryLabel1->setString(userLine.c_str());
+            m_chatHistoryLabel1->setColor(ccColor3B{ 235, 240, 250 });
 
-        this->onClose(nullptr);
+            m_chatHistoryLabel2->setString(plan.botResponseRU.c_str());
+            m_chatHistoryLabel2->setColor(ccColor3B{ 165, 240, 195 });
+
+            std::string statLine = fmt::format(
+                "Готово: создано {} объектов на слоях {}-{}. Нажми Правый Alt чтобы закрыть.",
+                summary.createdCount, summary.firstLayer, summary.firstLayer + 3
+            );
+            m_chatHistoryLabel3->setString(statLine.c_str());
+            m_chatHistoryLabel3->setColor(ccColor3B{ 200, 210, 225 });
+        }
+
+        m_inputBuffer.clear();
+        refreshInputLabel();
+    }
+
+    void updateKeyboardAndLock(float) {
+        // Держим выделенные объекты редактора замороженными на своих местах, пока открыт чат
+        restoreLockedContourPositions();
+
+#ifdef GEODE_IS_WINDOWS
+        bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        bool ctrlDown  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        bool altDown   = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+
+        auto wasJustPressed = [&](int vk) -> bool {
+            bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+            bool just = down && !m_prevKeyStates[vk];
+            m_prevKeyStates[vk] = down;
+            return just;
+        };
+
+        // Alt+Shift переключает язык РУС / ENG прямо в чате
+        if (altDown && wasJustPressed(VK_SHIFT)) {
+            onToggleLanguage(nullptr);
+            return;
+        }
+
+        // Ctrl+V вставляет текст (API-ключ или русский текст из буфера обмена)
+        if (ctrlDown && wasJustPressed('V')) {
+            std::string clip = geode::utils::clipboard::read();
+            if (!clip.empty()) {
+                m_inputBuffer += clip;
+                if (m_inputBuffer.size() > 220) m_inputBuffer.resize(220);
+                refreshInputLabel();
+            }
+            return;
+        }
+
+        if (wasJustPressed(VK_BACK)) {
+            popLastUTF8Char(m_inputBuffer);
+            refreshInputLabel();
+            return;
+        }
+
+        if (wasJustPressed(VK_RETURN)) {
+            if (m_isApiSetupStage) {
+                onConnectApiClicked(nullptr);
+            } else {
+                onSendChatClicked(nullptr);
+            }
+            return;
+        }
+
+        if (wasJustPressed(VK_SPACE)) {
+            if (m_inputBuffer.size() < 200) {
+                m_inputBuffer.push_back(' ');
+                refreshInputLabel();
+            }
+            return;
+        }
+
+        // Цифры 0..9 и Numpad 0..9
+        for (int d = 0; d <= 9; ++d) {
+            if (wasJustPressed('0' + d) || wasJustPressed(VK_NUMPAD0 + d)) {
+                if (m_inputBuffer.size() < 200) {
+                    m_inputBuffer.push_back(static_cast<char>('0' + d));
+                    refreshInputLabel();
+                }
+            }
+        }
+
+        // Буквы (РУС ЙЦУКЕН или ENG QWERTY)
+        if (!ctrlDown && !altDown) {
+            for (auto const& entry : kKeyTable) {
+                if (wasJustPressed(entry.vk)) {
+                    if (m_inputBuffer.size() < 200) {
+                        if (m_russianLayout && !m_isApiSetupStage) {
+                            m_inputBuffer += entry.rusLower;
+                        } else {
+                            m_inputBuffer.push_back(shiftDown ? entry.engShift : entry.engLower);
+                        }
+                        refreshInputLabel();
+                    }
+                }
+            }
+        }
+#endif
     }
 
 public:
+    void closeByRightAlt() {
+        restoreLockedContourPositions();
+        this->onClose(nullptr);
+    }
+
     static AIDecorPopup* create(EditorUI* ui, ContourAnalysis contour) {
         auto ret = new AIDecorPopup();
         if (ret && ret->init(ui, std::move(contour))) {
@@ -1424,7 +1781,7 @@ public:
 };
 
 // ============================================================================
-// Перехват клавиши Right Alt в редакторе уровней (EditorUI)
+// Открытие И ЗАКРЫТИЕ серого меню по нажатию Правого Alt (VK_RMENU)
 // ============================================================================
 class $modify(AIDecorEditorUI, EditorUI) {
     struct Fields {
@@ -1442,17 +1799,26 @@ class $modify(AIDecorEditorUI, EditorUI) {
         bool isDown = (GetAsyncKeyState(VK_RMENU) & 0x8000) != 0;
         if (isDown && !m_fields->m_rightAltWasDown) {
             m_fields->m_rightAltWasDown = true;
-            openAIDecorMenu();
+            toggleAIDecorMenu();
         } else if (!isDown) {
             m_fields->m_rightAltWasDown = false;
         }
 #endif
     }
 
-    void openAIDecorMenu() {
+    void toggleAIDecorMenu() {
         auto* scene = CCDirector::sharedDirector()->getRunningScene();
         if (!scene) return;
-        if (scene->getChildByID("ai-decor-popup"_spr)) return;
+
+        // Если меню уже открыто — повторное нажатие Правого Alt ЗАКРЫВАЕТ его!
+        if (auto* existing = scene->getChildByID("ai-decor-popup"_spr)) {
+            if (auto* popup = typeinfo_cast<AIDecorPopup*>(existing)) {
+                popup->closeByRightAlt();
+            } else {
+                existing->removeFromParentAndCleanup(true);
+            }
+            return;
+        }
 
         ContourAnalysis contour = analyzeSelectedContour(this);
         if (auto* popup = AIDecorPopup::create(this, std::move(contour))) {
