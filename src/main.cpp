@@ -6,8 +6,6 @@
 #include <Geode/modify/EditorUI.hpp>
 #include <Geode/ui/Popup.hpp>
 #include <Geode/ui/TextInput.hpp>
-#include <Geode/utils/web.hpp>
-#include <Geode/utils/async.hpp>
 #include <random>
 #include <sstream>
 #include <algorithm>
@@ -254,7 +252,6 @@ static int spawnGeneratedObjectsInEditor(EditorUI* ui, std::vector<GeneratedObje
     if (!ui || !ui->m_editorLayer || specs.empty()) return 0;
 
     auto* editorLayer = ui->m_editorLayer;
-    bool tagGroup999 = Mod::get()->getSettingValue<bool>("clear-previous-decor");
     int createdCount = 0;
 
     for (auto const& s : specs) {
@@ -266,10 +263,6 @@ static int spawnGeneratedObjectsInEditor(EditorUI* ui, std::vector<GeneratedObje
             obj->setScale(s.scale);
         }
         obj->setZOrder(s.zOrder);
-
-        if (tagGroup999) {
-            editorLayer->addToGroup(obj, 999, false);
-        }
 
         createdCount++;
     }
@@ -291,7 +284,6 @@ protected:
     TextInput* m_countInput = nullptr;
     CCLabelBMFont* m_statusLabel = nullptr;
     std::vector<ButtonSprite*> m_styleSprites;
-    async::TaskHolder<web::WebResponse> m_webListener;
 
     bool init(EditorUI* ui, SelectionBounds bounds) {
         if (!Popup::init(420.f, 280.f)) return false;
@@ -413,17 +405,6 @@ protected:
         );
         std::string userPrompt = m_promptInput ? std::string(m_promptInput->getString()) : "";
 
-        std::string apiKey = Mod::get()->getSettingValue<std::string>("ai-api-key");
-        std::string apiUrl = Mod::get()->getSettingValue<std::string>("ai-api-url");
-
-        if (!apiKey.empty() && !apiUrl.empty()) {
-            requestCloudAIDecor(apiUrl, apiKey, userPrompt);
-        } else {
-            runProceduralGeneration(userPrompt);
-        }
-    }
-
-    void runProceduralGeneration(std::string const& userPrompt) {
         auto specs = generateProceduralStyleDecor(m_bounds, m_selectedStyle, m_targetBlockCount, userPrompt);
         int placed = spawnGeneratedObjectsInEditor(m_editorUI, specs);
 
@@ -433,83 +414,6 @@ protected:
         )->show();
 
         this->onClose(nullptr);
-    }
-
-    void requestCloudAIDecor(std::string const& apiUrl, std::string const& apiKey, std::string const& userPrompt) {
-        m_statusLabel->setString("Contacting AI Server...");
-
-        const char* styleNames[4] = { "Neon", "Modern", "Hell", "Reality" };
-        std::string styleName = styleNames[static_cast<int>(m_selectedStyle)];
-        std::string modelName = Mod::get()->getSettingValue<std::string>("ai-model");
-
-        std::string systemPrompt =
-            "You are a Geometry Dash 2.2 Level Editor decoration assistant. "
-            "Respond ONLY with a valid JSON object containing an array field 'objects', where each item has: "
-            "{\"id\": int, \"x\": float, \"y\": float, \"rot\": float, \"scale\": float, \"z\": int}. "
-            "Use authentic GD object IDs (211=block, 503/504/505=neon outlines, 1888=glow, 1705/88=saw, 446/447=rock, 406/407=nature, 8=spike).";
-
-        std::string fullUserPrompt = fmt::format(
-            "Decorate bounding box minX={:.1f}, minY={:.1f}, maxX={:.1f}, maxY={:.1f} in '{}' style using ~{} objects. User request: {}",
-            m_bounds.minX, m_bounds.minY, m_bounds.maxX, m_bounds.maxY,
-            styleName, m_targetBlockCount,
-            userPrompt.empty() ? "Standard rich decoration for this style" : userPrompt
-        );
-
-        matjson::Value msgs = matjson::Value::array();
-        msgs.push(matjson::makeObject({{"role", "system"}, {"content", systemPrompt}}));
-        msgs.push(matjson::makeObject({{"role", "user"}, {"content", fullUserPrompt}}));
-
-        matjson::Value body = matjson::makeObject({
-            {"model", modelName},
-            {"messages", msgs},
-            {"temperature", 0.7}
-        });
-
-        web::WebRequest req = web::WebRequest();
-        req.header("Content-Type", "application/json");
-        req.header("Authorization", fmt::format("Bearer {}", apiKey));
-        req.bodyJSON(body);
-
-        m_webListener.spawn(
-            req.post(apiUrl),
-            [this, userPrompt](auto res) {
-                if (res.ok()) {
-                    auto jsonRes = res.json();
-                    if (jsonRes.isOk()) {
-                        auto root = jsonRes.unwrap();
-                        std::vector<GeneratedObjectSpec> aiSpecs;
-                        auto contentStr = root["choices"][0]["message"]["content"].asString().unwrapOr("");
-                        auto parsedContent = matjson::parse(contentStr);
-                        if (parsedContent.isOk()) {
-                            auto objs = parsedContent.unwrap()["objects"];
-                            if (objs.isArray()) {
-                                for (auto const& item : objs) {
-                                    GeneratedObjectSpec s;
-                                    s.objectId = static_cast<int>(item["id"].asInt().unwrapOr(211));
-                                    s.x = static_cast<float>(item["x"].asDouble().unwrapOr(m_bounds.minX));
-                                    s.y = static_cast<float>(item["y"].asDouble().unwrapOr(m_bounds.minY));
-                                    s.rotation = static_cast<float>(item["rot"].asDouble().unwrapOr(0.0));
-                                    s.scale = static_cast<float>(item["scale"].asDouble().unwrapOr(1.0));
-                                    s.zOrder = static_cast<int>(item["z"].asInt().unwrapOr(5));
-                                    aiSpecs.push_back(s);
-                                }
-                            }
-                        }
-
-                        if (!aiSpecs.empty()) {
-                            int placed = spawnGeneratedObjectsInEditor(m_editorUI, aiSpecs);
-                            Notification::create(
-                                fmt::format("Cloud AI generated {} objects!", placed),
-                                NotificationIcon::Success
-                            )->show();
-                            this->onClose(nullptr);
-                            return;
-                        }
-                    }
-                }
-                runProceduralGeneration(userPrompt);
-            }
-        );
     }
 
 public:
@@ -606,16 +510,6 @@ class $modify(AIDecorEditorUI, EditorUI) {
             openAIDecorMenu();
         } else if (!isDown) {
             m_fields->m_rightAltWasDown = false;
-        }
-#endif
-    }
-
-    void keyDown(cocos2d::enumKeyCodes key) {
-        EditorUI::keyDown(key);
-
-#ifndef GEODE_IS_WINDOWS
-        if (key == cocos2d::enumKeyCodes::KEY_Alt) {
-            openAIDecorMenu();
         }
 #endif
     }
