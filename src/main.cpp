@@ -608,6 +608,8 @@ static std::string sanitizeApiKeyString(std::string s) {
     return trimWhitespace(s);
 }
 
+static std::string extractJsonStringField(std::string const& json, std::string const& key);
+
 static bool verifyApiKeyWithServer(int providerIdx, std::string const& rawKey, std::string& outErrorMsg) {
     std::string key = sanitizeApiKeyString(rawKey);
     if (!hasPlausibleKeyFormat(key)) {
