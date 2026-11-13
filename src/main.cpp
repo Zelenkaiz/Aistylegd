@@ -2027,14 +2027,25 @@ static std::string readWindowsClipboardText() {
 }
 
 // ============================================================================
-// Помощник создания 100% НЕПРОЗРАЧНЫХ цветных плашек через CCLayerColor
-// (чтобы фон, кнопки и превью никогда не были прозрачными!)
+// Помощники UI:
+// - Прямоугольные кнопки (CCLayerColor)
+// - Округлый каркас меню и округлая строка ввода (CCScale9Sprite с увеличенным радиусом)
+// - Градиентная подложка под кнопками (CCLayerGradient по размерам каркаса)
 // ============================================================================
 static CCLayerColor* createSolidPanel(float width, float height, ccColor3B color, GLubyte alpha = 255) {
     auto* panel = CCLayerColor::create(ccColor4B{ color.r, color.g, color.b, alpha }, width, height);
     panel->ignoreAnchorPointForPosition(false);
     panel->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
     return panel;
+}
+
+static CCScale9Sprite* createRoundedPanel(float width, float height, float cornerScale, ccColor3B color, GLubyte alpha = 255) {
+    auto* spr = CCScale9Sprite::create("square02b_001.png");
+    spr->setContentSize(CCSize{ width / cornerScale, height / cornerScale });
+    spr->setScale(cornerScale);
+    spr->setColor(color);
+    spr->setOpacity(alpha);
+    return spr;
 }
 
 static CCMenuItemSpriteExtra* createSolidButton(
@@ -2048,7 +2059,7 @@ static CCMenuItemSpriteExtra* createSolidButton(
     SEL_MenuHandler selector
 ) {
     auto* bg = createSolidPanel(width, height, bgColor, 255);
-    auto* border = createSolidPanel(width + 2.f, height + 2.f, ccColor3B{ 62, 66, 78 }, 255);
+    auto* border = createSolidPanel(width + 2.f, height + 2.f, ccColor3B{ 78, 36, 42 }, 255);
     border->setPosition(CCPoint{ width * 0.5f, height * 0.5f });
     border->setZOrder(-1);
     bg->addChild(border);
@@ -2086,15 +2097,10 @@ protected:
     CCLayerColor* m_checkBoxBg = nullptr;
     CCNode* m_checkTickContainer = nullptr;
 
-    // Элементы интерфейса Art Agent
-    CCLabelBMFont* m_agentReplyLine1 = nullptr;
-    CCLabelBMFont* m_agentReplyLine2 = nullptr;
-    CCLabelBMFont* m_agentReplyLine3 = nullptr;
-    CCLabelBMFont* m_userPromptLine1 = nullptr;
-    CCLabelBMFont* m_userPromptLine2 = nullptr;
+    // Прокручиваемый ИИ-чат для чтения старых и новых сообщений
+    geode::ScrollLayer* m_chatScrollLayer = nullptr;
     CCLabelBMFont* m_stepPlanLabel = nullptr;
     CCLabelBMFont* m_stepDrawingLabel = nullptr;
-    CCLabelBMFont* m_stepVectorLabel = nullptr;
     CCLabelBMFont* m_stepPlaceLabel = nullptr;
 
     // Правая панель Art Agent (Shape | Drawing | In GD)
@@ -2108,7 +2114,7 @@ protected:
     CCLayerColor* m_overhangTabBg = nullptr;
 
     bool init(EditorUI* ui, ContourAnalysis contour, PopupStage requestedStage, PopupStage prevStage) {
-        if (!Popup::init(492.f, 288.f)) return false;
+        if (!Popup::init(500.f, 294.f)) return false;
 
         g_activePopup = this;
         m_editorUI = ui;
@@ -2132,19 +2138,39 @@ protected:
             m_inputBuffer = g_connectedApiKey;
         }
 
+        if constexpr (requires { this->m_bgSprite; }) {
+            if (this->m_bgSprite) {
+                this->m_bgSprite->setOpacity(0);
+            }
+        }
+
         auto size = m_mainLayer->getContentSize();
         auto center = CCPoint{ size.width / 2.f, size.height / 2.f };
 
-        // Сплошной непрозрачный темно-серый корпус окна
-        auto* outerBorder = createSolidPanel(size.width, size.height, ccColor3B{ 68, 72, 84 }, 255);
-        outerBorder->setPosition(center);
-        outerBorder->setZOrder(-3);
-        m_mainLayer->addChild(outerBorder);
+        // 1. Более ОКРУГЛЕННЫЙ внешний каркас меню (с увеличенным радиусом скругления)
+        auto* outerRoundedFrame = createRoundedPanel(size.width, size.height, 1.85f, ccColor3B{ 72, 22, 28 }, 255);
+        outerRoundedFrame->setPosition(center);
+        outerRoundedFrame->setZOrder(-4);
+        m_mainLayer->addChild(outerRoundedFrame);
 
-        auto* innerBody = createSolidPanel(size.width - 4.f, size.height - 4.f, ccColor3B{ 18, 19, 24 }, 255);
-        innerBody->setPosition(center);
-        innerBody->setZOrder(-2);
-        m_mainLayer->addChild(innerBody);
+        auto* innerRoundedShell = createRoundedPanel(size.width - 6.f, size.height - 6.f, 1.80f, ccColor3B{ 12, 8, 10 }, 255);
+        innerRoundedShell->setPosition(center);
+        innerRoundedShell->setZOrder(-3);
+        m_mainLayer->addChild(innerRoundedShell);
+
+        // 2. Градиентная красно-черная подложка (как на фото image_b5b63a.png),
+        //    лежащая ровно на каркасе меню ПОД всеми кнопками и панелями!
+        auto* frameGradient = CCLayerGradient::create(
+            ccColor4B{ 68, 7, 10, 235 },
+            ccColor4B{ 4, 2, 3, 245 },
+            CCPoint{ 0.f, -1.f }
+        );
+        frameGradient->setContentSize(CCSize{ size.width - 18.f, size.height - 18.f });
+        frameGradient->ignoreAnchorPointForPosition(false);
+        frameGradient->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
+        frameGradient->setPosition(center);
+        frameGradient->setZOrder(-2);
+        m_mainLayer->addChild(frameGradient);
 
         if (m_stage == PopupStage::ApiGate) {
             setupStrictApiGateUI(center);
@@ -2207,7 +2233,7 @@ protected:
     }
 
     // ========================================================================
-    // ЭКРАН 1: СТРОГАЯ ПРОВЕРКА ДОСТОВЕРНОСТИ API-КЛЮЧА + КНОПКА ВЫБОРА МОДЕЛИ
+    // ЭКРАН 1: СТРОГАЯ ПРОВЕРКА ДОСТОВЕРНОСТИ API-КЛЮЧА
     // ========================================================================
     void setupStrictApiGateUI(CCPoint center) {
         this->setTitle("ART AGENT — PODKLYUCHENIE II PO API");
@@ -2218,11 +2244,11 @@ protected:
                 "Back", 0.48f, ccColor3B{ 235, 240, 250 },
                 this, menu_selector(AIDecorPopup::onBackToArtAgent)
             );
-            backBtn->setPosition(CCPoint{ center.x + 190.f, center.y + 118.f });
+            backBtn->setPosition(CCPoint{ center.x + 190.f, center.y + 120.f });
             m_buttonMenu->addChild(backBtn);
         }
 
-        auto* cardBg = createSolidPanel(440.f, 122.f, ccColor3B{ 28, 30, 38 }, 255);
+        auto* cardBg = createRoundedPanel(444.f, 122.f, 1.35f, ccColor3B{ 22, 16, 20 }, 225);
         cardBg->setPosition(CCPoint{ center.x, center.y + 28.f });
         m_mainLayer->addChild(cardBg);
 
@@ -2230,17 +2256,17 @@ protected:
 
         std::string initStatus = g_apiVerifiedAndConnected
             ? fmt::format("API Key Verified: {} ({})", kApiProviders[m_providerIdx].name, maskApiKeyPreview(g_connectedApiKey))
-            : "Vvedite dostoverniy API-klyuch (proverka cherez GET /models bez oshibki 404!)";
+            : "Vvedite dostoverniy API-klyuch (proverka cherez server pered vhodom)";
         m_apiGateStatusLabel = CCLabelBMFont::create(initStatus.c_str(), "chatFont.fnt");
         m_apiGateStatusLabel->setScale(0.50f);
         m_apiGateStatusLabel->setColor(g_apiVerifiedAndConnected ? ccColor3B{ 110, 245, 155 } : ccColor3B{ 245, 195, 120 });
         m_apiGateStatusLabel->setPosition(CCPoint{ center.x + 10.f, center.y + 68.f });
         m_mainLayer->addChild(m_apiGateStatusLabel);
 
-        // Две удобные кнопки выбора: [Провайдер] и [Окошко выбора модели ИИ]
+        // Прямоугольные кнопки выбора провайдера и модели
         std::string provText = fmt::format("Provider: {} (Switch)", kApiProviders[m_providerIdx].name);
         auto* provBtn = createSolidButton(
-            195.f, 26.f, ccColor3B{ 44, 48, 58 },
+            195.f, 26.f, ccColor3B{ 40, 32, 38 },
             provText.c_str(), 0.48f, ccColor3B{ 245, 248, 255 },
             this, menu_selector(AIDecorPopup::onCycleApiProvider)
         );
@@ -2249,7 +2275,7 @@ protected:
 
         std::string modBtnText = fmt::format("Model: {} (Change)", getCurrentModelID(m_providerIdx));
         auto* openModWinBtn = createSolidButton(
-            215.f, 26.f, ccColor3B{ 56, 62, 78 },
+            215.f, 26.f, ccColor3B{ 48, 36, 44 },
             modBtnText.c_str(), 0.45f, ccColor3B{ 165, 230, 255 },
             this, menu_selector(AIDecorPopup::onOpenModelSelectorFromGate)
         );
@@ -2257,16 +2283,16 @@ protected:
         m_buttonMenu->addChild(openModWinBtn);
 
         auto* hintLbl = CCLabelBMFont::create(
-            "Nazhmite 'Model: ... (Change)' chtobi vibrat aktualnuyu model II v otdelnom okoshke!",
+            "Nazhmite 'Model: ... (Change)' chtobi vibrat aktualnuyu model II!",
             "chatFont.fnt"
         );
         hintLbl->setScale(0.45f);
-        hintLbl->setColor(ccColor3B{ 170, 178, 192 });
+        hintLbl->setColor(ccColor3B{ 185, 175, 180 });
         hintLbl->setPosition(CCPoint{ center.x, center.y - 8.f });
         m_mainLayer->addChild(hintLbl);
 
-        // Непрозрачное поле ввода API-ключа
-        auto* inputBg = createSolidPanel(440.f, 34.f, ccColor3B{ 12, 13, 17 }, 255);
+        // Округленная строка ввода API-ключа
+        auto* inputBg = createRoundedPanel(444.f, 34.f, 1.40f, ccColor3B{ 14, 12, 16 }, 255);
         inputBg->setPosition(CCPoint{ center.x, center.y - 54.f });
         m_mainLayer->addChild(inputBg);
 
@@ -2276,9 +2302,9 @@ protected:
         m_mainLayer->addChild(m_inputDisplayLabel);
         refreshInputLabel();
 
-        // Нижние кнопки с четкими непрозрачными плашками
+        // Прямоугольные кнопки внизу
         auto* pasteBtn = createSolidButton(
-            130.f, 30.f, ccColor3B{ 44, 48, 58 },
+            130.f, 30.f, ccColor3B{ 42, 34, 40 },
             "Paste (Ctrl+V)", 0.50f, ccColor3B{ 240, 245, 255 },
             this, menu_selector(AIDecorPopup::onPasteApiClicked)
         );
@@ -2286,7 +2312,7 @@ protected:
         m_buttonMenu->addChild(pasteBtn);
 
         auto* clearBtn = createSolidButton(
-            90.f, 30.f, ccColor3B{ 44, 48, 58 },
+            90.f, 30.f, ccColor3B{ 42, 34, 40 },
             "Clear", 0.50f, ccColor3B{ 240, 245, 255 },
             this, menu_selector(AIDecorPopup::onClearApiClicked)
         );
@@ -2294,7 +2320,7 @@ protected:
         m_buttonMenu->addChild(clearBtn);
 
         auto* verifyBtn = createSolidButton(
-            195.f, 30.f, ccColor3B{ 228, 58, 92 },
+            195.f, 30.f, ccColor3B{ 212, 46, 78 },
             "Verify & Connect API", 0.52f, ccColor3B{ 255, 255, 255 },
             this, menu_selector(AIDecorPopup::onVerifyAndConnectApi)
         );
@@ -2303,15 +2329,14 @@ protected:
     }
 
     // ========================================================================
-    // ЭКРАН 2: ОКОШКО ВЫБОРА АКТУАЛЬНОЙ МОДЕЛИ ИИ (Только поддерживаемые модели!)
+    // ЭКРАН 2: ОКОШКО ВЫБОРА АКТУАЛЬНОЙ МОДЕЛИ ИИ
     // ========================================================================
     void setupModelSelectorWindowUI(CCPoint center) {
         this->setTitle("VIBOR AKTUALNOY MODELI II");
 
-        // Верхняя плашка выбора провайдера [< Provider: Gemini >] + кнопка [Назад]
         std::string provHeader = fmt::format("Provider: {} (Click to switch)", kApiProviders[m_providerIdx].name);
         auto* provSwitchBtn = createSolidButton(
-            260.f, 26.f, ccColor3B{ 44, 48, 60 },
+            260.f, 26.f, ccColor3B{ 44, 34, 42 },
             provHeader.c_str(), 0.50f, ccColor3B{ 165, 230, 255 },
             this, menu_selector(AIDecorPopup::onCycleProviderInModelWindow)
         );
@@ -2319,7 +2344,7 @@ protected:
         m_buttonMenu->addChild(provSwitchBtn);
 
         auto* backBtn = createSolidButton(
-            110.f, 26.f, ccColor3B{ 62, 66, 78 },
+            110.f, 26.f, ccColor3B{ 62, 46, 54 },
             "Nazad / Done", 0.48f, ccColor3B{ 245, 248, 255 },
             this, menu_selector(AIDecorPopup::onCloseModelSelectorWindow)
         );
@@ -2327,11 +2352,11 @@ protected:
         m_buttonMenu->addChild(backBtn);
 
         auto* subInfo = CCLabelBMFont::create(
-            "Vse ustarevshie modeli ubrani. Nazhmite na lyubuyu podderzhivaemuyu model nizhe:",
+            "Vse ustarevshie modeli ubrani. Nazhmite na podderzhivaemuyu model nizhe:",
             "chatFont.fnt"
         );
         subInfo->setScale(0.45f);
-        subInfo->setColor(ccColor3B{ 175, 182, 195 });
+        subInfo->setColor(ccColor3B{ 195, 185, 190 });
         subInfo->setPosition(CCPoint{ center.x, center.y + 62.f });
         m_mainLayer->addChild(subInfo);
 
@@ -2347,11 +2372,11 @@ protected:
             float rowY = center.y + 28.f - i * 42.f;
             bool isSelected = (i == activeIdx);
 
-            ccColor3B cardColor = isSelected ? ccColor3B{ 36, 68, 52 } : ccColor3B{ 28, 30, 38 };
+            ccColor3B cardColor = isSelected ? ccColor3B{ 34, 72, 52 } : ccColor3B{ 26, 20, 24 };
             auto* rowBg = createSolidPanel(430.f, 34.f, cardColor, 255);
             auto* rowBorder = createSolidPanel(
                 432.f, 36.f,
-                isSelected ? ccColor3B{ 46, 215, 105 } : ccColor3B{ 54, 58, 68 },
+                isSelected ? ccColor3B{ 46, 215, 105 } : ccColor3B{ 72, 44, 52 },
                 255
             );
             rowBorder->setPosition(CCPoint{ 215.f, 17.f });
@@ -2372,7 +2397,7 @@ protected:
 
             auto* descLbl = CCLabelBMFont::create(kApiProviders[m_providerIdx].models[i].badgeDesc, "chatFont.fnt");
             descLbl->setScale(0.42f);
-            descLbl->setColor(ccColor3B{ 170, 178, 192 });
+            descLbl->setColor(ccColor3B{ 185, 180, 190 });
             descLbl->setPosition(CCPoint{ 215.f, 9.f });
             rowBg->addChild(descLbl);
 
@@ -2383,220 +2408,179 @@ protected:
     }
 
     // ========================================================================
-    // ЭКРАН 3: ГЛАВНЫЙ ИНТЕРФЕЙС "ART AGENT" (1-в-1 по скриншотам!)
+    // ЭКРАН 3: ГЛАВНЫЙ ИНТЕРФЕЙС "ART AGENT" С ПРОКРУЧИВАЕМЫМ ИИ-ЧАТОМ
     // ========================================================================
     void setupArtAgentMainUI(CCPoint center) {
         this->setTitle("");
 
-        // --- ВЕРХНЯЯ ПАНЕЛЬ (Шапка Art Agent) ---
+        // --- ВЕРХНЯЯ ПАНЕЛЬ ---
         auto* headerTitle = CCLabelBMFont::create("Art Agent", "chatFont.fnt");
         headerTitle->setScale(0.58f);
         headerTitle->setColor(ccColor3B{ 245, 248, 255 });
-        headerTitle->setPosition(CCPoint{ center.x + 15.f, center.y + 125.f });
+        headerTitle->setPosition(CCPoint{ center.x + 15.f, center.y + 126.f });
         m_mainLayer->addChild(headerTitle);
 
-        // Левая капсула API + зеленая галочка + розовая кнопка [+] смены API
-        auto* balPill = createSolidPanel(106.f, 22.f, ccColor3B{ 28, 30, 38 }, 255);
-        balPill->setPosition(CCPoint{ center.x - 180.f, center.y + 125.f });
+        auto* balPill = createSolidPanel(106.f, 22.f, ccColor3B{ 28, 18, 22 }, 220);
+        balPill->setPosition(CCPoint{ center.x - 182.f, center.y + 126.f });
         m_mainLayer->addChild(balPill);
 
-        createCheckmarkBadge(CCPoint{ center.x - 221.f, center.y + 125.f }, true);
+        createCheckmarkBadge(CCPoint{ center.x - 223.f, center.y + 126.f }, true);
 
         std::string apiTag = fmt::format("API {}", kApiProviders[m_providerIdx].name);
         auto* apiTagLbl = CCLabelBMFont::create(apiTag.c_str(), "chatFont.fnt");
         apiTagLbl->setScale(0.44f);
         apiTagLbl->setColor(ccColor3B{ 230, 235, 245 });
-        apiTagLbl->setPosition(CCPoint{ center.x - 182.f, center.y + 125.f });
+        apiTagLbl->setPosition(CCPoint{ center.x - 184.f, center.y + 126.f });
         m_mainLayer->addChild(apiTagLbl);
 
         auto* changeApiBtn = createSolidButton(
-            24.f, 20.f, ccColor3B{ 232, 65, 98 },
+            24.f, 20.f, ccColor3B{ 222, 52, 86 },
             "+", 0.55f, ccColor3B{ 255, 255, 255 },
             this, menu_selector(AIDecorPopup::onOpenApiGate)
         );
-        changeApiBtn->setPosition(CCPoint{ center.x - 138.f, center.y + 125.f });
+        changeApiBtn->setPosition(CCPoint{ center.x - 140.f, center.y + 126.f });
         m_buttonMenu->addChild(changeApiBtn);
 
-        // Кнопка открытия окошка выбора модели ИИ прямо из шапки Art Agent!
         std::string shortMod = fmt::format("Model: {}", getCurrentModelID(m_providerIdx));
         if (shortMod.size() > 22) shortMod = shortMod.substr(0, 22);
         auto* modelBtn = createSolidButton(
-            112.f, 20.f, ccColor3B{ 38, 42, 54 },
+            114.f, 20.f, ccColor3B{ 38, 26, 32 },
             shortMod.c_str(), 0.38f, ccColor3B{ 165, 230, 255 },
             this, menu_selector(AIDecorPopup::onOpenModelSelectorFromMain)
         );
-        modelBtn->setPosition(CCPoint{ center.x - 64.f, center.y + 125.f });
+        modelBtn->setPosition(CCPoint{ center.x - 65.f, center.y + 126.f });
         m_buttonMenu->addChild(modelBtn);
 
-        // Кнопка переключения раскладки [RUS/ENG]
-        auto* langBg = createSolidPanel(44.f, 20.f, ccColor3B{ 38, 42, 54 }, 255);
+        auto* langBg = createSolidPanel(44.f, 20.f, ccColor3B{ 38, 26, 32 }, 255);
         m_langBadgeLabel = CCLabelBMFont::create("RUS", "chatFont.fnt");
         m_langBadgeLabel->setScale(0.45f);
         m_langBadgeLabel->setColor(ccColor3B{ 240, 245, 255 });
         m_langBadgeLabel->setPosition(CCPoint{ 22.f, 10.f });
         langBg->addChild(m_langBadgeLabel);
         auto* langBtn = CCMenuItemSpriteExtra::create(langBg, this, menu_selector(AIDecorPopup::onToggleLanguage));
-        langBtn->setPosition(CCPoint{ center.x + 185.f, center.y + 125.f });
+        langBtn->setPosition(CCPoint{ center.x + 186.f, center.y + 126.f });
         m_buttonMenu->addChild(langBtn);
 
-        // Разделительные линии
-        auto* topDivider = createSolidPanel(484.f, 1.5f, ccColor3B{ 42, 45, 54 }, 255);
-        topDivider->setPosition(CCPoint{ center.x, center.y + 109.f });
+        // Разделители поверх градиента
+        auto* topDivider = createSolidPanel(482.f, 1.2f, ccColor3B{ 88, 32, 40 }, 220);
+        topDivider->setPosition(CCPoint{ center.x, center.y + 110.f });
         m_mainLayer->addChild(topDivider);
 
-        auto* midDivider = createSolidPanel(1.5f, 246.f, ccColor3B{ 42, 45, 54 }, 255);
+        auto* midDivider = createSolidPanel(1.2f, 246.f, ccColor3B{ 88, 32, 40 }, 220);
         midDivider->setPosition(CCPoint{ center.x - 4.f, center.y - 14.f });
         m_mainLayer->addChild(midDivider);
 
         // ====================================================================
-        // ЛЕВАЯ КОЛОНКА: Карточка ответа ИИ-Агента + Карточка выделения и шагов
+        // ЛЕВАЯ КОЛОНКА: Прокручиваемый ИИ-чат + Компактный статус + Округленная строка ввода
         // ====================================================================
-        float leftX = center.x - 122.f;
+        float leftX = center.x - 125.f;
 
-        auto* agentCard = createSolidPanel(222.f, 64.f, ccColor3B{ 26, 28, 35 }, 255);
-        agentCard->setPosition(CCPoint{ leftX, center.y + 68.f });
-        m_mainLayer->addChild(agentCard);
+        // Округленная подложка ленты прокручиваемого чата
+        auto* chatBoxBg = createRoundedPanel(204.f, 158.f, 1.30f, ccColor3B{ 18, 12, 16 }, 215);
+        chatBoxBg->setPosition(CCPoint{ leftX - 10.f, center.y + 24.f });
+        m_mainLayer->addChild(chatBoxBg);
 
-        auto* agentTitle = CCLabelBMFont::create("Agent", "chatFont.fnt");
-        agentTitle->setScale(0.44f);
-        agentTitle->setColor(ccColor3B{ 140, 146, 160 });
-        agentTitle->setPosition(CCPoint{ leftX - 88.f, center.y + 90.f });
-        m_mainLayer->addChild(agentTitle);
+        // Настоящий прокручиваемый geode::ScrollLayer (поддерживает колесико мыши и перетаскивание!)
+        m_chatScrollLayer = geode::ScrollLayer::create(CCSize{ 196.f, 150.f }, true, true);
+        m_chatScrollLayer->ignoreAnchorPointForPosition(false);
+        m_chatScrollLayer->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
+        m_chatScrollLayer->setPosition(CCPoint{ leftX - 10.f, center.y + 24.f });
+        m_mainLayer->addChild(m_chatScrollLayer);
 
-        std::string initMsg1 = fmt::format(
-            "Tell me what to draw on the {} selected blocks.",
-            m_contour.cellCount()
+        // Прямоугольные кнопки прокрутки вверх [^] и вниз [v] справа от чата
+        auto* scrollUpBtn = createSolidButton(
+            18.f, 22.f, ccColor3B{ 44, 28, 34 },
+            "^", 0.52f, ccColor3B{ 245, 248, 255 },
+            this, menu_selector(AIDecorPopup::onScrollChatUp)
         );
-        m_agentReplyLine1 = CCLabelBMFont::create(initMsg1.c_str(), "chatFont.fnt");
-        m_agentReplyLine1->setScale(0.45f);
-        m_agentReplyLine1->setColor(ccColor3B{ 240, 242, 248 });
-        m_agentReplyLine1->setPosition(CCPoint{ leftX, center.y + 73.f });
-        m_mainLayer->addChild(m_agentReplyLine1);
+        scrollUpBtn->setPosition(CCPoint{ leftX + 102.f, center.y + 84.f });
+        m_buttonMenu->addChild(scrollUpBtn);
 
-        m_agentReplyLine2 = CCLabelBMFont::create("You can write in any language.", "chatFont.fnt");
-        m_agentReplyLine2->setScale(0.45f);
-        m_agentReplyLine2->setColor(ccColor3B{ 210, 215, 225 });
-        m_agentReplyLine2->setPosition(CCPoint{ leftX, center.y + 58.f });
-        m_mainLayer->addChild(m_agentReplyLine2);
+        auto* scrollDownBtn = createSolidButton(
+            18.f, 22.f, ccColor3B{ 44, 28, 34 },
+            "v", 0.48f, ccColor3B{ 245, 248, 255 },
+            this, menu_selector(AIDecorPopup::onScrollChatDown)
+        );
+        scrollDownBtn->setPosition(CCPoint{ leftX + 102.f, center.y - 36.f });
+        m_buttonMenu->addChild(scrollDownBtn);
 
-        m_agentReplyLine3 = CCLabelBMFont::create("", "chatFont.fnt");
-        m_agentReplyLine3->setScale(0.43f);
-        m_agentReplyLine3->setColor(ccColor3B{ 185, 192, 205 });
-        m_agentReplyLine3->setPosition(CCPoint{ leftX, center.y + 44.f });
-        m_mainLayer->addChild(m_agentReplyLine3);
+        // Компактная полоска статуса шагов под чатом (Plan | Drawing | Place)
+        auto* statusBarBg = createSolidPanel(224.f, 20.f, ccColor3B{ 22, 14, 18 }, 220);
+        statusBarBg->setPosition(CCPoint{ leftX, center.y - 66.f });
+        m_mainLayer->addChild(statusBarBg);
 
-        // Средняя карточка: Selection + чеклист (Shape / Plan / Drawing / Vector / Place)
-        auto* stepsCard = createSolidPanel(222.f, 92.f, ccColor3B{ 24, 26, 32 }, 255);
-        stepsCard->setPosition(CCPoint{ leftX, center.y - 16.f });
-        m_mainLayer->addChild(stepsCard);
+        m_stepPlanLabel = CCLabelBMFont::create("Plan: ready", "chatFont.fnt");
+        m_stepPlanLabel->setScale(0.36f);
+        m_stepPlanLabel->setColor(ccColor3B{ 225, 195, 205 });
+        m_stepPlanLabel->setPosition(CCPoint{ leftX - 72.f, center.y - 66.f });
+        m_mainLayer->addChild(m_stepPlanLabel);
 
-        auto* miniThumbBg = createSolidPanel(34.f, 22.f, ccColor3B{ 22, 92, 212 }, 255);
-        miniThumbBg->setPosition(CCPoint{ leftX - 86.f, center.y + 14.f });
-        m_mainLayer->addChild(miniThumbBg);
+        m_stepDrawingLabel = CCLabelBMFont::create("Draw: wait", "chatFont.fnt");
+        m_stepDrawingLabel->setScale(0.36f);
+        m_stepDrawingLabel->setColor(ccColor3B{ 195, 185, 195 });
+        m_stepDrawingLabel->setPosition(CCPoint{ leftX - 2.f, center.y - 66.f });
+        m_mainLayer->addChild(m_stepDrawingLabel);
 
-        auto* miniShapeIcon = createSolidPanel(16.f, 14.f, ccColor3B{ 38, 215, 50 }, 255);
-        miniShapeIcon->setPosition(CCPoint{ leftX - 86.f, center.y + 14.f });
-        m_mainLayer->addChild(miniShapeIcon);
+        m_stepPlaceLabel = CCLabelBMFont::create("Place: wait", "chatFont.fnt");
+        m_stepPlaceLabel->setScale(0.36f);
+        m_stepPlaceLabel->setColor(ccColor3B{ 195, 185, 195 });
+        m_stepPlaceLabel->setPosition(CCPoint{ leftX + 72.f, center.y - 66.f });
+        m_mainLayer->addChild(m_stepPlaceLabel);
 
-        auto* selTitle = CCLabelBMFont::create("Selection", "chatFont.fnt");
-        selTitle->setScale(0.44f);
-        selTitle->setColor(ccColor3B{ 232, 82, 105 });
-        selTitle->setPosition(CCPoint{ leftX - 42.f, center.y + 19.f });
-        m_mainLayer->addChild(selTitle);
-
-        std::string selObjStr = fmt::format("{} objects ({}x{})", m_contour.cellCount(), m_contour.widthUnits(), m_contour.heightUnits());
-        m_userPromptLine1 = CCLabelBMFont::create(selObjStr.c_str(), "chatFont.fnt");
-        m_userPromptLine1->setScale(0.43f);
-        m_userPromptLine1->setColor(ccColor3B{ 185, 190, 202 });
-        m_userPromptLine1->setPosition(CCPoint{ leftX - 16.f, center.y + 8.f });
-        m_mainLayer->addChild(m_userPromptLine1);
-
-        m_userPromptLine2 = CCLabelBMFont::create("Prompt: waiting for your message...", "chatFont.fnt");
-        m_userPromptLine2->setScale(0.42f);
-        m_userPromptLine2->setColor(ccColor3B{ 220, 225, 235 });
-        m_userPromptLine2->setPosition(CCPoint{ leftX, center.y - 8.f });
-        m_mainLayer->addChild(m_userPromptLine2);
-
-        auto addStepRow = [&](float yPos, const char* stepName, std::string const& rightVal) -> CCLabelBMFont* {
-            auto* dot = createSolidPanel(7.f, 7.f, ccColor3B{ 232, 65, 98 }, 255);
-            dot->setPosition(CCPoint{ leftX - 98.f, yPos });
-            m_mainLayer->addChild(dot);
-
-            auto* nameL = CCLabelBMFont::create(stepName, "chatFont.fnt");
-            nameL->setScale(0.41f);
-            nameL->setColor(ccColor3B{ 215, 220, 230 });
-            nameL->setPosition(CCPoint{ leftX - 68.f, yPos });
-            m_mainLayer->addChild(nameL);
-
-            auto* valL = CCLabelBMFont::create(rightVal.c_str(), "chatFont.fnt");
-            valL->setScale(0.41f);
-            valL->setColor(ccColor3B{ 145, 152, 168 });
-            valL->setPosition(CCPoint{ leftX + 26.f, yPos });
-            m_mainLayer->addChild(valL);
-            return valL;
-        };
-
-        m_stepPlanLabel    = addStepRow(center.y - 23.f, "Plan",    "ready");
-        m_stepDrawingLabel = addStepRow(center.y - 35.f, "Drawing", "waiting");
-        m_stepVectorLabel  = addStepRow(center.y - 47.f, "Vector",  "waiting");
-        m_stepPlaceLabel   = addStepRow(center.y - 59.f, "Place",   "waiting");
-
-        // Примеры (For example)
-        auto* exHeader = CCLabelBMFont::create("For example", "chatFont.fnt");
-        exHeader->setScale(0.40f);
-        exHeader->setColor(ccColor3B{ 135, 140, 155 });
-        exHeader->setPosition(CCPoint{ leftX - 88.f, center.y - 72.f });
-        m_mainLayer->addChild(exHeader);
-
+        // Быстрые прямоугольные кнопки-примеры (For example)
         auto addExampleChip = [&](const char* label, CCPoint pos, SEL_MenuHandler cb) {
             auto* btn = createSolidButton(
-                52.f, 15.f, ccColor3B{ 34, 36, 44 },
-                label, 0.34f, ccColor3B{ 220, 225, 235 },
+                52.f, 15.f, ccColor3B{ 36, 24, 30 },
+                label, 0.34f, ccColor3B{ 230, 225, 235 },
                 this, cb
             );
             btn->setPosition(pos);
             m_buttonMenu->addChild(btn);
         };
 
-        addExampleChip("Stone snow", CCPoint{ leftX - 83.f, center.y - 86.f }, menu_selector(AIDecorPopup::onPresetStoneSnow));
-        addExampleChip("Tree glow",  CCPoint{ leftX - 28.f, center.y - 86.f }, menu_selector(AIDecorPopup::onPresetTreeGlow));
-        addExampleChip("Crystal",    CCPoint{ leftX + 27.f, center.y - 86.f }, menu_selector(AIDecorPopup::onPresetCrystal));
-        addExampleChip("Only 3D",    CCPoint{ leftX + 82.f, center.y - 86.f }, menu_selector(AIDecorPopup::onPresetOnly3D));
+        addExampleChip("Stone snow", CCPoint{ leftX - 84.f, center.y - 88.f }, menu_selector(AIDecorPopup::onPresetStoneSnow));
+        addExampleChip("Tree glow",  CCPoint{ leftX - 28.f, center.y - 88.f }, menu_selector(AIDecorPopup::onPresetTreeGlow));
+        addExampleChip("Crystal",    CCPoint{ leftX + 28.f, center.y - 88.f }, menu_selector(AIDecorPopup::onPresetCrystal));
+        addExampleChip("Only 3D",    CCPoint{ leftX + 84.f, center.y - 88.f }, menu_selector(AIDecorPopup::onPresetOnly3D));
 
-        // Нижняя строка ввода чата
-        auto* glowStrip = createSolidPanel(165.f, 2.f, ccColor3B{ 110, 215, 255 }, 255);
-        glowStrip->setPosition(CCPoint{ leftX - 15.f, center.y - 101.f });
-        m_mainLayer->addChild(glowStrip);
+        // ОКРУГЛЕННАЯ строка ввода сообщения ИИ (по просьбе пользователя!)
+        auto* inputGlowOuter = createRoundedPanel(196.f, 30.f, 1.55f, ccColor3B{ 125, 205, 255 }, 165);
+        inputGlowOuter->setPosition(CCPoint{ leftX - 15.f, center.y - 116.f });
+        m_mainLayer->addChild(inputGlowOuter);
 
-        auto* inputBarBg = createSolidPanel(222.f, 28.f, ccColor3B{ 26, 28, 35 }, 255);
-        inputBarBg->setPosition(CCPoint{ leftX, center.y - 116.f });
-        m_mainLayer->addChild(inputBarBg);
+        auto* inputPillBg = createRoundedPanel(192.f, 26.f, 1.50f, ccColor3B{ 18, 15, 20 }, 255);
+        inputPillBg->setPosition(CCPoint{ leftX - 15.f, center.y - 116.f });
+        m_mainLayer->addChild(inputPillBg);
 
         m_inputDisplayLabel = CCLabelBMFont::create("", "chatFont.fnt");
-        m_inputDisplayLabel->setScale(0.45f);
-        m_inputDisplayLabel->setPosition(CCPoint{ leftX - 14.f, center.y - 116.f });
+        m_inputDisplayLabel->setScale(0.44f);
+        m_inputDisplayLabel->setPosition(CCPoint{ leftX - 15.f, center.y - 116.f });
         m_mainLayer->addChild(m_inputDisplayLabel);
         refreshInputLabel();
 
+        // Прямоугольная кнопка отправки [>]
         auto* sendBtn = createSolidButton(
-            26.f, 22.f, ccColor3B{ 215, 52, 85 },
+            26.f, 24.f, ccColor3B{ 215, 48, 80 },
             ">", 0.52f, ccColor3B{ 255, 255, 255 },
             this, menu_selector(AIDecorPopup::onSendToNeuralNet)
         );
-        sendBtn->setPosition(CCPoint{ leftX + 94.f, center.y - 116.f });
+        sendBtn->setPosition(CCPoint{ leftX + 98.f, center.y - 116.f });
         m_buttonMenu->addChild(sendBtn);
+
+        // Заполняем ленту чата историей сообщений
+        rebuildChatScrollFeed();
 
         // ====================================================================
         // ПРАВАЯ КОЛОНКА: Вкладки [Shape | Drawing | In GD] + Синее превью + Limit + Keep
         // ====================================================================
-        float rightX = center.x + 118.f;
+        float rightX = center.x + 120.f;
 
-        auto* tabBarBg = createSolidPanel(224.f, 22.f, ccColor3B{ 26, 28, 35 }, 255);
+        auto* tabBarBg = createSolidPanel(224.f, 22.f, ccColor3B{ 22, 16, 20 }, 240);
         tabBarBg->setPosition(CCPoint{ rightX, center.y + 92.f });
         m_mainLayer->addChild(tabBarBg);
 
         auto createTabButton = [&](const char* title, CCPoint pos, SEL_MenuHandler cb, CCLayerColor*& outBg) {
-            outBg = createSolidPanel(72.f, 18.f, ccColor3B{ 26, 28, 35 }, 255);
+            outBg = createSolidPanel(72.f, 18.f, ccColor3B{ 28, 20, 24 }, 255);
             auto* lbl = CCLabelBMFont::create(title, "chatFont.fnt");
             lbl->setScale(0.45f);
             lbl->setColor(ccColor3B{ 245, 248, 255 });
@@ -2611,7 +2595,6 @@ protected:
         createTabButton("Drawing", CCPoint{ rightX,        center.y + 92.f }, menu_selector(AIDecorPopup::onTabDrawing), m_tabDrawingBg);
         createTabButton("In GD",   CCPoint{ rightX + 73.f, center.y + 92.f }, menu_selector(AIDecorPopup::onTabInGD),    m_tabInGDBg);
 
-        // Сплошное синее превью-полотно в стиле редактора GD
         auto* canvasBg = createSolidPanel(224.f, 128.f, ccColor3B{ 18, 92, 212 }, 255);
         canvasBg->setPosition(CCPoint{ rightX, center.y + 10.f });
         m_mainLayer->addChild(canvasBg);
@@ -2634,12 +2617,11 @@ protected:
         );
         m_previewSubInfoLabel = CCLabelBMFont::create(dimText.c_str(), "chatFont.fnt");
         m_previewSubInfoLabel->setScale(0.44f);
-        m_previewSubInfoLabel->setColor(ccColor3B{ 175, 182, 195 });
+        m_previewSubInfoLabel->setColor(ccColor3B{ 195, 190, 200 });
         m_previewSubInfoLabel->setPosition(CCPoint{ rightX, center.y - 62.f });
         m_mainLayer->addChild(m_previewSubInfoLabel);
 
-        // Кнопки [< Limit 16000 >] и [Inside | Overhang]
-        auto* limitPill = createSolidPanel(108.f, 22.f, ccColor3B{ 26, 28, 35 }, 255);
+        auto* limitPill = createSolidPanel(108.f, 22.f, ccColor3B{ 24, 16, 20 }, 255);
         limitPill->setPosition(CCPoint{ rightX - 58.f, center.y - 84.f });
         m_mainLayer->addChild(limitPill);
 
@@ -2650,20 +2632,20 @@ protected:
         m_limitValueLabel->setPosition(CCPoint{ rightX - 58.f, center.y - 84.f });
         m_mainLayer->addChild(m_limitValueLabel);
 
-        auto* decBtn = createSolidButton(18.f, 18.f, ccColor3B{ 42, 46, 56 }, "<", 0.45f, ccColor3B{ 245, 248, 255 }, this, menu_selector(AIDecorPopup::onLimitDec));
+        auto* decBtn = createSolidButton(18.f, 18.f, ccColor3B{ 44, 28, 34 }, "<", 0.45f, ccColor3B{ 245, 248, 255 }, this, menu_selector(AIDecorPopup::onLimitDec));
         decBtn->setPosition(CCPoint{ rightX - 101.f, center.y - 84.f });
         m_buttonMenu->addChild(decBtn);
 
-        auto* incBtn = createSolidButton(18.f, 18.f, ccColor3B{ 42, 46, 56 }, ">", 0.45f, ccColor3B{ 245, 248, 255 }, this, menu_selector(AIDecorPopup::onLimitInc));
+        auto* incBtn = createSolidButton(18.f, 18.f, ccColor3B{ 44, 28, 34 }, ">", 0.45f, ccColor3B{ 245, 248, 255 }, this, menu_selector(AIDecorPopup::onLimitInc));
         incBtn->setPosition(CCPoint{ rightX - 15.f, center.y - 84.f });
         m_buttonMenu->addChild(incBtn);
 
-        auto* modePill = createSolidPanel(108.f, 22.f, ccColor3B{ 26, 28, 35 }, 255);
+        auto* modePill = createSolidPanel(108.f, 22.f, ccColor3B{ 24, 16, 20 }, 255);
         modePill->setPosition(CCPoint{ rightX + 58.f, center.y - 84.f });
         m_mainLayer->addChild(modePill);
 
         auto createModeHalf = [&](const char* txt, CCPoint pos, SEL_MenuHandler cb, CCLayerColor*& outBg) {
-            outBg = createSolidPanel(51.f, 18.f, ccColor3B{ 26, 28, 35 }, 255);
+            outBg = createSolidPanel(51.f, 18.f, ccColor3B{ 28, 20, 24 }, 255);
             auto* l = CCLabelBMFont::create(txt, "chatFont.fnt");
             l->setScale(0.40f);
             l->setColor(ccColor3B{ 245, 248, 255 });
@@ -2676,18 +2658,17 @@ protected:
         createModeHalf("Inside",   CCPoint{ rightX + 32.f, center.y - 84.f }, menu_selector(AIDecorPopup::onSelectInside),   m_insideTabBg);
         createModeHalf("Overhang", CCPoint{ rightX + 84.f, center.y - 84.f }, menu_selector(AIDecorPopup::onSelectOverhang), m_overhangTabBg);
 
-        // Нижние кнопки: [Another variant] и [Keep]
         std::string varStr = fmt::format("Another variant ({})", g_variantIndex);
         auto* varBtn = createSolidButton(
-            108.f, 28.f, ccColor3B{ 30, 32, 40 },
-            varStr.c_str(), 0.42f, ccColor3B{ 215, 220, 232 },
+            108.f, 28.f, ccColor3B{ 34, 22, 28 },
+            varStr.c_str(), 0.42f, ccColor3B{ 225, 220, 232 },
             this, menu_selector(AIDecorPopup::onAnotherVariantClicked)
         );
         varBtn->setPosition(CCPoint{ rightX - 58.f, center.y - 116.f });
         m_buttonMenu->addChild(varBtn);
 
         auto* keepBtn = createSolidButton(
-            108.f, 28.f, ccColor3B{ 158, 38, 68 },
+            108.f, 28.f, ccColor3B{ 178, 38, 68 },
             "Keep", 0.50f, ccColor3B{ 255, 245, 248 },
             this, menu_selector(AIDecorPopup::onKeepClicked)
         );
@@ -2697,13 +2678,109 @@ protected:
         refreshRightPanelTabsAndCanvas();
     }
 
-    void refreshRightPanelTabsAndCanvas() {
-        if (m_tabShapeBg)   m_tabShapeBg->setColor((m_previewTab == 0) ? ccColor3B{ 232, 65, 98 } : ccColor3B{ 26, 28, 35 });
-        if (m_tabDrawingBg) m_tabDrawingBg->setColor((m_previewTab == 1) ? ccColor3B{ 232, 65, 98 } : ccColor3B{ 26, 28, 35 });
-        if (m_tabInGDBg)    m_tabInGDBg->setColor((m_previewTab == 2) ? ccColor3B{ 232, 65, 98 } : ccColor3B{ 26, 28, 35 });
+    // ========================================================================
+    // Перестроение прокручиваемой ленты ИИ-чата со всеми старыми сообщениями
+    // ========================================================================
+    void rebuildChatScrollFeed() {
+        if (!m_chatScrollLayer || !m_chatScrollLayer->m_contentLayer) return;
 
-        if (m_insideTabBg)   m_insideTabBg->setColor(!g_overhangAllowed ? ccColor3B{ 232, 65, 98 } : ccColor3B{ 26, 28, 35 });
-        if (m_overhangTabBg) m_overhangTabBg->setColor(g_overhangAllowed  ? ccColor3B{ 232, 65, 98 } : ccColor3B{ 26, 28, 35 });
+        auto* content = m_chatScrollLayer->m_contentLayer;
+        content->removeAllChildrenWithCleanup(true);
+
+        struct ChatBubbleBlock {
+            bool isUser = false;
+            std::vector<std::string> lines;
+        };
+        std::vector<ChatBubbleBlock> blocks;
+
+        // Приветственное сообщение в самом начале истории
+        {
+            ChatBubbleBlock intro;
+            intro.isUser = false;
+            intro.lines = wrapTextLines(
+                fmt::format(
+                    "Agent: Tell me what to draw on the {} selected blocks ({}x{}). You can scroll up anytime!",
+                    m_contour.cellCount(), m_contour.widthUnits(), m_contour.heightUnits()
+                ),
+                36, 4
+            );
+            blocks.push_back(std::move(intro));
+        }
+
+        // Все старые и новые сообщения из истории диалога g_chatHistory
+        for (auto const& msg : g_chatHistory) {
+            ChatBubbleBlock b;
+            b.isUser = (msg.role == "user");
+            std::string prefix = b.isUser ? "You: " : "Agent: ";
+            b.lines = wrapTextLines(prefix + msg.content, 36, 6);
+            blocks.push_back(std::move(b));
+        }
+
+        // Считаем суммарную высоту всех пузырей сообщений
+        float totalH = 8.f;
+        std::vector<float> blockHeights;
+        for (auto const& b : blocks) {
+            int nonEmpty = 0;
+            for (auto const& ln : b.lines) {
+                if (!ln.empty()) nonEmpty++;
+            }
+            nonEmpty = (std::max)(1, nonEmpty);
+            float h = 10.f + nonEmpty * 12.f;
+            blockHeights.push_back(h);
+            totalH += h + 6.f;
+        }
+
+        float viewH = m_chatScrollLayer->getContentSize().height;
+        float finalContentH = (std::max)(viewH, totalH);
+        content->setContentSize(CCSize{ 196.f, finalContentH });
+
+        float curY = finalContentH - 6.f;
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            auto const& b = blocks[i];
+            float h = blockHeights[i];
+            float centerY = curY - h * 0.5f;
+
+            ccColor3B cardCol = b.isUser ? ccColor3B{ 54, 24, 34 } : ccColor3B{ 26, 22, 28 };
+            auto* bubble = createRoundedPanel(188.f, h, 1.25f, cardCol, 240);
+            bubble->setPosition(CCPoint{ 98.f, centerY });
+            content->addChild(bubble);
+
+            int drawnLines = 0;
+            float topTextY = curY - 10.f;
+            for (auto const& ln : b.lines) {
+                if (ln.empty()) continue;
+                auto* lbl = CCLabelBMFont::create(ln.c_str(), "chatFont.fnt");
+                lbl->setScale(0.39f);
+                lbl->setColor(b.isUser ? ccColor3B{ 255, 225, 232 } : ccColor3B{ 230, 235, 245 });
+                lbl->setPosition(CCPoint{ 98.f, topTextY - drawnLines * 12.f });
+                content->addChild(lbl);
+                drawnLines++;
+            }
+
+            curY -= (h + 6.f);
+        }
+
+        // Прокручиваем ленту к самому новому сообщению внизу
+        content->setPosition(CCPoint{ 0.f, 0.f });
+    }
+
+    void onScrollChatUp(CCObject*) {
+        if (!m_chatScrollLayer) return;
+        m_chatScrollLayer->scrollWheel(-42.f, 0.f);
+    }
+
+    void onScrollChatDown(CCObject*) {
+        if (!m_chatScrollLayer) return;
+        m_chatScrollLayer->scrollWheel(42.f, 0.f);
+    }
+
+    void refreshRightPanelTabsAndCanvas() {
+        if (m_tabShapeBg)   m_tabShapeBg->setColor((m_previewTab == 0) ? ccColor3B{ 225, 52, 86 } : ccColor3B{ 28, 20, 24 });
+        if (m_tabDrawingBg) m_tabDrawingBg->setColor((m_previewTab == 1) ? ccColor3B{ 225, 52, 86 } : ccColor3B{ 28, 20, 24 });
+        if (m_tabInGDBg)    m_tabInGDBg->setColor((m_previewTab == 2) ? ccColor3B{ 225, 52, 86 } : ccColor3B{ 28, 20, 24 });
+
+        if (m_insideTabBg)   m_insideTabBg->setColor(!g_overhangAllowed ? ccColor3B{ 225, 52, 86 } : ccColor3B{ 28, 20, 24 });
+        if (m_overhangTabBg) m_overhangTabBg->setColor(g_overhangAllowed  ? ccColor3B{ 225, 52, 86 } : ccColor3B{ 28, 20, 24 });
 
         if (!m_previewCanvasContent) return;
 
@@ -2787,10 +2864,10 @@ protected:
             } else {
                 m_inputDisplayLabel->setString("Describe the art or ask AI...");
             }
-            m_inputDisplayLabel->setColor(ccColor3B{ 140, 146, 162 });
+            m_inputDisplayLabel->setColor(ccColor3B{ 150, 145, 160 });
         } else {
             std::string shown = m_inputBuffer;
-            size_t maxLen = (m_stage == PopupStage::ApiGate) ? 48 : 30;
+            size_t maxLen = (m_stage == PopupStage::ApiGate) ? 48 : 28;
             if (shown.size() > maxLen) {
                 shown = "..." + shown.substr(shown.size() - (maxLen - 3));
             }
@@ -2811,7 +2888,6 @@ protected:
         }
     }
 
-    // Обработчики переключения провайдера и окна выбора модели
     void onCycleApiProvider(CCObject*) {
         g_apiProviderIndex = (g_apiProviderIndex + 1) % 5;
         reopenWithStage(PopupStage::ApiGate);
@@ -2955,12 +3031,6 @@ protected:
         m_inputBuffer.clear();
         refreshInputLabel();
 
-        if (m_userPromptLine2) {
-            std::string shortP = utf8ToGDReadable(promptText);
-            if (shortP.size() > 42) shortP = shortP.substr(0, 39) + "...";
-            m_userPromptLine2->setString(shortP.c_str());
-        }
-
         AIDecisionResult ai = queryRealNeuralNetwork(
             promptText,
             m_contour,
@@ -2969,21 +3039,20 @@ protected:
             g_variantIndex
         );
 
-        auto replyLines = wrapTextLines(ai.replyText, 44, 3);
-        if (m_agentReplyLine1) m_agentReplyLine1->setString(replyLines[0].c_str());
-        if (m_agentReplyLine2) m_agentReplyLine2->setString(replyLines[1].c_str());
-        if (m_agentReplyLine3) m_agentReplyLine3->setString(replyLines[2].c_str());
-
         if (!ai.httpSuccess) {
-            if (m_stepPlanLabel) m_stepPlanLabel->setString("API request error");
+            g_chatHistory.push_back({ "user", promptText });
+            g_chatHistory.push_back({ "assistant", ai.replyText });
+            rebuildChatScrollFeed();
+            if (m_stepPlanLabel) m_stepPlanLabel->setString("Plan: error");
             return;
         }
 
+        rebuildChatScrollFeed();
+
         if (ai.taskMode == AITaskMode::ChatOnly) {
-            if (m_stepPlanLabel)    m_stepPlanLabel->setString("chat response");
-            if (m_stepDrawingLabel) m_stepDrawingLabel->setString("idle");
-            if (m_stepVectorLabel)  m_stepVectorLabel->setString("idle");
-            if (m_stepPlaceLabel)   m_stepPlaceLabel->setString("no blocks placed");
+            if (m_stepPlanLabel)    m_stepPlanLabel->setString("Plan: chat");
+            if (m_stepDrawingLabel) m_stepDrawingLabel->setString("Draw: idle");
+            if (m_stepPlaceLabel)   m_stepPlaceLabel->setString("Place: 0 obj");
             return;
         }
 
@@ -2993,7 +3062,7 @@ protected:
             m_previewTab = 0;
             refreshRightPanelTabsAndCanvas();
             if (m_stepPlaceLabel) {
-                std::string uStr = fmt::format("removed {} objects", rem);
+                std::string uStr = fmt::format("Undo: -{}", rem);
                 m_stepPlaceLabel->setString(uStr.c_str());
             }
             return;
@@ -3021,15 +3090,10 @@ protected:
         m_previewTab = 1;
         refreshRightPanelTabsAndCanvas();
 
-        if (m_stepPlanLabel) {
-            std::string pStr = utf8ToGDReadable(ai.planText);
-            if (pStr.size() > 26) pStr = pStr.substr(0, 23) + "...";
-            m_stepPlanLabel->setString(pStr.c_str());
-        }
-        if (m_stepDrawingLabel) m_stepDrawingLabel->setString("done");
-        if (m_stepVectorLabel)  m_stepVectorLabel->setString("done");
+        if (m_stepPlanLabel)    m_stepPlanLabel->setString("Plan: done");
+        if (m_stepDrawingLabel) m_stepDrawingLabel->setString("Draw: done");
         if (m_stepPlaceLabel) {
-            std::string plStr = fmt::format("{} objects (L{}-L{})", summary.createdCount, summary.firstLayer, summary.firstLayer + 3);
+            std::string plStr = fmt::format("Place: {} (L{})", summary.createdCount, summary.firstLayer);
             m_stepPlaceLabel->setString(plStr.c_str());
         }
         if (m_previewSubInfoLabel) {
