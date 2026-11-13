@@ -2039,13 +2039,43 @@ static CCLayerColor* createSolidPanel(float width, float height, ccColor3B color
     return panel;
 }
 
-static CCScale9Sprite* createRoundedPanel(float width, float height, float cornerScale, ccColor3B color, GLubyte alpha = 255) {
-    auto* spr = CCScale9Sprite::create("square02b_001.png");
-    spr->setContentSize(CCSize{ width / cornerScale, height / cornerScale });
-    spr->setScale(cornerScale);
-    spr->setColor(color);
-    spr->setOpacity(alpha);
-    return spr;
+static CCDrawNode* createSmoothRoundedRect(float width, float height, float radius, ccColor4F color) {
+    auto* dn = CCDrawNode::create();
+    float hw = width * 0.5f;
+    float hh = height * 0.5f;
+    float r = std::clamp(radius, 1.f, (std::min)(hw, hh));
+
+    // Для пилюли (строка ввода) достаточно одного drawSegment — без наложений при любой прозрачности
+    if (r >= hh - 0.5f) {
+        float x0 = -hw + r;
+        float x1 =  hw - r;
+        if (x1 < x0) {
+            x0 = 0.f;
+            x1 = 0.f;
+        }
+        dn->drawSegment(CCPoint{ x0, 0.f }, CCPoint{ x1, 0.f }, r, color);
+        return dn;
+    }
+
+    float x0 = -hw + r;
+    float x1 =  hw - r;
+    float y0 = -hh + r;
+    float y1 =  hh - r;
+
+    dn->drawSegment(CCPoint{ x0, y1 }, CCPoint{ x1, y1 }, r, color);
+    dn->drawSegment(CCPoint{ x0, y0 }, CCPoint{ x1, y0 }, r, color);
+    dn->drawSegment(CCPoint{ x0, y0 }, CCPoint{ x0, y1 }, r, color);
+    dn->drawSegment(CCPoint{ x1, y0 }, CCPoint{ x1, y1 }, r, color);
+
+    float step = (std::max)(2.f, r * 0.9f);
+    for (float y = y0 + step; y < y1; y += step) {
+        dn->drawSegment(CCPoint{ x0, y }, CCPoint{ x1, y }, r, color);
+    }
+    return dn;
+}
+
+static ccColor4F toColor4F(ccColor3B c, GLubyte alpha = 255) {
+    return ccColor4F{ c.r / 255.f, c.g / 255.f, c.b / 255.f, alpha / 255.f };
 }
 
 static CCMenuItemSpriteExtra* createSolidButton(
@@ -2147,30 +2177,37 @@ protected:
         auto size = m_mainLayer->getContentSize();
         auto center = CCPoint{ size.width / 2.f, size.height / 2.f };
 
-        // 1. Более ОКРУГЛЕННЫЙ внешний каркас меню (с увеличенным радиусом скругления)
-        auto* outerRoundedFrame = createRoundedPanel(size.width, size.height, 1.85f, ccColor3B{ 72, 22, 28 }, 255);
+        // 1. По-настоящему сглаженный внешний каркас меню (векторные дуги CCDrawNode)
+        auto* outerRoundedFrame = createSmoothRoundedRect(size.width, size.height, 20.f, toColor4F(ccColor3B{ 72, 22, 28 }, 255));
         outerRoundedFrame->setPosition(center);
         outerRoundedFrame->setZOrder(-4);
         m_mainLayer->addChild(outerRoundedFrame);
 
-        auto* innerRoundedShell = createRoundedPanel(size.width - 6.f, size.height - 6.f, 1.80f, ccColor3B{ 12, 8, 10 }, 255);
+        auto* innerRoundedShell = createSmoothRoundedRect(size.width - 6.f, size.height - 6.f, 18.f, toColor4F(ccColor3B{ 12, 8, 10 }, 255));
         innerRoundedShell->setPosition(center);
         innerRoundedShell->setZOrder(-3);
         m_mainLayer->addChild(innerRoundedShell);
 
-        // 2. Градиентная красно-черная подложка (как на фото image_b5b63a.png),
-        //    лежащая ровно на каркасе меню ПОД всеми кнопками и панелями!
+        // 2. Градиентная красно-черная подложка (image_b5b63a.png), обрезанная по сглаженному
+        //    скругленному контуру через CCClippingNode, строго под всеми кнопками и панелями
+        auto* gradStencil = createSmoothRoundedRect(size.width - 10.f, size.height - 10.f, 16.f, ccColor4F{ 1.f, 1.f, 1.f, 1.f });
+        gradStencil->setPosition(center);
+
+        auto* gradClip = CCClippingNode::create(gradStencil);
+        gradClip->setAlphaThreshold(0.05f);
+        gradClip->setZOrder(-2);
+
         auto* frameGradient = CCLayerGradient::create(
             ccColor4B{ 68, 7, 10, 235 },
             ccColor4B{ 4, 2, 3, 245 },
             CCPoint{ 0.f, -1.f }
         );
-        frameGradient->setContentSize(CCSize{ size.width - 18.f, size.height - 18.f });
+        frameGradient->setContentSize(CCSize{ size.width - 10.f, size.height - 10.f });
         frameGradient->ignoreAnchorPointForPosition(false);
         frameGradient->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
         frameGradient->setPosition(center);
-        frameGradient->setZOrder(-2);
-        m_mainLayer->addChild(frameGradient);
+        gradClip->addChild(frameGradient);
+        m_mainLayer->addChild(gradClip);
 
         if (m_stage == PopupStage::ApiGate) {
             setupStrictApiGateUI(center);
@@ -2248,7 +2285,7 @@ protected:
             m_buttonMenu->addChild(backBtn);
         }
 
-        auto* cardBg = createRoundedPanel(444.f, 122.f, 1.35f, ccColor3B{ 22, 16, 20 }, 225);
+        auto* cardBg = createSmoothRoundedRect(444.f, 122.f, 14.f, toColor4F(ccColor3B{ 22, 16, 20 }, 240));
         cardBg->setPosition(CCPoint{ center.x, center.y + 28.f });
         m_mainLayer->addChild(cardBg);
 
@@ -2291,8 +2328,12 @@ protected:
         hintLbl->setPosition(CCPoint{ center.x, center.y - 8.f });
         m_mainLayer->addChild(hintLbl);
 
-        // Округленная строка ввода API-ключа
-        auto* inputBg = createRoundedPanel(444.f, 34.f, 1.40f, ccColor3B{ 14, 12, 16 }, 255);
+        // Сглаженная округленная строка ввода API-ключа (pill)
+        auto* inputGlow = createSmoothRoundedRect(448.f, 38.f, 19.f, toColor4F(ccColor3B{ 95, 165, 225 }, 140));
+        inputGlow->setPosition(CCPoint{ center.x, center.y - 54.f });
+        m_mainLayer->addChild(inputGlow);
+
+        auto* inputBg = createSmoothRoundedRect(444.f, 34.f, 17.f, toColor4F(ccColor3B{ 14, 12, 16 }, 255));
         inputBg->setPosition(CCPoint{ center.x, center.y - 54.f });
         m_mainLayer->addChild(inputBg);
 
@@ -2475,8 +2516,12 @@ protected:
         // ====================================================================
         float leftX = center.x - 125.f;
 
-        // Округленная подложка ленты прокручиваемого чата
-        auto* chatBoxBg = createRoundedPanel(204.f, 158.f, 1.30f, ccColor3B{ 18, 12, 16 }, 215);
+        // Сглаженная округленная подложка ленты прокручиваемого чата
+        auto* chatBoxBorder = createSmoothRoundedRect(206.f, 160.f, 13.f, toColor4F(ccColor3B{ 68, 26, 34 }, 255));
+        chatBoxBorder->setPosition(CCPoint{ leftX - 10.f, center.y + 24.f });
+        m_mainLayer->addChild(chatBoxBorder);
+
+        auto* chatBoxBg = createSmoothRoundedRect(204.f, 158.f, 12.f, toColor4F(ccColor3B{ 16, 11, 15 }, 255));
         chatBoxBg->setPosition(CCPoint{ leftX - 10.f, center.y + 24.f });
         m_mainLayer->addChild(chatBoxBg);
 
@@ -2543,12 +2588,12 @@ protected:
         addExampleChip("Crystal",    CCPoint{ leftX + 28.f, center.y - 88.f }, menu_selector(AIDecorPopup::onPresetCrystal));
         addExampleChip("Only 3D",    CCPoint{ leftX + 84.f, center.y - 88.f }, menu_selector(AIDecorPopup::onPresetOnly3D));
 
-        // ОКРУГЛЕННАЯ строка ввода сообщения ИИ (по просьбе пользователя!)
-        auto* inputGlowOuter = createRoundedPanel(196.f, 30.f, 1.55f, ccColor3B{ 125, 205, 255 }, 165);
+        // По-настоящему сглаженная округленная строка ввода сообщения ИИ (pill)
+        auto* inputGlowOuter = createSmoothRoundedRect(196.f, 30.f, 15.f, toColor4F(ccColor3B{ 125, 205, 255 }, 180));
         inputGlowOuter->setPosition(CCPoint{ leftX - 15.f, center.y - 116.f });
         m_mainLayer->addChild(inputGlowOuter);
 
-        auto* inputPillBg = createRoundedPanel(192.f, 26.f, 1.50f, ccColor3B{ 18, 15, 20 }, 255);
+        auto* inputPillBg = createSmoothRoundedRect(192.f, 26.f, 13.f, toColor4F(ccColor3B{ 18, 15, 20 }, 255));
         inputPillBg->setPosition(CCPoint{ leftX - 15.f, center.y - 116.f });
         m_mainLayer->addChild(inputPillBg);
 
@@ -2741,7 +2786,7 @@ protected:
             float centerY = curY - h * 0.5f;
 
             ccColor3B cardCol = b.isUser ? ccColor3B{ 54, 24, 34 } : ccColor3B{ 26, 22, 28 };
-            auto* bubble = createRoundedPanel(188.f, h, 1.25f, cardCol, 240);
+            auto* bubble = createSmoothRoundedRect(188.f, h, 8.f, toColor4F(cardCol, 255));
             bubble->setPosition(CCPoint{ 98.f, centerY });
             content->addChild(bubble);
 
