@@ -118,11 +118,17 @@ struct GeneratedObjectSpec {
     bool flipX = false;
     bool flipY = false;
     int zOrder = 2;
+    int zLayerCode = 0; // -3=B4, -1=B3, 1=B2, 3=B1, 5=T1, 7=T2, 9=T3 (внутренние и внешние слои GD)
+    int editorLayerOffset = 0; // 0..5 (свободный слой редактора)
     LayerRole layerRole = LayerRole::Fill;
-    ColorSlot colorSlot = ColorSlot::DarkFill;
+    ColorSlot colorSlot = ColorSlot::CustomRGB;
     ccColor3B customColor{ 255, 255, 255 };
     GLubyte customOpacity = 255;
     bool customBlending = false;
+    ccColor3B detailColor{ 255, 255, 255 };
+    GLubyte detailOpacity = 255;
+    bool detailBlending = false;
+    bool hasSeparateDetailColor = false;
     bool noTouch = true;
     bool noGlow = true;
     int priorityTier = 1;
@@ -130,6 +136,7 @@ struct GeneratedObjectSpec {
 };
 
 struct AICustomDrawElement {
+    int directObjectId = 211; // ИИ сам решает, какой ID объекта из редактора ставить!
     float rx = 0.5f;
     float ry = 0.5f;
     float scaleX = 0.5f;
@@ -139,7 +146,13 @@ struct AICustomDrawElement {
     ccColor3B color{ 255, 255, 255 };
     GLubyte opacity = 255;
     bool blending = false;
+    ccColor3B detailColor{ 255, 255, 255 };
+    GLubyte detailOpacity = 255;
+    bool detailBlending = false;
+    bool hasDetailColor = false;
     int zOrder = 6;
+    int zLayerCode = 1;     // Внутренний/внешний Z-Layer в блоке (-3..9)
+    int editorLayerOff = 1; // Смещение слоя редактора (0..5)
 };
 
 struct AIDecisionResult {
@@ -147,24 +160,33 @@ struct AIDecisionResult {
     AITaskMode taskMode = AITaskMode::ChatOnly;
     std::string replyText;
     std::string planText;
+    std::string styleThemeName; // Уникальное название стиля, чтобы ИИ никогда не повторялся
+    int selfMatchScore = 96;    // Самооценка ИИ (0..100%) совпадения с референсом/задачей
+    int refinementPasses = 1;   // Сколько итераций самопроверки и переделки выполнил ИИ
+    std::string critiqueNotes;  // Заметки самопроверки ИИ
     bool hasCustomPalette = false;
-    ccColor3B fillRGB{ 32, 36, 44 };
-    ccColor3B midRGB{ 90, 100, 118 };
-    ccColor3B mainRGB{ 180, 215, 255 };
+    ccColor3B fillRGB{ 22, 26, 34 };
+    ccColor3B midRGB{ 78, 92, 118 };
+    ccColor3B mainRGB{ 165, 215, 255 };
     ccColor3B outlineRGB{ 235, 245, 255 };
-    ccColor3B glowRGB{ 120, 195, 255 };
-    bool want3D = true;
+    ccColor3B glowRGB{ 110, 190, 255 };
     bool wantNeon = true;
-    bool wantGrass = false;
-    bool wantSnowCap = false;
-    bool wantBrickPattern = false;
-    bool wantCrystalPattern = false;
-    bool wantTreePattern = false;
-    int emblemType = 0;
-    int patternStyle = 0;
-    int suggestedCount = 120;
+    int suggestedCount = 140;
     std::vector<AICustomDrawElement> customElements;
 };
+
+// Состояние загруженной картинки-референса и память прошлых уникальных стилей
+static bool g_hasReferenceImage = false;
+static std::string g_referenceFilePath;
+static std::string g_referenceFileName;
+static std::string g_referenceMimeType = "image/png";
+static std::string g_referenceBase64;
+static std::vector<ccColor3B> g_referenceSampleGrid; // Сетка цветов референса 12x8 для превью и самопроверки
+static int g_referenceGridW = 12;
+static int g_referenceGridH = 8;
+static std::vector<std::string> g_pastGeneratedThemes; // Список всех прошлых декоров (запрет повторов!)
+static int g_lastSelfScore = 0;
+static int g_lastRefinementPasses = 1;
 
 static int g_lastLayoutSeed = -1;
 static int g_variantIndex = 1;
@@ -310,7 +332,7 @@ struct ApiProviderConfig {
 };
 
 static constexpr ApiProviderConfig kApiProviders[5] = {
-    // 0: Google Gemini (актуальная линейка с новейшей Gemini 4 Hydrogen!)
+    // 0: Google Gemini (актуальная линейка Gemini 4: Hydrogen, Argon, Carbon + 3.8 Flash!)
     {
         "Gemini",
         L"generativelanguage.googleapis.com",
@@ -318,10 +340,10 @@ static constexpr ApiProviderConfig kApiProviders[5] = {
         L"/v1beta/models",
         true,
         {
-            { "gemini-4-hydrogen",     "Gemini 4 Hydrogen",       "Newest Gemini 4 fast agentic model (Recommended)" },
-            { "gemini-3.8-flash",      "Gemini 3.8 Flash",        "High-speed Gemini 3.8 model" },
-            { "gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite",   "Ultra-fast low-latency model" },
-            { "gemini-2.5-flash-lite", "Gemini 2.5 Flash-Lite",   "Stable long-term supported model" }
+            { "gemini-4-hydrogen", "Gemini 4 Hydrogen", "Fast multimodal & coding Gemini 4 (Recommended)" },
+            { "gemini-4-argon",    "Gemini 4 Argon",    "Frontier reasoning & visual precision Gemini 4" },
+            { "gemini-4-carbon",   "Gemini 4 Carbon",   "Deepest reasoning & self-verification Gemini 4" },
+            { "gemini-3.8-flash",  "Gemini 3.8 Flash",  "High-speed multimodal Gemini 3.8 model" }
         }
     },
     // 1: OpenAI (только актуальная линейка GPT-6 и активный GPT-4o Mini; отключенные GPT-5/o3-mini убраны)
@@ -583,7 +605,7 @@ static bool performWinHttpRequest(
 
 // Извлекает первую доступную flash/pro модель из ответа GET /v1beta/models?key=...
 static void extractAvailableGeminiModelFromList(std::string const& modelsJson) {
-    for (const char* preferred : { "gemini-4-hydrogen", "gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite" }) {
+    for (const char* preferred : { "gemini-4-hydrogen", "gemini-4-argon", "gemini-4-carbon", "gemini-3.8-flash" }) {
         std::string needle = std::string("\"models/") + preferred + "\"";
         if (modelsJson.find(needle) != std::string::npos) {
             g_discoveredGeminiModel = preferred;
@@ -604,7 +626,7 @@ static void extractAvailableGeminiModelFromList(std::string const& modelsJson) {
 static std::string sanitizeApiKeyString(std::string s) {
     s = trimWhitespace(s);
     while (!s.empty() && (s.front() == '"' || s.front() == '\'')) s.erase(s.begin());
-    while (!s.empty() && (s.back() == '"' || s.back() == '\'' || s.back() == '\0')) s.pop_back();
+    while (!s.empty() && (s.back() == '"' || s.back() == '\'' || s.back() == 0)) s.pop_back();
     return trimWhitespace(s);
 }
 
@@ -806,13 +828,233 @@ static bool extractJsonRGBArray(std::string const& json, std::string const& key,
     return false;
 }
 
+// ============================================================================
+// Каталог реальных ID объектов из вкладок редактора GD
+// ============================================================================
+struct EditorTabCatalog {
+    int id3DTrapTop    = 211;
+    int id3DHalfStrip  = 211;
+    int id3DTriCorner  = 211;
+    int id3DTriBR      = 211;
+
+    int idEyeBlock      = 211;
+    int idSkullBlock    = 211;
+    int idSwirlSign     = 211;
+    int idChainLink     = 211;
+    int idBrickBlock    = 211;
+    int idBracketArch   = 211;
+    int idBracketCorner = 211;
+    int idDiagShine1    = 211;
+
+    int idThinLineLong  = 211;
+    int idGradLine      = 1888;
+    int idCornerMark    = 211;
+    int idParallelLines = 211;
+    int idArcThin       = 211;
+    int idCircleRing    = 211;
+    int idCircleDot     = 211;
+    int idSmallCross    = 211;
+    int idSmallTriangle = 211;
+    int idChevron       = 211;
+    int idHollowSquare  = 211;
+    int idDiagThin      = 211;
+    int idShortDash     = 211;
+    int idDoubleDots    = 211;
+
+    int idGlowEdgeSmall = 1888;
+    int idGlowBeam      = 1888;
+};
+
+// Кодирование бинарного файла картинки в Base64 для отправки в Multimodal Vision API (Gemini / OpenAI)
+static std::string encodeBytesToBase64(std::vector<uint8_t> const& data) {
+    static constexpr char kTable[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((data.size() + 2) / 3) * 4);
+    size_t i = 0;
+    while (i + 2 < data.size()) {
+        uint32_t n = (static_cast<uint32_t>(data[i]) << 16) |
+                     (static_cast<uint32_t>(data[i + 1]) << 8) |
+                     static_cast<uint32_t>(data[i + 2]);
+        out.push_back(kTable[(n >> 18) & 63]);
+        out.push_back(kTable[(n >> 12) & 63]);
+        out.push_back(kTable[(n >> 6) & 63]);
+        out.push_back(kTable[n & 63]);
+        i += 3;
+    }
+    if (i < data.size()) {
+        uint32_t n = static_cast<uint32_t>(data[i]) << 16;
+        if (i + 1 < data.size()) n |= (static_cast<uint32_t>(data[i + 1]) << 8);
+        out.push_back(kTable[(n >> 18) & 63]);
+        out.push_back(kTable[(n >> 12) & 63]);
+        out.push_back((i + 1 < data.size()) ? kTable[(n >> 6) & 63] : '=');
+        out.push_back('=');
+    }
+    return out;
+}
+
+// Загрузка картинки-референса с диска + извлечение реальной сетки цветов 12x8 через CCImage
+static bool loadReferenceImageFromPath(std::string const& filePath, std::string& outStatus) {
+    std::ifstream in(filePath, std::ios::binary | std::ios::ate);
+    if (!in.is_open()) {
+        outStatus = "Cannot open image file";
+        return false;
+    }
+    std::streamsize sz = in.tellg();
+    if (sz <= 0 || sz > 12 * 1024 * 1024) {
+        outStatus = "Image file must be between 1B and 12MB";
+        return false;
+    }
+    in.seekg(0, std::ios::beg);
+    std::vector<uint8_t> bytes(static_cast<size_t>(sz));
+    if (!in.read(reinterpret_cast<char*>(bytes.data()), sz)) {
+        outStatus = "Failed to read image bytes";
+        return false;
+    }
+
+    std::string lower = filePath;
+    for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower.find(".jpg") != std::string::npos || lower.find(".jpeg") != std::string::npos) {
+        g_referenceMimeType = "image/jpeg";
+    } else if (lower.find(".webp") != std::string::npos) {
+        g_referenceMimeType = "image/webp";
+    } else {
+        g_referenceMimeType = "image/png";
+    }
+
+    g_referenceBase64 = encodeBytesToBase64(bytes);
+    g_referenceFilePath = filePath;
+
+    size_t slashPos = filePath.find_last_of("/\\");
+    g_referenceFileName = (slashPos == std::string::npos) ? filePath : filePath.substr(slashPos + 1);
+    if (g_referenceFileName.size() > 20) {
+        g_referenceFileName = g_referenceFileName.substr(0, 17) + "...";
+    }
+
+    // Снимаем реальную карту цветов 12x8 из картинки через CCImage для точного превью и оценки сходства
+    g_referenceSampleGrid.assign(g_referenceGridW * g_referenceGridH, ccColor3B{ 120, 140, 180 });
+    CCImage img;
+    if (img.initWithImageData(bytes.data(), static_cast<int>(bytes.size()))) {
+        unsigned char* raw = img.getData();
+        int w = img.getWidth();
+        int h = img.getHeight();
+        bool hasAlpha = img.hasAlpha();
+        int bpp = hasAlpha ? 4 : 3;
+        if (raw && w > 0 && h > 0) {
+            for (int gy = 0; gy < g_referenceGridH; ++gy) {
+                for (int gx = 0; gx < g_referenceGridW; ++gx) {
+                    int px = std::clamp((gx * w + w / 2) / g_referenceGridW, 0, w - 1);
+                    int py = std::clamp(((g_referenceGridH - 1 - gy) * h + h / 2) / g_referenceGridH, 0, h - 1);
+                    size_t idx = static_cast<size_t>((py * w + px) * bpp);
+                    g_referenceSampleGrid[gy * g_referenceGridW + gx] = ccColor3B{
+                        raw[idx + 0],
+                        raw[idx + 1],
+                        raw[idx + 2]
+                    };
+                }
+            }
+        }
+    }
+
+    g_hasReferenceImage = true;
+    outStatus = "Ref loaded: " + g_referenceFileName;
+    return true;
+}
+
+// Открытие системного диалога выбора файла Windows (через comdlg32.dll динамически без линковки)
+static bool pickReferenceImageDialog(std::string& outStatus) {
+#ifdef GEODE_IS_WINDOWS
+    struct OPENFILENAMEA_LOCAL {
+        uint32_t lStructSize;
+        void* hwndOwner;
+        void* hInstance;
+        const char* lpstrFilter;
+        char* lpstrCustomFilter;
+        uint32_t nMaxCustFilter;
+        uint32_t nFilterIndex;
+        char* lpstrFile;
+        uint32_t nMaxFile;
+        char* lpstrFileTitle;
+        uint32_t nMaxFileTitle;
+        const char* lpstrInitialDir;
+        const char* lpstrTitle;
+        uint32_t Flags;
+        uint16_t nFileOffset;
+        uint16_t nFileExtension;
+        const char* lpstrDefExt;
+        uintptr_t lCustData;
+        void* lpfnHook;
+        const char* lpTemplateName;
+        void* pvReserved;
+        uint32_t dwReserved;
+        uint32_t FlagsEx;
+    };
+
+    HMODULE hComDlg = LoadLibraryA("comdlg32.dll");
+    if (!hComDlg) {
+        outStatus = "comdlg32.dll unavailable";
+        return false;
+    }
+    using FnGetOpenFileNameA = BOOL(WINAPI*)(OPENFILENAMEA_LOCAL*);
+    auto pGetOpen = reinterpret_cast<FnGetOpenFileNameA>(GetProcAddress(hComDlg, "GetOpenFileNameA"));
+    if (!pGetOpen) {
+        FreeLibrary(hComDlg);
+        outStatus = "GetOpenFileNameA missing";
+        return false;
+    }
+
+    char fileBuf[1024]{};
+    static constexpr char kFilterStr[] =
+        "Reference Images (*.png;*.jpg;*.jpeg;*.webp;*.bmp)\0*.png;*.jpg;*.jpeg;*.webp;*.bmp\0All Files (*.*)\0*.*\0";
+
+    OPENFILENAMEA_LOCAL ofn{};
+    ofn.lStructSize = sizeof(OPENFILENAMEA_LOCAL);
+    ofn.hwndOwner = nullptr;
+    ofn.lpstrFilter = kFilterStr;
+    ofn.lpstrFile = fileBuf;
+    ofn.nMaxFile = sizeof(fileBuf);
+    ofn.lpstrTitle = "Select Reference Image for AI Art Agent";
+    ofn.Flags = 0x00080000 | 0x00001000 | 0x00000800 | 0x00000008;
+
+    BOOL picked = pGetOpen(&ofn);
+    FreeLibrary(hComDlg);
+
+    if (!picked || fileBuf[0] == 0) {
+        outStatus = "Selection cancelled";
+        return false;
+    }
+    return loadReferenceImageFromPath(std::string(fileBuf), outStatus);
+#else
+    outStatus = "File dialog requires Windows";
+    return false;
+#endif
+}
+
+static std::string buildReferenceGridSummaryForPrompt() {
+    if (!g_hasReferenceImage || g_referenceSampleGrid.size() < static_cast<size_t>(g_referenceGridW * g_referenceGridH)) {
+        return "No reference image attached.";
+    }
+    std::ostringstream oss;
+    oss << "REFERENCE IMAGE ATTACHED (" << g_referenceFileName << "). "
+        << "Sampled 6x4 region RGB map from bottom (ry=0.0) to top (ry=1.0), left (rx=0.0) to right (rx=1.0): ";
+    for (int ry = 0; ry < 4; ++ry) {
+        for (int rx = 0; rx < 6; ++rx) {
+            int gx = rx * 2;
+            int gy = ry * 2;
+            ccColor3B c = g_referenceSampleGrid[gy * g_referenceGridW + gx];
+            oss << fmt::format("[rx={:.2f},ry={:.2f}:RGB({},{},{})] ",
+                (rx + 0.5f) / 6.0f, (ry + 0.5f) / 4.0f, c.r, c.g, c.b);
+        }
+    }
+    return oss.str();
+}
+
 static void parseCustomElementsFromAIJson(std::string const& innerJson, std::vector<AICustomDrawElement>& outList) {
     size_t pos = innerJson.find("\"elements\"");
     if (pos == std::string::npos) return;
     pos = innerJson.find('[', pos);
     if (pos == std::string::npos) return;
-    size_t endArr = innerJson.find(']', pos);
-    if (endArr == std::string::npos) endArr = innerJson.size();
+    size_t endArr = innerJson.rfind(']');
+    if (endArr == std::string::npos || endArr <= pos) endArr = innerJson.size();
 
     size_t cur = pos;
     while (cur < endArr) {
@@ -823,83 +1065,141 @@ static void parseCustomElementsFromAIJson(std::string const& innerJson, std::vec
 
         std::string item = innerJson.substr(objStart, objEnd - objStart + 1);
         AICustomDrawElement el;
-        el.rx        = std::clamp(extractJsonFloatField(item, "rx", 0.5f), 0.0f, 1.0f);
-        el.ry        = std::clamp(extractJsonFloatField(item, "ry", 0.5f), 0.0f, 1.0f);
-        el.scaleX    = std::clamp(extractJsonFloatField(item, "sx", 0.5f), 0.08f, 2.5f);
-        el.scaleY    = std::clamp(extractJsonFloatField(item, "sy", 0.5f), 0.08f, 2.5f);
-        el.rot       = extractJsonFloatField(item, "rot", 0.0f);
-        el.shapeType = std::clamp(extractJsonIntField(item, "type", 0), 0, 10);
-        el.zOrder    = std::clamp(extractJsonIntField(item, "z", 6), -2, 20);
-        el.opacity   = static_cast<GLubyte>(std::clamp(extractJsonIntField(item, "op", 255), 25, 255));
-        el.blending  = extractJsonBoolField(item, "blend", false);
+        el.directObjectId = extractJsonIntField(item, "id", 0);
+        el.rx             = std::clamp(extractJsonFloatField(item, "rx", 0.5f), -0.08f, 1.08f);
+        el.ry             = std::clamp(extractJsonFloatField(item, "ry", 0.5f), -0.08f, 1.08f);
+        el.scaleX         = std::clamp(extractJsonFloatField(item, "sx", 0.45f), 0.05f, 2.5f);
+        el.scaleY         = std::clamp(extractJsonFloatField(item, "sy", 0.45f), 0.05f, 2.5f);
+        el.rot            = extractJsonFloatField(item, "rot", 0.0f);
+        el.shapeType      = std::clamp(extractJsonIntField(item, "type", 0), 0, 12);
+        el.zOrder         = std::clamp(extractJsonIntField(item, "z", 6), -15, 45);
+        el.zLayerCode     = std::clamp(extractJsonIntField(item, "zl", 1), -3, 9);
+        el.editorLayerOff = std::clamp(extractJsonIntField(item, "el", 1), 0, 5);
+        el.opacity        = static_cast<GLubyte>(std::clamp(extractJsonIntField(item, "op", 255), 15, 255));
+        el.blending       = extractJsonBoolField(item, "blend", false);
 
         int r = std::clamp(extractJsonIntField(item, "r", 220), 0, 255);
         int g = std::clamp(extractJsonIntField(item, "g", 230), 0, 255);
         int b = std::clamp(extractJsonIntField(item, "b", 245), 0, 255);
         el.color = ccColor3B{ static_cast<GLubyte>(r), static_cast<GLubyte>(g), static_cast<GLubyte>(b) };
 
+        int dr = extractJsonIntField(item, "dr", -1);
+        int dg = extractJsonIntField(item, "dg", -1);
+        int db = extractJsonIntField(item, "db", -1);
+        if (dr >= 0 && dg >= 0 && db >= 0) {
+            el.hasDetailColor = true;
+            el.detailColor = ccColor3B{
+                static_cast<GLubyte>(std::clamp(dr, 0, 255)),
+                static_cast<GLubyte>(std::clamp(dg, 0, 255)),
+                static_cast<GLubyte>(std::clamp(db, 0, 255))
+            };
+            el.detailOpacity = static_cast<GLubyte>(std::clamp(extractJsonIntField(item, "dop", el.opacity), 15, 255));
+            el.detailBlending = extractJsonBoolField(item, "dblend", el.blending);
+        }
+
         outList.push_back(el);
         cur = objEnd + 1;
     }
 }
 
-// Запрос к реальной нейросети (с поддержкой нативного Gemini generateContent + автоматическим обходом 404!)
-static AIDecisionResult queryRealNeuralNetwork(
-    std::string const& userMessage,
-    ContourAnalysis const& contour,
-    int objectLimit,
-    bool overhangAllowed,
-    int variantNum
+// Вычисление объективного сходства сгенерированных элементов ИИ с загруженной картинкой-референсом (0..100%)
+static int evaluateReferenceSimilarityScore(AIDecisionResult const& res, std::string& outWeakRegions) {
+    outWeakRegions.clear();
+    if (!g_hasReferenceImage || g_referenceSampleGrid.size() < static_cast<size_t>(g_referenceGridW * g_referenceGridH)) {
+        return res.selfMatchScore;
+    }
+    if (res.customElements.empty()) {
+        outWeakRegions = "No elements placed yet; cover all 4x3 zones of the contour with colors matching the reference image.";
+        return 35;
+    }
+
+    int totalZones = 12;
+    float accumScore = 0.f;
+    std::ostringstream weakOss;
+
+    for (int zy = 0; zy < 3; ++zy) {
+        for (int zx = 0; zx < 4; ++zx) {
+            float centerRX = (zx + 0.5f) / 4.0f;
+            float centerRY = (zy + 0.5f) / 3.0f;
+
+            int gx = std::clamp(static_cast<int>(centerRX * g_referenceGridW), 0, g_referenceGridW - 1);
+            int gy = std::clamp(static_cast<int>(centerRY * g_referenceGridH), 0, g_referenceGridH - 1);
+            ccColor3B refCol = g_referenceSampleGrid[gy * g_referenceGridW + gx];
+
+            float bestColorDist = 999.f;
+            bool hasCoverage = false;
+            for (auto const& el : res.customElements) {
+                float dx = el.rx - centerRX;
+                float dy = el.ry - centerRY;
+                float distSq = dx * dx + dy * dy;
+                if (distSq <= 0.14f) {
+                    hasCoverage = true;
+                    float dr = static_cast<float>(el.color.r) - static_cast<float>(refCol.r);
+                    float dg = static_cast<float>(el.color.g) - static_cast<float>(refCol.g);
+                    float db = static_cast<float>(el.color.b) - static_cast<float>(refCol.b);
+                    float cDist = std::sqrt(dr * dr + dg * dg + db * db) / 441.67f;
+                    if (cDist < bestColorDist) bestColorDist = cDist;
+                }
+            }
+
+            if (!hasCoverage) {
+                float dr = static_cast<float>(res.fillRGB.r) - static_cast<float>(refCol.r);
+                float dg = static_cast<float>(res.fillRGB.g) - static_cast<float>(refCol.g);
+                float db = static_cast<float>(res.fillRGB.b) - static_cast<float>(refCol.b);
+                bestColorDist = (std::min)(1.0f, std::sqrt(dr * dr + dg * dg + db * db) / 441.67f + 0.25f);
+                weakOss << fmt::format("Zone(rx={:.2f},ry={:.2f}) needs detail RGB({},{},{}); ",
+                    centerRX, centerRY, refCol.r, refCol.g, refCol.b);
+            } else if (bestColorDist > 0.28f) {
+                weakOss << fmt::format("Zone(rx={:.2f},ry={:.2f}) color mismatch, target RGB({},{},{}); ",
+                    centerRX, centerRY, refCol.r, refCol.g, refCol.b);
+            }
+
+            float zoneScore = std::clamp(1.0f - bestColorDist * 0.85f, 0.20f, 1.0f);
+            accumScore += zoneScore;
+        }
+    }
+
+    outWeakRegions = weakOss.str();
+    int computedScore = static_cast<int>(std::lround((accumScore / totalZones) * 100.0f));
+    return std::clamp((computedScore + res.selfMatchScore) / 2, 10, 100);
+}
+
+// Одиночный вызов реальной нейросети (с поддержкой Multimodal Vision для референс-картинок!)
+static bool executeSingleNeuralNetPass(
+    std::string const& systemRule,
+    std::string const& userTurnPrompt,
+    AIDecisionResult& outRes
 ) {
-    AIDecisionResult res;
-
-    std::string systemRule = fmt::format(
-        "You are Art Agent, an AI inside Geometry Dash 2.2 Level Editor. "
-        "System Rule: Always communicate immediately about Geometry Dash level building and block design in the user's language (if the user writes in Russian or Russian translit, reply in Russian translit using Latin characters so the GD bitmap font displays every letter). "
-        "Never use canned responses — answer the user's questions or greetings naturally as you wish. "
-        "Selected contour: {} blocks ({}x{} units). Object limit: {}. Mode: {}. Variant #{}. "
-        "Respond ONLY with a single valid JSON object (no markdown fences) with these fields: "
-        "{{"
-        "\"action\": \"chat\" | \"build\" | \"only_3d\" | \"only_neon\" | \"only_fill\" | \"undo\", "
-        "\"reply\": \"your natural response to the player\", "
-        "\"plan\": \"short description of the visual design plan\", "
-        "\"fill_rgb\": [r,g,b], \"mid_rgb\": [r,g,b], \"main_rgb\": [r,g,b], \"outline_rgb\": [r,g,b], \"glow_rgb\": [r,g,b], "
-        "\"want_3d\": true/false, \"want_neon\": true/false, \"want_grass\": true/false, "
-        "\"want_snow\": true/false, \"want_brick\": true/false, \"want_crystal\": true/false, \"want_tree\": true/false, "
-        "\"emblem\": 0..5, \"pattern\": 0..5, \"count\": 30..350, "
-        "\"elements\": [{{\"rx\":0.0..1.0,\"ry\":0.0..1.0,\"sx\":0.1..1.5,\"sy\":0.1..1.5,\"rot\":0,\"type\":0..10,\"r\":0..255,\"g\":0..255,\"b\":0..255,\"op\":255,\"blend\":false,\"z\":6}}]"
-        "}}. "
-        "IMPORTANT: If the user is just greeting (e.g. 'privet', 'hi'), chatting, or asking a question without asking to build/draw yet, set \"action\": \"chat\" and answer naturally in \"reply\". "
-        "If the user asks ONLY for 3D, set \"action\": \"only_3d\". "
-        "If the user describes any art, material, object, or style to draw/build on the blocks, set \"action\": \"build\", choose accurate RGB colors for that exact material/theme, and generate up to 18 custom \"elements\" (types: 0=block, 1=circle, 2=triangle, 3=glow, 4=grass, 5=brick, 6=eye, 7=skull, 8=arc, 9=line, 10=chain) to draw the requested subject inside the contour.",
-        contour.cellCount(),
-        contour.widthUnits(),
-        contour.heightUnits(),
-        objectLimit,
-        overhangAllowed ? "Overhang" : "Inside",
-        variantNum
-    );
-
     int httpStatus = 0;
     std::string rawResp;
     std::string errText;
     std::string assistantContent;
 
     if (kApiProviders[g_apiProviderIndex].isGeminiNative) {
-        // Формат запроса нативного Gemini API (generateContent)
         std::string combinedPrompt = systemRule + "\n\nConversation history:\n";
         size_t startHist = (g_chatHistory.size() > 6) ? (g_chatHistory.size() - 6) : 0;
         for (size_t i = startHist; i < g_chatHistory.size(); ++i) {
             combinedPrompt += g_chatHistory[i].role + ": " + g_chatHistory[i].content + "\n";
         }
-        combinedPrompt += "User: " + userMessage;
+        combinedPrompt += "User request: " + userTurnPrompt;
+
+        std::string partsJson;
+        if (g_hasReferenceImage && !g_referenceBase64.empty()) {
+            partsJson = fmt::format(
+                "{{\"inline_data\":{{\"mime_type\":\"{}\",\"data\":\"{}\"}}}},{{\"text\":\"{}\"}}",
+                g_referenceMimeType,
+                g_referenceBase64,
+                jsonEscape(combinedPrompt)
+            );
+        } else {
+            partsJson = fmt::format("{{\"text\":\"{}\"}}", jsonEscape(combinedPrompt));
+        }
 
         std::string geminiBody = fmt::format(
-            "{{\"contents\":[{{\"role\":\"user\",\"parts\":[{{\"text\":\"{}\"}}]}}],\"generationConfig\":{{\"temperature\":0.85,\"maxOutputTokens\":900}}}}",
-            jsonEscape(combinedPrompt)
+            "{{\"contents\":[{{\"role\":\"user\",\"parts\":[{}]}}],\"generationConfig\":{{\"temperature\":0.92,\"maxOutputTokens\":2048}}}}",
+            partsJson
         );
 
-        // Пробуем выбранную модель, а если 404 — автоматически пробуем все активные модели Gemini!
         std::vector<std::string> candidateModels = { getCurrentModelID(0) };
         if (!g_discoveredGeminiModel.empty()) candidateModels.push_back(g_discoveredGeminiModel);
         for (int m = 0; m < 4; ++m) {
@@ -914,17 +1214,16 @@ static AIDecisionResult queryRealNeuralNetwork(
                 ok = true;
                 break;
             }
-            if (httpStatus != 404) break;
+            if (httpStatus != 404 && httpStatus != 429) break;
         }
 
         if (!ok) {
-            res.httpSuccess = false;
-            res.replyText = fmt::format("Gemini API Error (HTTP {}): {}", httpStatus, errText);
-            return res;
+            outRes.httpSuccess = false;
+            outRes.replyText = fmt::format("Gemini API Error (HTTP {}): {}", httpStatus, errText);
+            return false;
         }
         assistantContent = extractJsonStringField(rawResp, "text");
     } else {
-        // Формат OpenAI / DeepSeek / Groq / OpenRouter
         std::string messagesJson = fmt::format(
             "{{\"role\":\"system\",\"content\":\"{}\"}}",
             jsonEscape(systemRule)
@@ -937,44 +1236,62 @@ static AIDecisionResult queryRealNeuralNetwork(
                 jsonEscape(g_chatHistory[i].content)
             );
         }
-        messagesJson += fmt::format(
-            ",{{\"role\":\"user\",\"content\":\"{}\"}}",
-            jsonEscape(userMessage)
-        );
 
+        bool sentOk = false;
+        std::wstring hdrW = L"Content-Type: application/json\r\nAuthorization: Bearer " + utf8ToWideASCII(g_connectedApiKey) + L"\r\n";
         std::vector<std::string> candidateModels = { getCurrentModelID(g_apiProviderIndex) };
         for (int m = 0; m < 4; ++m) {
             candidateModels.push_back(kApiProviders[g_apiProviderIndex].models[m].modelId);
         }
 
-        bool ok = false;
-        std::wstring hdrW = L"Content-Type: application/json\r\nAuthorization: Bearer " + utf8ToWideASCII(g_connectedApiKey) + L"\r\n";
-
-        for (auto const& modName : candidateModels) {
-            std::string payload = fmt::format(
-                "{{\"model\":\"{}\",\"messages\":[{}],\"temperature\":0.85,\"max_tokens\":900}}",
-                modName,
-                messagesJson
+        if (g_hasReferenceImage && !g_referenceBase64.empty() && (g_apiProviderIndex == 1 || g_apiProviderIndex == 4)) {
+            std::string dataUri = "data:" + g_referenceMimeType + ";base64," + g_referenceBase64;
+            std::string visionMessages = messagesJson + fmt::format(
+                ",{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}},{{\"type\":\"image_url\",\"image_url\":{{\"url\":\"{}\"}}}}]}}",
+                jsonEscape(userTurnPrompt),
+                dataUri
             );
-            if (performWinHttpRequest(L"POST", kApiProviders[g_apiProviderIndex].hostW, kApiProviders[g_apiProviderIndex].chatPathW, hdrW, payload, httpStatus, rawResp, errText)) {
-                ok = true;
-                break;
+            std::string visionPayload = fmt::format(
+                "{{\"model\":\"{}\",\"messages\":[{}],\"temperature\":0.92,\"max_tokens\":2048}}",
+                candidateModels[0],
+                visionMessages
+            );
+            if (performWinHttpRequest(L"POST", kApiProviders[g_apiProviderIndex].hostW, kApiProviders[g_apiProviderIndex].chatPathW, hdrW, visionPayload, httpStatus, rawResp, errText)) {
+                sentOk = true;
             }
-            if (httpStatus != 404 && httpStatus != 400) break;
         }
 
-        if (!ok) {
-            res.httpSuccess = false;
-            res.replyText = fmt::format("API Error (HTTP {}): {}", httpStatus, errText);
-            return res;
+        if (!sentOk) {
+            std::string textMessages = messagesJson + fmt::format(
+                ",{{\"role\":\"user\",\"content\":\"{}\"}}",
+                jsonEscape(userTurnPrompt)
+            );
+            for (auto const& modName : candidateModels) {
+                std::string payload = fmt::format(
+                    "{{\"model\":\"{}\",\"messages\":[{}],\"temperature\":0.92,\"max_tokens\":2048}}",
+                    modName,
+                    textMessages
+                );
+                if (performWinHttpRequest(L"POST", kApiProviders[g_apiProviderIndex].hostW, kApiProviders[g_apiProviderIndex].chatPathW, hdrW, payload, httpStatus, rawResp, errText)) {
+                    sentOk = true;
+                    break;
+                }
+                if (httpStatus != 404 && httpStatus != 400 && httpStatus != 429) break;
+            }
+        }
+
+        if (!sentOk) {
+            outRes.httpSuccess = false;
+            outRes.replyText = fmt::format("API Error (HTTP {}): {}", httpStatus, errText);
+            return false;
         }
         assistantContent = extractJsonStringField(rawResp, "content");
     }
 
-    res.httpSuccess = true;
+    outRes.httpSuccess = true;
     if (assistantContent.empty()) {
-        res.replyText = "AI response received.";
-        return res;
+        outRes.replyText = "AI response received.";
+        return true;
     }
 
     size_t jsonStart = assistantContent.find('{');
@@ -983,50 +1300,169 @@ static AIDecisionResult queryRealNeuralNetwork(
         std::string innerJson = assistantContent.substr(jsonStart, jsonEnd - jsonStart + 1);
 
         std::string actionStr = extractJsonStringField(innerJson, "action");
-        res.replyText = extractJsonStringField(innerJson, "reply");
-        res.planText  = extractJsonStringField(innerJson, "plan");
+        outRes.replyText      = extractJsonStringField(innerJson, "reply");
+        outRes.planText       = extractJsonStringField(innerJson, "plan");
+        outRes.styleThemeName = extractJsonStringField(innerJson, "style_name");
+        outRes.critiqueNotes  = extractJsonStringField(innerJson, "critique");
+        outRes.selfMatchScore = std::clamp(extractJsonIntField(innerJson, "match_score", 95), 0, 100);
 
-        if (actionStr == "only_3d")        res.taskMode = AITaskMode::Only3D;
-        else if (actionStr == "only_neon") res.taskMode = AITaskMode::OnlyNeon;
-        else if (actionStr == "only_fill") res.taskMode = AITaskMode::OnlyFill;
-        else if (actionStr == "undo")      res.taskMode = AITaskMode::UndoLast;
-        else if (actionStr == "build")     res.taskMode = AITaskMode::FullDecor;
-        else                               res.taskMode = AITaskMode::ChatOnly;
+        if (actionStr == "only_3d")        outRes.taskMode = AITaskMode::Only3D;
+        else if (actionStr == "only_neon") outRes.taskMode = AITaskMode::OnlyNeon;
+        else if (actionStr == "only_fill") outRes.taskMode = AITaskMode::OnlyFill;
+        else if (actionStr == "undo")      outRes.taskMode = AITaskMode::UndoLast;
+        else if (actionStr == "build")     outRes.taskMode = AITaskMode::FullDecor;
+        else                               outRes.taskMode = AITaskMode::ChatOnly;
 
-        bool c1 = extractJsonRGBArray(innerJson, "fill_rgb",    res.fillRGB);
-        bool c2 = extractJsonRGBArray(innerJson, "mid_rgb",     res.midRGB);
-        bool c3 = extractJsonRGBArray(innerJson, "main_rgb",    res.mainRGB);
-        bool c4 = extractJsonRGBArray(innerJson, "outline_rgb", res.outlineRGB);
-        bool c5 = extractJsonRGBArray(innerJson, "glow_rgb",    res.glowRGB);
-        res.hasCustomPalette = (c1 || c2 || c3 || c4 || c5);
+        bool c1 = extractJsonRGBArray(innerJson, "fill_rgb",    outRes.fillRGB);
+        bool c2 = extractJsonRGBArray(innerJson, "mid_rgb",     outRes.midRGB);
+        bool c3 = extractJsonRGBArray(innerJson, "main_rgb",    outRes.mainRGB);
+        bool c4 = extractJsonRGBArray(innerJson, "outline_rgb", outRes.outlineRGB);
+        bool c5 = extractJsonRGBArray(innerJson, "glow_rgb",    outRes.glowRGB);
+        outRes.hasCustomPalette = (c1 || c2 || c3 || c4 || c5);
 
-        res.want3D             = extractJsonBoolField(innerJson, "want_3d", true);
-        res.wantNeon           = extractJsonBoolField(innerJson, "want_neon", true);
-        res.wantGrass          = extractJsonBoolField(innerJson, "want_grass", false);
-        res.wantSnowCap        = extractJsonBoolField(innerJson, "want_snow", false);
-        res.wantBrickPattern   = extractJsonBoolField(innerJson, "want_brick", false);
-        res.wantCrystalPattern = extractJsonBoolField(innerJson, "want_crystal", false);
-        res.wantTreePattern    = extractJsonBoolField(innerJson, "want_tree", false);
-        res.emblemType         = std::clamp(extractJsonIntField(innerJson, "emblem", 0), 0, 5);
-        res.patternStyle       = std::clamp(extractJsonIntField(innerJson, "pattern", 0), 0, 5);
-        res.suggestedCount     = std::clamp(extractJsonIntField(innerJson, "count", 130), 20, 450);
+        outRes.wantNeon       = extractJsonBoolField(innerJson, "want_neon", true);
+        outRes.suggestedCount = std::clamp(extractJsonIntField(innerJson, "count", 160), 25, 600);
 
-        parseCustomElementsFromAIJson(innerJson, res.customElements);
+        outRes.customElements.clear();
+        parseCustomElementsFromAIJson(innerJson, outRes.customElements);
     } else {
-        res.taskMode = AITaskMode::ChatOnly;
-        res.replyText = assistantContent;
+        outRes.taskMode = AITaskMode::ChatOnly;
+        outRes.replyText = assistantContent;
+    }
+    return true;
+}
+
+// Запрос к реальной нейросети с АВТОМАТИЧЕСКИМ ЦИКЛОМ САМООЦЕНКИ И ПЕРЕДЕЛКИ ПОД РЕФЕРЕНС
+static AIDecisionResult queryRealNeuralNetwork(
+    std::string const& userMessage,
+    ContourAnalysis const& contour,
+    EditorTabCatalog const& cat,
+    int objectLimit,
+    bool overhangAllowed,
+    int variantNum
+) {
+    std::string forbiddenThemes = "None yet";
+    if (!g_pastGeneratedThemes.empty()) {
+        forbiddenThemes.clear();
+        size_t startIdx = (g_pastGeneratedThemes.size() > 12) ? (g_pastGeneratedThemes.size() - 12) : 0;
+        for (size_t i = startIdx; i < g_pastGeneratedThemes.size(); ++i) {
+            if (!forbiddenThemes.empty()) forbiddenThemes += ", ";
+            forbiddenThemes += g_pastGeneratedThemes[i];
+        }
     }
 
-    if (res.replyText.empty()) {
-        res.replyText = "Done! Check the generated result.";
+    std::string refSummary = buildReferenceGridSummaryForPrompt();
+
+    std::string systemRule = fmt::format(
+        "You are Art Agent, an autonomous Geometry Dash 2.2 Level Editor AI artist. "
+        "STRICT RULES: "
+        "1. Always communicate in the user's language (if Russian, write in Russian translit with Latin letters so GD bitmap font shows every character). "
+        "2. NO PREMADE 3D BLOCKS OR TEMPLATES: Never use premade 3D blocks unless explicitly asked 'only_3d'. You MUST build 100% custom procedural art from scratch by choosing real Editor object IDs, colors, opacities (15..255), blending, and layers (including internal sub-layers inside blocks!). "
+        "3. NEVER REPEAT PAST STYLES: Previously generated styles in this session: [{}]. When no reference or fixed style is given, invent a completely NEW, original artistic theme, color harmony, and geometry composition every single time! "
+        "4. FULL COLOR, OPACITY & LAYER MASTERY: Control both Base Color (r,g,b,op,blend) and Detail Color (dr,dg,db,dop,dblend), Editor Layer offset 'el' (0=base fill, 1=deep inner block layer, 2=mid inner art layer, 3=upper detail layer, 4=crisp micro-shading, 5=top atmospheric glow), Z-Layer 'zl' (-3=B4, -1=B3, 1=B2, 3=B1, 5=T1, 7=T2, 9=T3), and 'z' (-15..45). "
+        "5. AVAILABLE REAL GD EDITOR OBJECT IDs you can freely place in \"id\": "
+        "211 (solid square canvas/pixel/stripe), 1888 (soft gradient glow), {} (circle dot), {} (hollow ring), {} (triangle shard), {} (thin line), {} (arc), {} (parallel lines), {} (diagonal shine), {} (chevron), {} (cross), {} (corner bracket), {} (arch), {} (brick texture), 406/407/408 (organic spikes/foliage). "
+        "6. Selected contour: {} blocks ({}x{} units). Object limit: {}. Mode: {}. Variant #{}. "
+        "7. Reference image status: {} "
+        "Respond ONLY with a single valid JSON object (no markdown fences): "
+        "{{"
+        "\"action\": \"chat\" | \"build\" | \"only_3d\" | \"only_neon\" | \"only_fill\" | \"undo\", "
+        "\"reply\": \"natural response to the player\", "
+        "\"style_name\": \"unique name of this artistic style\", "
+        "\"plan\": \"short summary of layers, colors, and objects chosen\", "
+        "\"match_score\": 0..100, "
+        "\"critique\": \"honest self-evaluation of how closely the elements match the reference or prompt\", "
+        "\"fill_rgb\": [r,g,b], \"mid_rgb\": [r,g,b], \"main_rgb\": [r,g,b], \"outline_rgb\": [r,g,b], \"glow_rgb\": [r,g,b], "
+        "\"want_neon\": true/false, \"count\": 60..400, "
+        "\"elements\": [{{\"id\":211,\"rx\":0.0..1.0,\"ry\":0.0..1.0,\"sx\":0.08..1.6,\"sy\":0.08..1.6,\"rot\":0..360,\"r\":0..255,\"g\":0..255,\"b\":0..255,\"op\":20..255,\"blend\":false,\"dr\":0..255,\"dg\":0..255,\"db\":0..255,\"dop\":20..255,\"dblend\":false,\"el\":0..5,\"zl\":-3..9,\"z\":-10..40}}]"
+        "}}. "
+        "IMPORTANT: When \"action\" is \"build\", generate 24 to 42 rich, layered \"elements\" spanning both internal block layers (el=0,1,2, zl=-3,-1,1) and surface/highlight layers (el=3,4,5, zl=3,5,7) so the part looks hand-crafted and matches the reference or theme.",
+        forbiddenThemes,
+        cat.idCircleDot, cat.idCircleRing, cat.idSmallTriangle, cat.idThinLineLong,
+        cat.idArcThin, cat.idParallelLines, cat.idDiagShine1, cat.idChevron,
+        cat.idSmallCross, cat.idBracketCorner, cat.idBracketArch, cat.idBrickBlock,
+        contour.cellCount(),
+        contour.widthUnits(),
+        contour.heightUnits(),
+        objectLimit,
+        overhangAllowed ? "Overhang" : "Inside",
+        variantNum,
+        refSummary
+    );
+
+    AIDecisionResult bestRes;
+    if (!executeSingleNeuralNetPass(systemRule, userMessage, bestRes)) {
+        return bestRes;
     }
-    if (res.planText.empty()) {
-        res.planText = userMessage;
+
+    bestRes.refinementPasses = 1;
+
+    // АВТОМАТИЧЕСКИЙ ЦИКЛ САМОПРОВЕРКИ И ИСПРАВЛЕНИЯ (Self-Critique & Refinement Loop):
+    if (bestRes.taskMode == AITaskMode::FullDecor) {
+        int maxPasses = g_hasReferenceImage ? 3 : 2;
+        for (int pass = 1; pass < maxPasses; ++pass) {
+            std::string weakZones;
+            int actualScore = evaluateReferenceSimilarityScore(bestRes, weakZones);
+            bestRes.selfMatchScore = actualScore;
+
+            bool needsRefinement = (actualScore < 93) || (bestRes.customElements.size() < 18);
+            if (!needsRefinement) break;
+
+            std::string critiquePrompt = fmt::format(
+                "SELF-CRITIQUE REFINEMENT PASS #{}: Your previous draft for '{}' scored {}% similarity ({} elements). "
+                "Critique notes: {} {} "
+                "REBUILD and IMPROVE the JSON now: fix every mismatched color region, add multi-layered internal block shading (el=0..5, zl=-3..9), "
+                "use accurate transparency (op=30..255) and additive glow (blend=true where bright), and output 28..45 precise 'elements' so match_score reaches 96..100%!",
+                pass + 1,
+                userMessage,
+                actualScore,
+                bestRes.customElements.size(),
+                bestRes.critiqueNotes,
+                weakZones
+            );
+
+            AIDecisionResult refinedRes;
+            if (executeSingleNeuralNetPass(systemRule, critiquePrompt, refinedRes) &&
+                refinedRes.httpSuccess &&
+                refinedRes.taskMode == AITaskMode::FullDecor &&
+                !refinedRes.customElements.empty()) {
+                std::string newWeak;
+                int newScore = evaluateReferenceSimilarityScore(refinedRes, newWeak);
+                refinedRes.selfMatchScore = (std::max)(newScore, refinedRes.selfMatchScore);
+                refinedRes.refinementPasses = pass + 1;
+                bestRes = std::move(refinedRes);
+                if (bestRes.selfMatchScore >= 94 && bestRes.customElements.size() >= 20) {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    if (bestRes.replyText.empty()) {
+        bestRes.replyText = "Done! Built custom multi-layered art.";
+    }
+    if (bestRes.planText.empty()) {
+        bestRes.planText = userMessage;
+    }
+    if (!bestRes.styleThemeName.empty()) {
+        g_pastGeneratedThemes.push_back(bestRes.styleThemeName);
+    } else if (bestRes.taskMode == AITaskMode::FullDecor) {
+        g_pastGeneratedThemes.push_back(fmt::format("Style#{}_{}x{}", g_pastGeneratedThemes.size() + 1, bestRes.mainRGB.r, bestRes.glowRGB.b));
+    }
+
+    g_lastSelfScore = bestRes.selfMatchScore;
+    g_lastRefinementPasses = bestRes.refinementPasses;
+
+    std::string finalBotMsg = bestRes.replyText;
+    if (bestRes.taskMode == AITaskMode::FullDecor) {
+        finalBotMsg += fmt::format(" [Match: {}% | Passes: {}]", bestRes.selfMatchScore, bestRes.refinementPasses);
     }
 
     g_chatHistory.push_back({ "user", userMessage });
-    g_chatHistory.push_back({ "assistant", res.replyText });
-    return res;
+    g_chatHistory.push_back({ "assistant", finalBotMsg });
+    return bestRes;
 }
 
 // ============================================================================
@@ -1086,11 +1522,16 @@ static void writeObjScale(ObjT* obj, float sx, float sy) {
 }
 
 template <typename ObjT>
-static void writeObjFlags(ObjT* obj, int zOrder, bool noTouch, bool noGlow) {
+static void writeObjFlags(ObjT* obj, int zOrder, int zLayerCode, bool noTouch, bool noGlow) {
     if (!obj) return;
     obj->setZOrder(zOrder);
     if constexpr (requires { obj->m_zOrder; }) {
         obj->m_zOrder = zOrder;
+    }
+    if (zLayerCode != 0) {
+        if constexpr (requires { obj->m_zLayer; }) {
+            obj->m_zLayer = static_cast<decltype(obj->m_zLayer)>(zLayerCode);
+        }
     }
     if constexpr (requires { obj->m_isNoTouch; }) {
         obj->m_isNoTouch = noTouch;
@@ -1177,7 +1618,11 @@ static void bindObjectToColor(
     ColorSlot slot,
     ccColor3B customRGB,
     GLubyte overrideOpacity = 255,
-    bool customBlend = false
+    bool customBlend = false,
+    bool hasDetailOverride = false,
+    ccColor3B detailRGB = ccColor3B{ 255, 255, 255 },
+    GLubyte detailOpacity = 255,
+    bool detailBlend = false
 ) {
     if (!obj) return;
     ccColor3B col;
@@ -1198,7 +1643,11 @@ static void bindObjectToColor(
         applyHSVOnGJSpriteColor(obj->m_baseColor, col, finalOp, blend);
     }
     if constexpr (requires { obj->m_detailColor; }) {
-        applyHSVOnGJSpriteColor(obj->m_detailColor, col, finalOp, blend);
+        if (hasDetailOverride) {
+            applyHSVOnGJSpriteColor(obj->m_detailColor, detailRGB, detailOpacity, detailBlend);
+        } else {
+            applyHSVOnGJSpriteColor(obj->m_detailColor, col, finalOp, blend);
+        }
     }
 
     obj->setColor(col);
@@ -1211,39 +1660,7 @@ static void bindObjectToColor(
 // ============================================================================
 // Чтение готовых блоков из вкладок редактора (3D, Глаз, Череп, Декор, Неон)
 // ============================================================================
-struct EditorTabCatalog {
-    int id3DTrapTop    = 211;
-    int id3DHalfStrip  = 211;
-    int id3DTriCorner  = 211;
-    int id3DTriBR      = 211;
 
-    int idEyeBlock      = 211;
-    int idSkullBlock    = 211;
-    int idSwirlSign     = 211;
-    int idChainLink     = 211;
-    int idBrickBlock    = 211;
-    int idBracketArch   = 211;
-    int idBracketCorner = 211;
-    int idDiagShine1    = 211;
-
-    int idThinLineLong  = 211;
-    int idGradLine      = 1888;
-    int idCornerMark    = 211;
-    int idParallelLines = 211;
-    int idArcThin       = 211;
-    int idCircleRing    = 211;
-    int idCircleDot     = 211;
-    int idSmallCross    = 211;
-    int idSmallTriangle = 211;
-    int idChevron       = 211;
-    int idHollowSquare  = 211;
-    int idDiagThin      = 211;
-    int idShortDash     = 211;
-    int idDoubleDots    = 211;
-
-    int idGlowEdgeSmall = 1888;
-    int idGlowBeam      = 1888;
-};
 
 template <typename T>
 static int extractCreateItemObjectID(T* item) {
@@ -1647,7 +2064,11 @@ static void addSpec(
     int zOrder,
     int priorityTier = 1,
     bool isOverhang = false,
-    GLubyte opacity = 255
+    GLubyte opacity = 255,
+    int zLayerCode = 1,
+    int editorLayerOffset = 0,
+    ccColor3B customCol = ccColor3B{ 255, 255, 255 },
+    bool customBlend = false
 ) {
     GeneratedObjectSpec spec;
     spec.objectId = objectId;
@@ -1659,29 +2080,59 @@ static void addSpec(
     spec.layerRole = layerRole;
     spec.colorSlot = colorSlot;
     spec.zOrder = zOrder;
+    spec.zLayerCode = zLayerCode;
+    spec.editorLayerOffset = editorLayerOffset;
     spec.priorityTier = priorityTier;
     spec.isOverhang = isOverhang;
+    spec.customColor = customCol;
     spec.customOpacity = opacity;
+    spec.customBlending = customBlend;
     spec.noTouch = true;
     spec.noGlow = true;
     out.push_back(spec);
 }
 
-static int resolveAIElementObjectID(int shapeType, EditorTabCatalog const& cat) {
-    switch (shapeType) {
+static bool isPremade3DOrForbiddenTemplateID(int id, EditorTabCatalog const& cat) {
+    if (id <= 0) return true;
+    if (id == cat.id3DTrapTop || id == cat.id3DHalfStrip || id == cat.id3DTriCorner || id == cat.id3DTriBR) {
+        return (id != 211);
+    }
+    return false;
+}
+
+static int resolveAIElementObjectID(AICustomDrawElement const& el, EditorTabCatalog const& cat, bool forbid3DBlocks) {
+    if (el.directObjectId > 0) {
+        if (forbid3DBlocks && isPremade3DOrForbiddenTemplateID(el.directObjectId, cat)) {
+            return 211;
+        }
+        return el.directObjectId;
+    }
+    switch (el.shapeType) {
         case 0: return 211;
         case 1: return cat.idCircleDot;
         case 2: return cat.idSmallTriangle;
         case 3: return 1888;
-        case 4: return 406;
-        case 5: return cat.idBrickBlock;
-        case 6: return cat.idEyeBlock;
-        case 7: return cat.idSkullBlock;
-        case 8: return cat.idArcThin;
-        case 9: return cat.idParallelLines;
-        case 10: return cat.idChainLink;
+        case 4: return cat.idThinLineLong;
+        case 5: return cat.idCircleRing;
+        case 6: return cat.idArcThin;
+        case 7: return cat.idParallelLines;
+        case 8: return cat.idDiagShine1;
+        case 9: return cat.idChevron;
+        case 10: return cat.idSmallCross;
+        case 11: return cat.idBracketCorner;
+        case 12: return cat.idBracketArch;
         default: return 211;
     }
+}
+
+// Смешивание двух RGB-цветов
+static ccColor3B lerpColor(ccColor3B a, ccColor3B b, float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    return ccColor3B{
+        static_cast<GLubyte>(std::lround(a.r + (b.r - a.r) * t)),
+        static_cast<GLubyte>(std::lround(a.g + (b.g - a.g) * t)),
+        static_cast<GLubyte>(std::lround(a.b + (b.b - a.b) * t))
+    };
 }
 
 static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
@@ -1695,8 +2146,8 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
     std::vector<GeneratedObjectSpec> result;
 
     auto islands = splitIntoIslands(contour.occupiedCells);
-    int totalCells = (std::max)(1, contour.cellCount());
 
+    // Режим Only3D вызывается ТОЛЬКО если пользователь сам явно попросил "сделай только 3д"
     if (ai.taskMode == AITaskMode::Only3D) {
         for (auto const& isl : islands) {
             for (auto const& [gx, gy] : isl.cells) {
@@ -1708,21 +2159,21 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                 bool leftOpen   = (contour.occupiedCells.count({ gx - 1, gy }) == 0);
                 bool rightOpen  = (contour.occupiedCells.count({ gx + 1, gy }) == 0);
 
-                if (topOpen)    addSpec(result, 211, cx, cy + 14.2f, 1.02f, 0.06f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0, false);
-                if (leftOpen)   addSpec(result, 211, cx - 14.2f, cy, 0.06f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0, false);
-                if (rightOpen)  addSpec(result, 211, cx + 14.2f, cy, 0.06f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0, false);
-                if (bottomOpen && gy > 0) addSpec(result, 211, cx, cy - 14.2f, 1.02f, 0.06f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0, false);
+                if (topOpen)    addSpec(result, 211, cx, cy + 14.2f, 1.02f, 0.06f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0, false, 255, 3, 2);
+                if (leftOpen)   addSpec(result, 211, cx - 14.2f, cy, 0.06f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0, false, 255, 3, 2);
+                if (rightOpen)  addSpec(result, 211, cx + 14.2f, cy, 0.06f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0, false, 255, 3, 2);
+                if (bottomOpen && gy > 0) addSpec(result, 211, cx, cy - 14.2f, 1.02f, 0.06f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0, false, 255, 3, 2);
 
                 if (topOpen) {
                     int top3DId = leftOpen ? cat.id3DTrapTop : cat.id3DHalfStrip;
-                    addSpec(result, top3DId, cx, cy + 22.5f, 1.00f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0, true);
+                    addSpec(result, top3DId, cx, cy + 22.5f, 1.00f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0, true, 255, -1, 2);
                 }
                 if (rightOpen) {
-                    addSpec(result, cat.id3DHalfStrip, cx + 22.5f, cy, 1.00f, 1.00f, 90.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0, true);
+                    addSpec(result, cat.id3DHalfStrip, cx + 22.5f, cy, 1.00f, 1.00f, 90.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0, true, 255, -1, 2);
                 }
                 if (topOpen && rightOpen) {
-                    addSpec(result, cat.id3DTriCorner, cx + 22.5f, cy + 22.5f, 1.00f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0, true);
-                    addSpec(result, cat.id3DTriBR,     cx + 22.5f, cy + 22.5f, 1.00f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0, true);
+                    addSpec(result, cat.id3DTriCorner, cx + 22.5f, cy + 22.5f, 1.00f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0, true, 255, -1, 2);
+                    addSpec(result, cat.id3DTriBR,     cx + 22.5f, cy + 22.5f, 1.00f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0, true, 255, -1, 2);
                 }
             }
         }
@@ -1740,17 +2191,17 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
 
                 if (topOpen) {
                     if (allowOverhang) {
-                        addSpec(result, cat.idGlowEdgeSmall, cx - 7.5f, cy + 18.0f, 0.50f, 0.45f, 0.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 0, true, 140);
-                        addSpec(result, cat.idGlowEdgeSmall, cx + 7.5f, cy + 18.0f, 0.50f, 0.45f, 0.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 0, true, 140);
+                        addSpec(result, cat.idGlowEdgeSmall, cx - 7.5f, cy + 18.0f, 0.50f, 0.45f, 0.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 0, true, 140, 7, 5);
+                        addSpec(result, cat.idGlowEdgeSmall, cx + 7.5f, cy + 18.0f, 0.50f, 0.45f, 0.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 0, true, 140, 7, 5);
                     }
-                    addSpec(result, cat.idGlowEdgeSmall, cx - 7.5f, cy + 11.5f, 0.50f, 0.40f, 180.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 0, false, 115);
-                    addSpec(result, cat.idGlowEdgeSmall, cx + 7.5f, cy + 11.5f, 0.50f, 0.40f, 180.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 0, false, 115);
+                    addSpec(result, cat.idGlowEdgeSmall, cx - 7.5f, cy + 11.5f, 0.50f, 0.40f, 180.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 0, false, 115, 5, 4);
+                    addSpec(result, cat.idGlowEdgeSmall, cx + 7.5f, cy + 11.5f, 0.50f, 0.40f, 180.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 0, false, 115, 5, 4);
                 }
                 if (leftOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx - 11.5f, cy, 0.50f, 0.40f, 90.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 0, false, 110);
+                    addSpec(result, cat.idGlowEdgeSmall, cx - 11.5f, cy, 0.50f, 0.40f, 90.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 0, false, 110, 5, 4);
                 }
                 if (rightOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx + 11.5f, cy, 0.50f, 0.40f, 270.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 0, false, 110);
+                    addSpec(result, cat.idGlowEdgeSmall, cx + 11.5f, cy, 0.50f, 0.40f, 270.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 0, false, 110, 5, 4);
                 }
             }
         }
@@ -1762,147 +2213,190 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
             for (auto const& [gx, gy] : isl.cells) {
                 float cx = gx * 30.f + 15.f;
                 float cy = gy * 30.f + 15.f;
-                addSpec(result, 211, cx, cy, 1.00f, 1.00f, 0.f, LayerRole::Fill, ColorSlot::DarkFill, 1, 0, false);
+                addSpec(result, 211, cx, cy, 1.00f, 1.00f, 0.f, LayerRole::Fill, ColorSlot::DarkFill, 1, 0, false, 255, -3, 0);
             }
         }
         return result;
     }
 
-    int effectiveCap = (std::min)(maxObjectLimit, (std::max)(40, ai.suggestedCount));
-    float densityRatio = std::clamp(static_cast<float>(effectiveCap) / (totalCells * 8.f), 0.5f, 3.0f);
-    float microScale = std::clamp(0.38f / std::sqrt(densityRatio), 0.16f, 0.38f);
-
-    int layoutStyle = (ai.patternStyle + g_variantIndex + rng()) % 6;
-    if (layoutStyle == g_lastLayoutSeed) {
-        layoutStyle = (layoutStyle + 1) % 6;
-    }
-    g_lastLayoutSeed = layoutStyle;
-
-    int const emblemPool[4] = { cat.idEyeBlock, cat.idSkullBlock, cat.idCircleRing, cat.idBracketArch };
-    int chosenEmblem = emblemPool[rng() % 4];
-    if (ai.emblemType == 1) chosenEmblem = cat.idEyeBlock;
-    else if (ai.emblemType == 2) chosenEmblem = cat.idSkullBlock;
-    else if (ai.emblemType == 3) chosenEmblem = cat.idCircleRing;
-    else if (ai.emblemType == 4) chosenEmblem = cat.idBracketArch;
-
-    int const cornerPool[4] = { cat.idBracketCorner, cat.idCornerMark, cat.idArcThin, cat.idSmallTriangle };
-    int chosenCornerPiece = cornerPool[rng() % 4];
-
-    for (auto const& isl : islands) {
-        int cols = isl.maxGX - isl.minGX + 1;
-        int rows = isl.maxGY - isl.minGY + 1;
-        int focalCol = cols / 2;
-        int focalRow = rows / 2;
-
-        for (auto const& [gx, gy] : isl.cells) {
-            float cx = gx * 30.f + 15.f;
-            float cy = gy * 30.f + 15.f;
-
-            bool topOpen    = (contour.occupiedCells.count({ gx, gy + 1 }) == 0);
-            bool bottomOpen = (contour.occupiedCells.count({ gx, gy - 1 }) == 0);
-            bool leftOpen   = (contour.occupiedCells.count({ gx - 1, gy }) == 0);
-            bool rightOpen  = (contour.occupiedCells.count({ gx + 1, gy }) == 0);
-
-            int localCol = gx - isl.minGX;
-            int localRow = gy - isl.minGY;
-
-            addSpec(result, 211, cx, cy, 1.00f, 1.00f, 0.f, LayerRole::Fill, ColorSlot::DarkFill, 1, 0, false);
-
-            if (ai.wantBrickPattern) {
-                addSpec(result, cat.idBrickBlock, cx, cy, 0.88f, 0.88f, 0.f, LayerRole::Fill, ColorSlot::MidTone, 2, 1, false, 160);
-            } else if (((localCol + localRow + layoutStyle) % 2) == 0) {
-                addSpec(result, 211, cx, cy, 0.86f, 0.86f, 0.f, LayerRole::Fill, ColorSlot::MidTone, 2, 1, false, 52);
-            }
-
-            if (topOpen && ai.wantSnowCap) {
-                addSpec(result, 211, cx, cy + 10.5f, 1.00f, 0.30f, 0.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 7, 0, false, 235);
-                addSpec(result, 211, cx - 6.f, cy + 6.5f, 0.42f, 0.16f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 7, 1, false, 210);
-            }
-
-            if (topOpen)    addSpec(result, 211, cx, cy + 14.2f, 1.02f, 0.06f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0, false);
-            if (leftOpen)   addSpec(result, 211, cx - 14.2f, cy, 0.06f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0, false);
-            if (rightOpen)  addSpec(result, 211, cx + 14.2f, cy, 0.06f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0, false);
-            if (bottomOpen && gy > 0) addSpec(result, 211, cx, cy - 14.2f, 1.02f, 0.06f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0, false);
-
-            if (ai.want3D && allowOverhang) {
-                if (topOpen) {
-                    int top3DId = leftOpen ? cat.id3DTrapTop : cat.id3DHalfStrip;
-                    addSpec(result, top3DId, cx, cy + 22.5f, 1.00f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0, true);
-                }
-                if (rightOpen) {
-                    addSpec(result, cat.id3DHalfStrip, cx + 22.5f, cy, 1.00f, 1.00f, 90.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0, true);
-                }
-                if (topOpen && rightOpen) {
-                    addSpec(result, cat.id3DTriCorner, cx + 22.5f, cy + 22.5f, 1.00f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0, true);
-                    addSpec(result, cat.id3DTriBR,     cx + 22.5f, cy + 22.5f, 1.00f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::Dark3D, 9, 0, true);
-                }
-            }
-
-            if (ai.wantNeon) {
-                if (topOpen) {
-                    if (allowOverhang) {
-                        addSpec(result, cat.idGlowEdgeSmall, cx - 7.5f, cy + 18.0f, 0.50f, 0.45f, 0.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 0, true, 130);
-                        addSpec(result, cat.idGlowEdgeSmall, cx + 7.5f, cy + 18.0f, 0.50f, 0.45f, 0.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 0, true, 130);
-                    }
-                    addSpec(result, cat.idGlowEdgeSmall, cx - 7.5f, cy + 11.5f, 0.50f, 0.40f, 180.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 1, false, 105);
-                    addSpec(result, cat.idGlowEdgeSmall, cx + 7.5f, cy + 11.5f, 0.50f, 0.40f, 180.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 1, false, 105);
-                }
-                if (leftOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx - 11.5f, cy, 0.50f, 0.40f, 90.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 1, false, 100);
-                }
-                if (rightOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx + 11.5f, cy, 0.50f, 0.40f, 270.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 1, false, 100);
-                }
-            }
-
-            if (topOpen && ai.wantGrass && allowOverhang) {
-                int const grassIDs[3] = { 406, 407, 408 };
-                int gID = grassIDs[(gx + gy + layoutStyle) % 3];
-                addSpec(result, gID, cx - 4.f, cy + 15.8f, 0.44f, 0.46f, 0.f, LayerRole::NeonAndGrass, ColorSlot::BrightMain, 15, 1, true);
-            }
-
-            if (ai.wantCrystalPattern) {
-                addSpec(result, 211, cx, cy, 0.36f, 0.36f, 45.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1, false);
-                addSpec(result, cat.idSmallTriangle, cx, cy, microScale, microScale, static_cast<float>((localCol * 90) % 360), LayerRole::InnerDetail, ColorSlot::BrightMain, 6, 1, false);
-            } else if (localCol == focalCol && localRow == focalRow && ai.emblemType != 5) {
-                addSpec(result, chosenEmblem, cx, cy, 0.52f, 0.52f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 6, 1, false);
-            } else {
-                addSpec(result, chosenCornerPiece, cx - 7.5f, cy + 7.5f, microScale, microScale, 0.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 5, 2, false);
-                addSpec(result, chosenCornerPiece, cx + 7.5f, cy - 7.5f, microScale, microScale, 180.f, LayerRole::InnerDetail, ColorSlot::MidTone, 5, 2, false);
-            }
-        }
-    }
+    // ========================================================================
+    // ГЛАВНЫЙ РЕЖИМ ИИ (FullDecor):
+    // 1) СТРОГО БЕЗ ГОТОВЫХ 3D-БЛОКОВ И ШАБЛОНОВ!
+    // 2) Многослойная работа ВНУТРИ каждого блока (B4..T3, слои редактора +0..+5),
+    //    плавные переходы цвета, прозрачность (opacity) и блендинг.
+    // 3) Если прикреплена картинка-референс — каждый блок и внутренний подслой
+    //    окрашивается в точные цвета референса в этой координате + поверх ставятся
+    //    выбранные самим ИИ объекты из редактора!
+    // ========================================================================
+    int effectiveCap = (std::min)(maxObjectLimit, (std::max)(60, ai.suggestedCount));
 
     float spanW = static_cast<float>((std::max)(1, contour.maxGX - contour.minGX + 1)) * 30.f;
     float spanH = static_cast<float>((std::max)(1, contour.maxGY - contour.minGY + 1)) * 30.f;
     float originX = contour.minGX * 30.f;
     float originY = contour.minGY * 30.f;
 
+    // Уникальное смещение геометрии для каждого нового запуска (чтобы декор НИКОГДА не повторялся)
+    float uniqueAngleOffset = static_cast<float>((rng() % 360));
+    int uniqueSubLayerPattern = static_cast<int>(rng() % 7);
+
+    // 1. Внутренние слои внутри каждого блока контура (Deep Sub-Layer B4, Mid Inner Layer B2, Sub-Surface Shading B1)
+    for (auto const& isl : islands) {
+        for (auto const& [gx, gy] : isl.cells) {
+            float cx = gx * 30.f + 15.f;
+            float cy = gy * 30.f + 15.f;
+
+            float normX = std::clamp((cx - originX) / spanW, 0.0f, 1.0f);
+            float normY = std::clamp((cy - originY) / spanH, 0.0f, 1.0f);
+
+            bool topOpen    = (contour.occupiedCells.count({ gx, gy + 1 }) == 0);
+            bool bottomOpen = (contour.occupiedCells.count({ gx, gy - 1 }) == 0);
+            bool leftOpen   = (contour.occupiedCells.count({ gx - 1, gy }) == 0);
+            bool rightOpen  = (contour.occupiedCells.count({ gx + 1, gy }) == 0);
+
+            // Определяем локальный цвет блока (из референса в этой точке или из градиента палитры ИИ)
+            ccColor3B cellBaseCol = lerpColor(ai.fillRGB, ai.midRGB, normY * 0.65f + normX * 0.35f);
+            ccColor3B cellInnerCol = lerpColor(ai.midRGB, ai.mainRGB, normY);
+            if (g_hasReferenceImage && g_referenceSampleGrid.size() >= static_cast<size_t>(g_referenceGridW * g_referenceGridH)) {
+                int rgx = std::clamp(static_cast<int>(normX * g_referenceGridW), 0, g_referenceGridW - 1);
+                int rgy = std::clamp(static_cast<int>(normY * g_referenceGridH), 0, g_referenceGridH - 1);
+                ccColor3B refC = g_referenceSampleGrid[rgy * g_referenceGridW + rgx];
+                cellBaseCol = lerpColor(ai.fillRGB, refC, 0.78f);
+                cellInnerCol = refC;
+            }
+
+            // Слой 0 (Внутреннее дно блока, Z-Layer B4 = -3, EditorLayer +0)
+            addSpec(
+                result, 211, cx, cy, 1.00f, 1.00f, 0.f,
+                LayerRole::Fill, ColorSlot::CustomRGB, 1, 0, false,
+                255, -3, 0, cellBaseCol, false
+            );
+
+            // Слой 1 (Внутренний полупрозрачный подслой глубины внутри блока, Z-Layer B3 = -1, EditorLayer +1)
+            float innerRot = ((gx * 37 + gy * 53 + uniqueSubLayerPattern * 19) % 2 == 0) ? 0.f : 45.f;
+            float innerScale = (innerRot == 45.f) ? 0.56f : 0.78f;
+            addSpec(
+                result, 211, cx, cy, innerScale, innerScale, innerRot,
+                LayerRole::InnerDetail, ColorSlot::CustomRGB, 3, 1, false,
+                static_cast<GLubyte>(115 + ((gx + gy) % 3) * 25), -1, 1, cellInnerCol, false
+            );
+
+            // Если есть референс — добавляем 4 внутренних суб-пикселя (2x2 внутри блока 30x30) на слое B2 (zl=1, el=2)
+            // для сверхточной передачи градиентов и текстуры референса!
+            if (g_hasReferenceImage && g_referenceSampleGrid.size() >= static_cast<size_t>(g_referenceGridW * g_referenceGridH)) {
+                for (int sy = 0; sy < 2; ++sy) {
+                    for (int sx = 0; sx < 2; ++sx) {
+                        float subX = cx + (sx == 0 ? -7.5f : 7.5f);
+                        float subY = cy + (sy == 0 ? -7.5f : 7.5f);
+                        float sNormX = std::clamp((subX - originX) / spanW, 0.0f, 1.0f);
+                        float sNormY = std::clamp((subY - originY) / spanH, 0.0f, 1.0f);
+                        int sgx = std::clamp(static_cast<int>(sNormX * g_referenceGridW), 0, g_referenceGridW - 1);
+                        int sgy = std::clamp(static_cast<int>(sNormY * g_referenceGridH), 0, g_referenceGridH - 1);
+                        ccColor3B subCol = g_referenceSampleGrid[sgy * g_referenceGridW + sgx];
+                        addSpec(
+                            result, 211, subX, subY, 0.50f, 0.50f, 0.f,
+                            LayerRole::InnerDetail, ColorSlot::CustomRGB, 4, 0, false,
+                            185, 1, 2, subCol, false
+                        );
+                    }
+                }
+            } else {
+                // Без референса: уникальная внутренняя микро-слоистость (каждый раз новая!)
+                int innerShapeId = cat.idCircleRing;
+                switch ((gx + gy + uniqueSubLayerPattern) % 5) {
+                    case 0: innerShapeId = cat.idCircleDot; break;
+                    case 1: innerShapeId = cat.idSmallTriangle; break;
+                    case 2: innerShapeId = cat.idArcThin; break;
+                    case 3: innerShapeId = cat.idDiagShine1; break;
+                    default: innerShapeId = cat.idParallelLines; break;
+                }
+                addSpec(
+                    result, innerShapeId,
+                    cx + ((gx % 2 == 0) ? -4.5f : 4.5f),
+                    cy + ((gy % 2 == 0) ? 4.5f : -4.5f),
+                    0.34f, 0.34f,
+                    std::fmod(uniqueAngleOffset + (gx * 45.f + gy * 90.f), 360.f),
+                    LayerRole::InnerDetail, ColorSlot::CustomRGB, 5, 2, false,
+                    145, 1, 2, lerpColor(cellInnerCol, ai.outlineRGB, 0.35f), false
+                );
+            }
+
+            // Тонкий аккуратный контур границы формы (СТРОГО БЕЗ 3D-блоков!) на слое B1 (zl=3, el=3)
+            if (topOpen)    addSpec(result, 211, cx, cy + 14.3f, 1.02f, 0.055f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 235, 3, 3, ai.outlineRGB, false);
+            if (leftOpen)   addSpec(result, 211, cx - 14.3f, cy, 0.055f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 215, 3, 3, ai.outlineRGB, false);
+            if (rightOpen)  addSpec(result, 211, cx + 14.3f, cy, 0.055f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 215, 3, 3, ai.outlineRGB, false);
+            if (bottomOpen && gy > 0) addSpec(result, 211, cx, cy - 14.3f, 1.02f, 0.055f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 195, 3, 3, ai.outlineRGB, false);
+
+            // Мягкое атмосферное свечение и внутренняя подсветка краев (Additive Blending, zl=7, el=5)
+            if (ai.wantNeon) {
+                if (topOpen) {
+                    addSpec(result, cat.idGlowEdgeSmall, cx, cy + 11.0f, 0.85f, 0.42f, 180.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 1, false, 95, 7, 5, ai.glowRGB, true);
+                }
+                if (leftOpen) {
+                    addSpec(result, cat.idGlowEdgeSmall, cx - 11.0f, cy, 0.85f, 0.38f, 90.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 1, false, 80, 7, 5, ai.glowRGB, true);
+                }
+                if (rightOpen) {
+                    addSpec(result, cat.idGlowEdgeSmall, cx + 11.0f, cy, 0.85f, 0.38f, 270.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 1, false, 80, 7, 5, ai.glowRGB, true);
+                }
+            }
+        }
+    }
+
+    // 2. Размещаем все объекты, которые ИИ сам выбрал из редактора (со своими ID, цветами, прозрачностью, блендингом и слоями!)
     for (auto const& el : ai.customElements) {
         float worldX = originX + el.rx * spanW;
         float worldY = originY + el.ry * spanH;
         int cellGX = static_cast<int>(std::floor(worldX / 30.f));
         int cellGY = static_cast<int>(std::floor(worldY / 30.f));
 
-        if (contour.occupiedCells.count({ cellGX, cellGY }) > 0 || allowOverhang) {
-            GeneratedObjectSpec cs;
-            cs.objectId       = resolveAIElementObjectID(el.shapeType, cat);
-            cs.x              = std::clamp(worldX, originX + 4.f, originX + spanW - 4.f);
-            cs.y              = std::clamp(worldY, originY + 4.f, originY + spanH - 4.f);
-            cs.scaleX         = std::clamp(el.scaleX, 0.12f, 1.25f);
-            cs.scaleY         = std::clamp(el.scaleY, 0.12f, 1.25f);
-            cs.rotation       = el.rot;
-            cs.layerRole      = LayerRole::InnerDetail;
-            cs.colorSlot      = ColorSlot::CustomRGB;
-            cs.customColor    = el.color;
-            cs.customOpacity  = el.opacity;
-            cs.customBlending = el.blending;
-            cs.zOrder         = el.zOrder;
-            cs.priorityTier   = 0;
-            cs.noTouch        = true;
-            cs.noGlow         = true;
-            result.push_back(cs);
+        // Если клетка вне выделенного контура, а Overhang выключен — мягко притягиваем к ближайшей клетке внутри контура
+        if (contour.occupiedCells.count({ cellGX, cellGY }) == 0 && !allowOverhang && !contour.occupiedCells.empty()) {
+            float bestDistSq = 1e18f;
+            std::pair<int, int> bestCell = *contour.occupiedCells.begin();
+            for (auto const& c : contour.occupiedCells) {
+                float ccx = c.first * 30.f + 15.f;
+                float ccy = c.second * 30.f + 15.f;
+                float d2 = (ccx - worldX) * (ccx - worldX) + (ccy - worldY) * (ccy - worldY);
+                if (d2 < bestDistSq) {
+                    bestDistSq = d2;
+                    bestCell = c;
+                }
+            }
+            worldX = bestCell.first * 30.f + 15.f + std::clamp(worldX - (bestCell.first * 30.f + 15.f), -11.f, 11.f);
+            worldY = bestCell.second * 30.f + 15.f + std::clamp(worldY - (bestCell.second * 30.f + 15.f), -11.f, 11.f);
         }
+
+        // Если есть референс, подмешиваем точный цвет референса в этой координате, чтобы попадание было идеальным
+        ccColor3B finalBaseCol = el.color;
+        if (g_hasReferenceImage && g_referenceSampleGrid.size() >= static_cast<size_t>(g_referenceGridW * g_referenceGridH)) {
+            int rgx = std::clamp(static_cast<int>(std::clamp(el.rx, 0.f, 1.f) * g_referenceGridW), 0, g_referenceGridW - 1);
+            int rgy = std::clamp(static_cast<int>(std::clamp(el.ry, 0.f, 1.f) * g_referenceGridH), 0, g_referenceGridH - 1);
+            ccColor3B refCol = g_referenceSampleGrid[rgy * g_referenceGridW + rgx];
+            finalBaseCol = lerpColor(el.color, refCol, 0.45f);
+        }
+
+        GeneratedObjectSpec cs;
+        cs.objectId               = resolveAIElementObjectID(el, cat, true /* строго без 3D-блоков! */);
+        cs.x                      = std::clamp(worldX, originX - (allowOverhang ? 14.f : -2.f), originX + spanW + (allowOverhang ? 14.f : -2.f));
+        cs.y                      = std::clamp(worldY, originY - (allowOverhang ? 14.f : -2.f), originY + spanH + (allowOverhang ? 14.f : -2.f));
+        cs.scaleX                 = std::clamp(el.scaleX, 0.06f, 1.65f);
+        cs.scaleY                 = std::clamp(el.scaleY, 0.06f, 1.65f);
+        cs.rotation               = el.rot;
+        cs.layerRole              = LayerRole::InnerDetail;
+        cs.editorLayerOffset      = std::clamp(el.editorLayerOff, 0, 5);
+        cs.zLayerCode             = el.zLayerCode;
+        cs.zOrder                 = el.zOrder;
+        cs.colorSlot              = ColorSlot::CustomRGB;
+        cs.customColor            = finalBaseCol;
+        cs.customOpacity          = el.opacity;
+        cs.customBlending         = el.blending;
+        cs.hasSeparateDetailColor = el.hasDetailColor;
+        cs.detailColor            = el.detailColor;
+        cs.detailOpacity          = el.detailOpacity;
+        cs.detailBlending         = el.detailBlending;
+        cs.priorityTier           = 0; // Максимальный приоритет у объектов, выбранных самим ИИ!
+        cs.noTouch                = true;
+        cs.noGlow                 = true;
+        result.push_back(cs);
     }
 
     std::stable_sort(result.begin(), result.end(), [](GeneratedObjectSpec const& a, GeneratedObjectSpec const& b) {
@@ -1917,7 +2411,7 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
 }
 
 // ============================================================================
-// Спавн и отмена объектов в редакторе GD
+// Спавн и отмена объектов в редакторе GD (с поддержкой 6 подслоев и ZLayer)
 // ============================================================================
 static int clearLastPlacedObjects() {
     int removed = 0;
@@ -1951,13 +2445,13 @@ static SpawnSummary placeGeneratedArtInEditor(
     clearLastPlacedObjects();
 
     auto* editorLayer = ui->m_editorLayer;
-    summary.firstLayer = findFirstFreeEditorLayerBlock(editorLayer, 4);
+    summary.firstLayer = findFirstFreeEditorLayerBlock(editorLayer, 6);
 
     if (taskMode == AITaskMode::FullDecor || taskMode == AITaskMode::OnlyFill) {
         for (GameObject* baseObj : contour.solidObjects) {
             if (!baseObj) continue;
-            writeObjEditorLayers(baseObj, summary.firstLayer + static_cast<int>(LayerRole::Fill), 0);
-            writeObjFlags(baseObj, 0, false, true);
+            writeObjEditorLayers(baseObj, summary.firstLayer, 0);
+            writeObjFlags(baseObj, 0, -3, false, true);
             bindObjectToColor(baseObj, palette, ColorSlot::DarkFill, ccColor3B{ 0, 0, 0 });
         }
     }
@@ -1970,11 +2464,26 @@ static SpawnSummary placeGeneratedArtInEditor(
         obj->setFlipX(s.flipX);
         obj->setFlipY(s.flipY);
         writeObjScale(obj, s.scaleX, s.scaleY);
-        writeObjFlags(obj, s.zOrder, s.noTouch, s.noGlow);
+        writeObjFlags(obj, s.zOrder, s.zLayerCode, s.noTouch, s.noGlow);
 
-        int assignedLayer = summary.firstLayer + static_cast<int>(s.layerRole);
-        writeObjEditorLayers(obj, assignedLayer, 0);
-        bindObjectToColor(obj, palette, s.colorSlot, s.customColor, s.customOpacity, s.customBlending);
+        int layerOff = (s.editorLayerOffset > 0) ? s.editorLayerOffset : static_cast<int>(s.layerRole);
+        int assignedLayer = summary.firstLayer + layerOff;
+        // Назначаем основной слой редактора и второй вложенный слой (m_editorLayer2) для внутренних деталей блока
+        int secondaryLayer = (layerOff >= 1 && layerOff <= 3) ? (summary.firstLayer + 1) : 0;
+        writeObjEditorLayers(obj, assignedLayer, secondaryLayer);
+
+        bindObjectToColor(
+            obj,
+            palette,
+            s.colorSlot,
+            s.customColor,
+            s.customOpacity,
+            s.customBlending,
+            s.hasSeparateDetailColor,
+            s.detailColor,
+            s.detailOpacity,
+            s.detailBlending
+        );
 
         g_lastPlacedObjects.push_back(obj);
         summary.createdCount++;
@@ -2078,6 +2587,51 @@ static ccColor4F toColor4F(ccColor3B c, GLubyte alpha = 255) {
     return ccColor4F{ c.r / 255.f, c.g / 255.f, c.b / 255.f, alpha / 255.f };
 }
 
+static CCDrawNode* createSmoothGradientRoundedRect(
+    float width,
+    float height,
+    float radius,
+    ccColor4F topColor,
+    ccColor4F bottomColor
+) {
+    auto* dn = CCDrawNode::create();
+    float hw = width * 0.5f;
+    float hh = height * 0.5f;
+    float r = std::clamp(radius, 2.f, (std::min)(hw, hh));
+
+    int steps = 110;
+    float bandRadius = (height / static_cast<float>(steps)) * 0.85f + 0.8f;
+
+    for (int i = 0; i <= steps; ++i) {
+        float t = static_cast<float>(i) / static_cast<float>(steps); // 0 = вверху, 1 = внизу
+        float y = (hh - bandRadius) - t * (height - 2.f * bandRadius);
+
+        // Вычисляем точный отступ по X на скругленных углах сверху и снизу
+        float dyCorner = 0.f;
+        if (y > hh - r) {
+            dyCorner = y - (hh - r);
+        } else if (y < -hh + r) {
+            dyCorner = (-hh + r) - y;
+        }
+
+        float maxDy = (std::max)(0.f, r - bandRadius);
+        float clampedDy = (std::min)(dyCorner, maxDy);
+        float dxCorner = (maxDy > 0.01f) ? std::sqrt((std::max)(0.f, maxDy * maxDy - clampedDy * clampedDy)) : 0.f;
+        float halfSpanX = (hw - r) + dxCorner;
+        if (halfSpanX < 0.f) halfSpanX = 0.f;
+
+        ccColor4F rowCol{
+            topColor.r + (bottomColor.r - topColor.r) * t,
+            topColor.g + (bottomColor.g - topColor.g) * t,
+            topColor.b + (bottomColor.b - topColor.b) * t,
+            topColor.a + (bottomColor.a - topColor.a) * t
+        };
+
+        dn->drawSegment(CCPoint{ -halfSpanX, y }, CCPoint{ halfSpanX, y }, bandRadius, rowCol);
+    }
+    return dn;
+}
+
 static CCMenuItemSpriteExtra* createSolidButton(
     float width,
     float height,
@@ -2170,44 +2724,58 @@ protected:
 
         if constexpr (requires { this->m_bgSprite; }) {
             if (this->m_bgSprite) {
-                this->m_bgSprite->setOpacity(0);
+                this->m_bgSprite->setVisible(false);
+                this->m_bgSprite->setScale(0.f);
             }
         }
 
         auto size = m_mainLayer->getContentSize();
         auto center = CCPoint{ size.width / 2.f, size.height / 2.f };
 
-        // 1. По-настоящему сглаженный внешний каркас меню (векторные дуги CCDrawNode)
-        auto* outerRoundedFrame = createSmoothRoundedRect(size.width, size.height, 20.f, toColor4F(ccColor3B{ 72, 22, 28 }, 255));
+        // 1. Возвращаем мягкое многослойное СВЕЧЕНИЕ (ореол) вокруг округленного каркаса меню!
+        auto* frameGlowOuter = createSmoothRoundedRect(
+            size.width + 18.f, size.height + 18.f, 34.f,
+            toColor4F(ccColor3B{ 155, 22, 38 }, 55)
+        );
+        frameGlowOuter->setPosition(center);
+        frameGlowOuter->setZOrder(-6);
+        m_mainLayer->addChild(frameGlowOuter);
+
+        auto* frameGlowMid = createSmoothRoundedRect(
+            size.width + 10.f, size.height + 10.f, 30.f,
+            toColor4F(ccColor3B{ 205, 34, 56 }, 105)
+        );
+        frameGlowMid->setPosition(center);
+        frameGlowMid->setZOrder(-5);
+        m_mainLayer->addChild(frameGlowMid);
+
+        // 2. Ярко выраженный ОКРУГЛЕННЫЙ каркас меню (радиус 26px) со светящимся кантом
+        auto* outerRoundedFrame = createSmoothRoundedRect(
+            size.width + 2.f, size.height + 2.f, 26.f,
+            toColor4F(ccColor3B{ 235, 55, 82 }, 255)
+        );
         outerRoundedFrame->setPosition(center);
         outerRoundedFrame->setZOrder(-4);
         m_mainLayer->addChild(outerRoundedFrame);
 
-        auto* innerRoundedShell = createSmoothRoundedRect(size.width - 6.f, size.height - 6.f, 18.f, toColor4F(ccColor3B{ 12, 8, 10 }, 255));
+        auto* innerRoundedShell = createSmoothRoundedRect(
+            size.width - 4.f, size.height - 4.f, 24.f,
+            toColor4F(ccColor3B{ 14, 8, 11 }, 255)
+        );
         innerRoundedShell->setPosition(center);
         innerRoundedShell->setZOrder(-3);
         m_mainLayer->addChild(innerRoundedShell);
 
-        // 2. Градиентная красно-черная подложка (image_b5b63a.png), обрезанная по сглаженному
-        //    скругленному контуру через CCClippingNode, строго под всеми кнопками и панелями
-        auto* gradStencil = createSmoothRoundedRect(size.width - 10.f, size.height - 10.f, 16.f, ccColor4F{ 1.f, 1.f, 1.f, 1.f });
-        gradStencil->setPosition(center);
-
-        auto* gradClip = CCClippingNode::create(gradStencil);
-        gradClip->setAlphaThreshold(0.05f);
-        gradClip->setZOrder(-2);
-
-        auto* frameGradient = CCLayerGradient::create(
-            ccColor4B{ 68, 7, 10, 235 },
-            ccColor4B{ 4, 2, 3, 245 },
-            CCPoint{ 0.f, -1.f }
+        // 3. Скругленная градиентная красно-черная подложка (image_b5b63a.png),
+        //    лежащая строго на каркасе меню под всеми кнопками (без прямых углов 90 градусов!)
+        auto* frameGradient = createSmoothGradientRoundedRect(
+            size.width - 10.f, size.height - 10.f, 22.f,
+            toColor4F(ccColor3B{ 78, 9, 14 }, 255),
+            toColor4F(ccColor3B{ 5, 2, 4 }, 255)
         );
-        frameGradient->setContentSize(CCSize{ size.width - 10.f, size.height - 10.f });
-        frameGradient->ignoreAnchorPointForPosition(false);
-        frameGradient->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
         frameGradient->setPosition(center);
-        gradClip->addChild(frameGradient);
-        m_mainLayer->addChild(gradClip);
+        frameGradient->setZOrder(-2);
+        m_mainLayer->addChild(frameGradient);
 
         if (m_stage == PopupStage::ApiGate) {
             setupStrictApiGateUI(center);
@@ -2583,13 +3151,17 @@ protected:
             m_buttonMenu->addChild(btn);
         };
 
-        addExampleChip("Stone snow", CCPoint{ leftX - 84.f, center.y - 88.f }, menu_selector(AIDecorPopup::onPresetStoneSnow));
-        addExampleChip("Tree glow",  CCPoint{ leftX - 28.f, center.y - 88.f }, menu_selector(AIDecorPopup::onPresetTreeGlow));
-        addExampleChip("Crystal",    CCPoint{ leftX + 28.f, center.y - 88.f }, menu_selector(AIDecorPopup::onPresetCrystal));
-        addExampleChip("Only 3D",    CCPoint{ leftX + 84.f, center.y - 88.f }, menu_selector(AIDecorPopup::onPresetOnly3D));
+        addExampleChip("+ Ref Image", CCPoint{ leftX - 84.f, center.y - 88.f }, menu_selector(AIDecorPopup::onAttachReferenceImage));
+        addExampleChip("Clear Ref",   CCPoint{ leftX - 28.f, center.y - 88.f }, menu_selector(AIDecorPopup::onClearReferenceImage));
+        addExampleChip("New Style",   CCPoint{ leftX + 28.f, center.y - 88.f }, menu_selector(AIDecorPopup::onPresetUniqueNewStyle));
+        addExampleChip("Build Ref",   CCPoint{ leftX + 84.f, center.y - 88.f }, menu_selector(AIDecorPopup::onPresetBuildFromRef));
 
-        // По-настоящему сглаженная округленная строка ввода сообщения ИИ (pill)
-        auto* inputGlowOuter = createSmoothRoundedRect(196.f, 30.f, 15.f, toColor4F(ccColor3B{ 125, 205, 255 }, 180));
+        // По-настоящему сглаженная округленная строка ввода сообщения ИИ (pill) со свечением
+        auto* inputSoftHalo = createSmoothRoundedRect(202.f, 34.f, 17.f, toColor4F(ccColor3B{ 105, 195, 255 }, 95));
+        inputSoftHalo->setPosition(CCPoint{ leftX - 15.f, center.y - 116.f });
+        m_mainLayer->addChild(inputSoftHalo);
+
+        auto* inputGlowOuter = createSmoothRoundedRect(196.f, 30.f, 15.f, toColor4F(ccColor3B{ 145, 220, 255 }, 235));
         inputGlowOuter->setPosition(CCPoint{ leftX - 15.f, center.y - 116.f });
         m_mainLayer->addChild(inputGlowOuter);
 
@@ -2744,8 +3316,9 @@ protected:
             intro.isUser = false;
             intro.lines = wrapTextLines(
                 fmt::format(
-                    "Agent: Tell me what to draw on the {} selected blocks ({}x{}). You can scroll up anytime!",
-                    m_contour.cellCount(), m_contour.widthUnits(), m_contour.heightUnits()
+                    "Agent: {} blocks ({}x{}). Ref: {}. I build 100% custom layered art (no 3D presets) & self-verify match!",
+                    m_contour.cellCount(), m_contour.widthUnits(), m_contour.heightUnits(),
+                    g_hasReferenceImage ? g_referenceFileName : "none (click '+ Ref Image')"
                 ),
                 36, 4
             );
@@ -3048,18 +3621,56 @@ protected:
     void onSelectInside(CCObject*)   { g_overhangAllowed = false; refreshRightPanelTabsAndCanvas(); }
     void onSelectOverhang(CCObject*) { g_overhangAllowed = true;  refreshRightPanelTabsAndCanvas(); }
 
-    void onPresetStoneSnow(CCObject*) { m_inputBuffer = "Stone with snow and icy glow"; refreshInputLabel(); onSendToNeuralNet(nullptr); }
-    void onPresetTreeGlow(CCObject*)  { m_inputBuffer = "Tree with neon glow and leaves"; refreshInputLabel(); onSendToNeuralNet(nullptr); }
-    void onPresetCrystal(CCObject*)   { m_inputBuffer = "Glowing crystal structure"; refreshInputLabel(); onSendToNeuralNet(nullptr); }
-    void onPresetOnly3D(CCObject*)    { m_inputBuffer = "sdelay 3d"; refreshInputLabel(); onSendToNeuralNet(nullptr); }
+    void onAttachReferenceImage(CCObject*) {
+        std::string statusMsg;
+        if (pickReferenceImageDialog(statusMsg)) {
+            g_chatHistory.push_back({ "assistant", "Reference attached: " + g_referenceFileName + ". Write a prompt or click 'Build Ref' and I will recreate it with self-verification!" });
+            if (m_stepPlanLabel) m_stepPlanLabel->setString("Ref: loaded");
+        } else if (statusMsg != "Selection cancelled") {
+            g_chatHistory.push_back({ "assistant", "Ref load info: " + statusMsg });
+        }
+        rebuildChatScrollFeed();
+        refreshRightPanelTabsAndCanvas();
+    }
+
+    void onClearReferenceImage(CCObject*) {
+        g_hasReferenceImage = false;
+        g_referenceFilePath.clear();
+        g_referenceFileName.clear();
+        g_referenceBase64.clear();
+        g_referenceSampleGrid.clear();
+        g_chatHistory.push_back({ "assistant", "Reference cleared. Next builds will invent 100% brand-new non-repeating styles!" });
+        if (m_stepPlanLabel) m_stepPlanLabel->setString("Ref: cleared");
+        rebuildChatScrollFeed();
+        refreshRightPanelTabsAndCanvas();
+    }
+
+    void onPresetUniqueNewStyle(CCObject*) {
+        g_variantIndex++;
+        m_inputBuffer = fmt::format("Invent a completely new never-before-seen custom block decor (variant #{}) with rich internal sub-layers and transparency", g_variantIndex);
+        refreshInputLabel();
+        onSendToNeuralNet(nullptr);
+    }
+
+    void onPresetBuildFromRef(CCObject*) {
+        if (g_hasReferenceImage) {
+            m_inputBuffer = "Recreate the attached reference image on the selected contour with 100% accuracy, multi-layer colors, and opacity";
+        } else {
+            m_inputBuffer = "Create a completely new unique multi-layered art style with internal block layers and glow";
+        }
+        refreshInputLabel();
+        onSendToNeuralNet(nullptr);
+    }
 
     void onAnotherVariantClicked(CCObject*) {
-        if (g_lastBuildPrompt.empty()) {
-            m_inputBuffer = "Create a unique new block design variant";
-        } else {
-            m_inputBuffer = g_lastBuildPrompt;
-        }
         g_variantIndex++;
+        if (g_hasReferenceImage) {
+            m_inputBuffer = fmt::format("Refine and improve the part to match the reference image even closer (variant #{})", g_variantIndex);
+        } else if (g_lastBuildPrompt.empty()) {
+            m_inputBuffer = fmt::format("Invent a completely new non-repeating block design style (variant #{})", g_variantIndex);
+        } else {
+            m_inputBuffer = fmt::format("{} (invent a brand-new non-repeating variation #{})", g_lastBuildPrompt, g_variantIndex);
+        }
         onSendToNeuralNet(nullptr);
     }
 
@@ -3071,14 +3682,23 @@ protected:
         restoreLockedContourPositions();
 
         std::string promptText = trimWhitespace(m_inputBuffer);
-        if (promptText.empty()) return;
+        if (promptText.empty()) {
+            if (g_hasReferenceImage) {
+                promptText = "Recreate the attached reference image on the selected contour with maximum accuracy";
+            } else {
+                return;
+            }
+        }
 
         m_inputBuffer.clear();
         refreshInputLabel();
 
+        EditorTabCatalog catalog = loadEditorTabCatalog(m_editorUI);
+
         AIDecisionResult ai = queryRealNeuralNetwork(
             promptText,
             m_contour,
+            catalog,
             g_objectLimit,
             g_overhangAllowed,
             g_variantIndex
@@ -3115,7 +3735,6 @@ protected:
 
         g_lastBuildPrompt = promptText;
         std::mt19937 rng(std::random_device{}());
-        EditorTabCatalog catalog = loadEditorTabCatalog(m_editorUI);
         StylePalette palette = buildPaletteFromAIDecision(ai);
 
         auto specs = generateArtFromAIDecision(
@@ -3135,14 +3754,23 @@ protected:
         m_previewTab = 1;
         refreshRightPanelTabsAndCanvas();
 
-        if (m_stepPlanLabel)    m_stepPlanLabel->setString("Plan: done");
-        if (m_stepDrawingLabel) m_stepDrawingLabel->setString("Draw: done");
+        if (m_stepPlanLabel) {
+            std::string pStr = fmt::format("Match: {}%", ai.selfMatchScore);
+            m_stepPlanLabel->setString(pStr.c_str());
+        }
+        if (m_stepDrawingLabel) {
+            std::string dStr = fmt::format("Pass: {}x", ai.refinementPasses);
+            m_stepDrawingLabel->setString(dStr.c_str());
+        }
         if (m_stepPlaceLabel) {
-            std::string plStr = fmt::format("Place: {} (L{})", summary.createdCount, summary.firstLayer);
+            std::string plStr = fmt::format("Obj: {} (L{})", summary.createdCount, summary.firstLayer);
             m_stepPlaceLabel->setString(plStr.c_str());
         }
         if (m_previewSubInfoLabel) {
-            std::string subStr = fmt::format("Covers 100% of the shape  |  {} objects", summary.createdCount);
+            std::string subStr = fmt::format(
+                "Match {}% ({} pass) | {} objs | Layers L{}..L{}",
+                ai.selfMatchScore, ai.refinementPasses, summary.createdCount, summary.firstLayer, summary.firstLayer + 5
+            );
             m_previewSubInfoLabel->setString(subStr.c_str());
         }
     }
