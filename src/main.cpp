@@ -529,7 +529,7 @@ static bool performWinHttpRequest(
     }
 
     if (pSetTimeouts) {
-        pSetTimeouts(hSession, 6000, 6000, 10000, 22000);
+        pSetTimeouts(hSession, 10000, 10000, 15000, 60000);
     }
 
     HINTERNET_T hConnect = pConnect(hSession, hostW, 443, 0);
@@ -1227,6 +1227,7 @@ static int evaluateReferenceSimilarityScore(AIDecisionResult const& res, std::st
 static bool executeSingleNeuralNetPass(
     std::string const& systemRule,
     std::string const& userTurnPrompt,
+    bool includeImage,
     AIDecisionResult& outRes
 ) {
     int httpStatus = 0;
@@ -1243,7 +1244,7 @@ static bool executeSingleNeuralNetPass(
         combinedPrompt += "User request: " + userTurnPrompt;
 
         std::string partsJson;
-        if (g_hasReferenceImage && !g_referenceBase64.empty()) {
+        if (includeImage && g_hasReferenceImage && !g_referenceBase64.empty()) {
             partsJson = fmt::format(
                 "{{\"inline_data\":{{\"mime_type\":\"{}\",\"data\":\"{}\"}}}},{{\"text\":\"{}\"}}",
                 g_referenceMimeType,
@@ -1266,14 +1267,23 @@ static bool executeSingleNeuralNetPass(
         }
 
         bool ok = false;
-        for (auto const& modName : candidateModels) {
+        for (size_t mIdx = 0; mIdx < candidateModels.size(); ++mIdx) {
+            auto const& modName = candidateModels[mIdx];
             std::wstring pathW = L"/v1beta/models/" + utf8ToWideASCII(modName) + L":generateContent";
             std::wstring hdrW  = L"Content-Type: application/json\r\nx-goog-api-key: " + utf8ToWideASCII(g_connectedApiKey) + L"\r\n";
-            if (performWinHttpRequest(L"POST", kApiProviders[0].hostW, pathW, hdrW, geminiBody, httpStatus, rawResp, errText)) {
-                ok = true;
-                break;
+            for (int attempt = 0; attempt < 2; ++attempt) {
+                if (performWinHttpRequest(L"POST", kApiProviders[0].hostW, pathW, hdrW, geminiBody, httpStatus, rawResp, errText)) {
+                    ok = true;
+                    break;
+                }
+                bool retryable = (httpStatus == 0 || httpStatus == 429 || httpStatus == 500 || httpStatus == 502 || httpStatus == 503 || httpStatus == 504);
+                if (!retryable) break;
+#ifdef GEODE_IS_WINDOWS
+                // non-blocking fast model switch
+#endif
             }
-            if (httpStatus != 404 && httpStatus != 429) break;
+            if (ok) break;
+            if (httpStatus != 0 && httpStatus != 404 && httpStatus != 429 && httpStatus != 500 && httpStatus != 503) break;
         }
 
         if (!ok) {
@@ -1303,7 +1313,7 @@ static bool executeSingleNeuralNetPass(
             candidateModels.push_back(kApiProviders[g_apiProviderIndex].models[m].modelId);
         }
 
-        if (g_hasReferenceImage && !g_referenceBase64.empty() && (g_apiProviderIndex == 1 || g_apiProviderIndex == 4)) {
+        if (includeImage && g_hasReferenceImage && !g_referenceBase64.empty() && (g_apiProviderIndex == 1 || g_apiProviderIndex == 4)) {
             std::string dataUri = "data:" + g_referenceMimeType + ";base64," + g_referenceBase64;
             std::string visionMessages = messagesJson + fmt::format(
                 ",{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}},{{\"type\":\"image_url\",\"image_url\":{{\"url\":\"{}\"}}}}]}}",
@@ -1331,11 +1341,19 @@ static bool executeSingleNeuralNetPass(
                     modName,
                     textMessages
                 );
-                if (performWinHttpRequest(L"POST", kApiProviders[g_apiProviderIndex].hostW, kApiProviders[g_apiProviderIndex].chatPathW, hdrW, payload, httpStatus, rawResp, errText)) {
-                    sentOk = true;
-                    break;
+                for (int attempt = 0; attempt < 2; ++attempt) {
+                    if (performWinHttpRequest(L"POST", kApiProviders[g_apiProviderIndex].hostW, kApiProviders[g_apiProviderIndex].chatPathW, hdrW, payload, httpStatus, rawResp, errText)) {
+                        sentOk = true;
+                        break;
+                    }
+                    bool retryable = (httpStatus == 0 || httpStatus == 429 || httpStatus == 500 || httpStatus == 502 || httpStatus == 503 || httpStatus == 504);
+                    if (!retryable) break;
+#ifdef GEODE_IS_WINDOWS
+                    // non-blocking fast model switch
+#endif
                 }
-                if (httpStatus != 404 && httpStatus != 400 && httpStatus != 429) break;
+                if (sentOk) break;
+                if (httpStatus != 0 && httpStatus != 404 && httpStatus != 400 && httpStatus != 429 && httpStatus != 500 && httpStatus != 503) break;
             }
         }
 
@@ -1390,6 +1408,17 @@ static bool executeSingleNeuralNetPass(
     }
     return true;
 }
+
+// Состояние фонового запроса и авто-повтора каждые 2 секунды при ошибке (503 / 429 / нет сети)
+static bool g_aiRequestThreadRunning = false;
+static bool g_aiRequestHasCompleted = false;
+static AIDecisionResult g_aiThreadResult;
+static std::string g_pendingRetryPrompt;
+static bool g_autoRetryTimerActive = false;
+static float g_autoRetryCountdown = 0.0f;
+static int g_autoRetryAttemptCount = 0;
+static float g_floatingDotsTimer = 0.0f;
+static int g_floatingDotsPhase = 0;
 
 // Запрос к реальной нейросети с АВТОМАТИЧЕСКИМ ЦИКЛОМ САМООЦЕНКИ И ПЕРЕДЕЛКИ ПОД РЕФЕРЕНС
 static AIDecisionResult queryRealNeuralNetwork(
@@ -1450,7 +1479,7 @@ static AIDecisionResult queryRealNeuralNetwork(
     );
 
     AIDecisionResult bestRes;
-    if (!executeSingleNeuralNetPass(systemRule, userMessage, bestRes)) {
+    if (!executeSingleNeuralNetPass(systemRule, userMessage, true, bestRes)) {
         return bestRes;
     }
 
@@ -1481,7 +1510,7 @@ static AIDecisionResult queryRealNeuralNetwork(
             );
 
             AIDecisionResult refinedRes;
-            if (executeSingleNeuralNetPass(systemRule, critiquePrompt, refinedRes) &&
+            if (executeSingleNeuralNetPass(systemRule, critiquePrompt, false, refinedRes) &&
                 refinedRes.httpSuccess &&
                 refinedRes.taskMode == AITaskMode::FullDecor &&
                 !refinedRes.customElements.empty()) {
@@ -1519,8 +1548,7 @@ static AIDecisionResult queryRealNeuralNetwork(
         finalBotMsg += fmt::format(" [Match: {}% | Passes: {}]", bestRes.selfMatchScore, bestRes.refinementPasses);
     }
 
-    g_chatHistory.push_back({ "user", userMessage });
-    g_chatHistory.push_back({ "assistant", finalBotMsg });
+    bestRes.replyText = finalBotMsg;
     return bestRes;
 }
 
@@ -2620,8 +2648,10 @@ static CCSprite* createSmoothGradientRoundedRect(
     ccColor4F topColor,
     ccColor4F bottomColor
 ) {
-    int texW = std::clamp(static_cast<int>(std::lround(width * 2.0f)), 8, 1024);
-    int texH = std::clamp(static_cast<int>(std::lround(height * 2.0f)), 8, 640);
+    // Генерируем текстуру с запасом четкости (2x) и компенсируем CCDirector::getContentScaleFactor(),
+    // чтобы в GD на High/Medium/Low текстурах размер панели на 100% совпадал с width x height!
+    int texW = std::clamp(static_cast<int>(std::lround(width * 2.0f)), 8, 1200);
+    int texH = std::clamp(static_cast<int>(std::lround(height * 2.0f)), 8, 800);
     float radPx = std::clamp(radius * 2.0f, 2.0f, (std::min)(texW, texH) * 0.5f);
 
     std::vector<uint8_t> rgba(static_cast<size_t>(texW * texH * 4), 0);
@@ -2679,8 +2709,11 @@ static CCSprite* createSmoothGradientRoundedRect(
         tex->autorelease();
         auto* spr = CCSprite::createWithTexture(tex);
         if (spr) {
-            spr->setScaleX(width / static_cast<float>(texW));
-            spr->setScaleY(height / static_cast<float>(texH));
+            CCSize ptsSize = spr->getContentSize();
+            float curW = (ptsSize.width > 0.01f) ? ptsSize.width : static_cast<float>(texW);
+            float curH = (ptsSize.height > 0.01f) ? ptsSize.height : static_cast<float>(texH);
+            spr->setScaleX(width / curW);
+            spr->setScaleY(height / curH);
             return spr;
         }
     } else {
@@ -3745,6 +3778,32 @@ protected:
         this->onClose(nullptr);
     }
 
+    void launchAsyncAIWorker(std::string const& promptToRun) {
+        if (g_aiRequestThreadRunning) return;
+        g_aiRequestThreadRunning = true;
+        g_aiRequestHasCompleted = false;
+
+        ContourAnalysis contourCopy = m_contour;
+        EditorTabCatalog catalogCopy = loadEditorTabCatalog(m_editorUI);
+        int limCopy = g_objectLimit;
+        bool ovhCopy = g_overhangAllowed;
+        int varCopy = g_variantIndex;
+
+        std::thread([promptToRun, contourCopy, catalogCopy, limCopy, ovhCopy, varCopy]() {
+            AIDecisionResult res = queryRealNeuralNetwork(
+                promptToRun,
+                contourCopy,
+                catalogCopy,
+                limCopy,
+                ovhCopy,
+                varCopy
+            );
+            g_aiThreadResult = std::move(res);
+            g_aiRequestHasCompleted = true;
+            g_aiRequestThreadRunning = false;
+        }).detach();
+    }
+
     void onSendToNeuralNet(CCObject*) {
         restoreLockedContourPositions();
 
@@ -3760,25 +3819,65 @@ protected:
         m_inputBuffer.clear();
         refreshInputLabel();
 
-        EditorTabCatalog catalog = loadEditorTabCatalog(m_editorUI);
+        // Запоминаем написанное сообщение для авто-повтора раз в 2 секунды при сбое!
+        g_pendingRetryPrompt = promptText;
+        g_autoRetryTimerActive = false;
+        g_autoRetryAttemptCount = 0;
 
-        AIDecisionResult ai = queryRealNeuralNetwork(
-            promptText,
-            m_contour,
-            catalog,
-            g_objectLimit,
-            g_overhangAllowed,
-            g_variantIndex
-        );
+        g_floatingDotsTimer = 0.0f;
+        g_floatingDotsPhase = 0;
 
+        g_chatHistory.push_back({ "user", promptText });
+        g_chatHistory.push_back({ "assistant", " .  " });
+        rebuildChatScrollFeed();
+
+        if (m_stepPlanLabel)    m_stepPlanLabel->setString("Plan: ...");
+        if (m_stepDrawingLabel) m_stepDrawingLabel->setString("Draw: ...");
+
+        launchAsyncAIWorker(promptText);
+    }
+
+    void handleCompletedAIResult(AIDecisionResult const& ai) {
         if (!ai.httpSuccess) {
-            g_chatHistory.push_back({ "user", promptText });
-            g_chatHistory.push_back({ "assistant", ai.replyText });
+            g_autoRetryAttemptCount++;
+
+            // Если прошло меньше 10 попыток — НЕ показываем ошибку игроку!
+            // Оставляем только плавающие 3 точки и переотправляем сообщение через 2 секунды
+            if (g_autoRetryAttemptCount < 10) {
+                g_autoRetryTimerActive = true;
+                g_autoRetryCountdown = 2.0f;
+
+                // Тихо переключаем на следующую доступную модель, чтобы обойти 503/429
+                g_selectedModelIndex[g_apiProviderIndex] = (g_selectedModelIndex[g_apiProviderIndex] + 1) % 4;
+                return;
+            }
+
+            // Только если за 10 попыток так и не получилось загрузить ответ — показываем ошибку!
+            g_autoRetryTimerActive = false;
+            g_autoRetryAttemptCount = 0;
+
+            std::string finalErrMsg = fmt::format("Failed after 10 attempts: {}", ai.replyText);
+            if (!g_chatHistory.empty() && g_chatHistory.back().role == "assistant") {
+                g_chatHistory.back().content = finalErrMsg;
+            } else {
+                g_chatHistory.push_back({ "assistant", finalErrMsg });
+            }
             rebuildChatScrollFeed();
-            if (m_stepPlanLabel) m_stepPlanLabel->setString("Plan: error");
+
+            if (m_stepPlanLabel)    m_stepPlanLabel->setString("Plan: error");
+            if (m_stepDrawingLabel) m_stepDrawingLabel->setString("Draw: failed");
             return;
         }
 
+        // УСПЕХ! Выключаем таймер авто-повтора и обновляем ответ ИИ в чате
+        g_autoRetryTimerActive = false;
+        g_autoRetryAttemptCount = 0;
+
+        if (!g_chatHistory.empty() && g_chatHistory.back().role == "assistant") {
+            g_chatHistory.back().content = ai.replyText;
+        } else {
+            g_chatHistory.push_back({ "assistant", ai.replyText });
+        }
         rebuildChatScrollFeed();
 
         if (ai.taskMode == AITaskMode::ChatOnly) {
@@ -3800,8 +3899,9 @@ protected:
             return;
         }
 
-        g_lastBuildPrompt = promptText;
+        g_lastBuildPrompt = g_pendingRetryPrompt;
         std::mt19937 rng(std::random_device{}());
+        EditorTabCatalog catalog = loadEditorTabCatalog(m_editorUI);
         StylePalette palette = buildPaletteFromAIDecision(ai);
 
         auto specs = generateArtFromAIDecision(
@@ -3842,8 +3942,45 @@ protected:
         }
     }
 
-    void updateKeyboardAndLock(float) {
+    void updateKeyboardAndLock(float dt) {
         restoreLockedContourPositions();
+
+        // 1. Проверяем завершение фонового запроса к ИИ
+        if (g_aiRequestHasCompleted) {
+            g_aiRequestHasCompleted = false;
+            handleCompletedAIResult(g_aiThreadResult);
+        }
+
+        // 2. Анимация плавающих 3 точек в чате, пока сообщение грузится или тихо переотправляется (до 10 попыток)
+        if (g_aiRequestThreadRunning || g_autoRetryTimerActive) {
+            g_floatingDotsTimer += dt;
+            if (g_floatingDotsTimer >= 0.32f) {
+                g_floatingDotsTimer = 0.0f;
+                g_floatingDotsPhase = (g_floatingDotsPhase + 1) % 4;
+                static constexpr const char* kFloatingDotsFrames[4] = {
+                    " .  ",
+                    " .. ",
+                    " ...",
+                    "  .."
+                };
+                if (!g_chatHistory.empty() && g_chatHistory.back().role == "assistant") {
+                    g_chatHistory.back().content = kFloatingDotsFrames[g_floatingDotsPhase];
+                    rebuildChatScrollFeed();
+                }
+                if (m_stepPlanLabel) {
+                    m_stepPlanLabel->setString(kFloatingDotsFrames[g_floatingDotsPhase]);
+                }
+            }
+        }
+
+        // 3. Тихий авто-повтор написанного сообщения каждые 2 секунды (без показа ошибок до 10-й попытки!)
+        if (g_autoRetryTimerActive && !g_aiRequestThreadRunning && !g_pendingRetryPrompt.empty()) {
+            g_autoRetryCountdown -= dt;
+            if (g_autoRetryCountdown <= 0.0f) {
+                g_autoRetryTimerActive = false;
+                launchAsyncAIWorker(g_pendingRetryPrompt);
+            }
+        }
 
         // Проверяем завершение фонового диалога выбора картинки-референса
         if (g_fileDialogHasResult) {
