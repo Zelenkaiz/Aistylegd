@@ -57,6 +57,12 @@ enum class AITaskMode {
     UndoLast = 5    // ИИ убирает последнюю постройку
 };
 
+enum class PopupStage : int {
+    ApiGate = 0,       // Окно проверки и ввода API-ключа
+    ArtAgentMain = 1,  // Главное окно Art Agent (Чат + Превью Shape/Drawing/In GD)
+    ModelSelector = 2  // Отдельное окошко выбора актуальной модели ИИ
+};
+
 struct StylePalette {
     ccColor3B masterColor{ 115, 255, 28 };
     ccColor3B slotColors[6];
@@ -123,14 +129,13 @@ struct GeneratedObjectSpec {
     bool isOverhang = false;
 };
 
-// Элемент кастомного векторного/блочного рисунка, сгенерированный самой ИИ-нейросетью
 struct AICustomDrawElement {
-    float rx = 0.5f;     // Относительная позиция X внутри формы (0.0 .. 1.0)
-    float ry = 0.5f;     // Относительная позиция Y внутри формы (0.0 .. 1.0)
-    float scaleX = 0.5f; // Масштаб X
-    float scaleY = 0.5f; // Масштаб Y
-    float rot = 0.f;     // Поворот в градусах
-    int shapeType = 0;   // 0=block(211), 1=circle, 2=triangle, 3=glow(1888), 4=grass(406), 5=brick, 6=eye, 7=skull, 8=arc, 9=line, 10=chain
+    float rx = 0.5f;
+    float ry = 0.5f;
+    float scaleX = 0.5f;
+    float scaleY = 0.5f;
+    float rot = 0.f;
+    int shapeType = 0;
     ccColor3B color{ 255, 255, 255 };
     GLubyte opacity = 255;
     bool blending = false;
@@ -155,7 +160,7 @@ struct AIDecisionResult {
     bool wantBrickPattern = false;
     bool wantCrystalPattern = false;
     bool wantTreePattern = false;
-    int emblemType = 0; // 0=auto, 1=eye, 2=skull, 3=circle, 4=arch, 5=none
+    int emblemType = 0;
     int patternStyle = 0;
     int suggestedCount = 120;
     std::vector<AICustomDrawElement> customElements;
@@ -171,7 +176,6 @@ static std::vector<GeneratedObjectSpec> g_lastPreviewSpecs;
 static StylePalette g_lastPreviewPalette;
 static bool g_hasGeneratedArt = false;
 
-// История диалога для контекста нейросети
 struct ChatTurnRecord {
     std::string role;
     std::string content;
@@ -204,7 +208,6 @@ static std::string utf8ToGDReadable(std::string const& input) {
             ++i;
             continue;
         }
-        // Кириллица в UTF-8 (D0 80..BF, D1 80..BF)
         if ((c == 0xD0 || c == 0xD1) && (i + 1 < input.size())) {
             unsigned char c2 = static_cast<unsigned char>(input[i + 1]);
             int code = ((c & 0x1F) << 6) | (c2 & 0x3F);
@@ -248,7 +251,6 @@ static std::string utf8ToGDReadable(std::string const& input) {
             }
             continue;
         }
-        // Пропускаем прочие многобайтовые последовательности
         if ((c & 0xE0) == 0xC0) i += 2;
         else if ((c & 0xF0) == 0xE0) i += 3;
         else if ((c & 0xF8) == 0xF0) i += 4;
@@ -257,7 +259,7 @@ static std::string utf8ToGDReadable(std::string const& input) {
     return out;
 }
 
-static std::vector<std::string> wrapTextLines(std::string const& rawText, size_t maxCharsPerLine, size_t maxLines = 4) {
+static std::vector<std::string> wrapTextLines(std::string const& rawText, size_t maxCharsPerLine, size_t maxLines = 3) {
     std::string clean = utf8ToGDReadable(rawText);
     for (char& c : clean) {
         if (c == '\n' || c == '\r' || c == '\t') c = ' ';
@@ -289,31 +291,113 @@ static std::vector<std::string> wrapTextLines(std::string const& rawText, size_t
 }
 
 // ============================================================================
-// Провайдеры ИИ и РЕАЛЬНЫЕ HTTPS-запросы через системный winhttp.dll Windows
+// ТОЛЬКО АКТУАЛЬНЫЕ ПОДДЕРЖИВАЕМЫЕ МОДЕЛИ ИИ (Проверены на ноябрь 2026,
+// устаревшие/отключенные модели исключены!)
 // ============================================================================
-struct ApiProviderPreset {
-    const char* name;
-    const wchar_t* hostW;
-    const wchar_t* pathW;
-    const char* defaultModel;
+struct AIModelEntry {
+    const char* modelId;
+    const char* displayTitle;
+    const char* badgeDesc;
 };
 
-static constexpr ApiProviderPreset kApiProviders[] = {
-    { "OpenAI",     L"api.openai.com",                        L"/v1/chat/completions",              "gpt-4o-mini" },
-    { "Gemini",     L"generativelanguage.googleapis.com",     L"/v1beta/openai/chat/completions",   "gemini-2.5-flash" },
-    { "DeepSeek",   L"api.deepseek.com",                      L"/chat/completions",                 "deepseek-chat" },
-    { "Groq",       L"api.groq.com",                          L"/openai/v1/chat/completions",       "llama-3.3-70b-versatile" },
-    { "OpenRouter", L"openrouter.ai",                         L"/api/v1/chat/completions",          "openai/gpt-4o-mini" }
+struct ApiProviderConfig {
+    const char* name;
+    const wchar_t* hostW;
+    const wchar_t* chatPathW;
+    const wchar_t* modelsListPathW;
+    bool isGeminiNative;
+    AIModelEntry models[4];
+};
+
+static constexpr ApiProviderConfig kApiProviders[5] = {
+    // 0: Google Gemini (используем нативный v1beta/models/...:generateContent без ошибки 404!)
+    {
+        "Gemini",
+        L"generativelanguage.googleapis.com",
+        L"/v1beta/models/",
+        L"/v1beta/models",
+        true,
+        {
+            { "gemini-flash-latest",   "Gemini Flash Latest",     "Always active auto-alias (Recommended)" },
+            { "gemini-3.8-flash",      "Gemini 3.8 Flash",        "Latest flagship high-speed model" },
+            { "gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite",   "Ultra-fast low-latency model" },
+            { "gemini-2.5-flash-lite", "Gemini 2.5 Flash-Lite",   "Stable long-term supported model" }
+        }
+    },
+    // 1: OpenAI (только актуальная линейка GPT-6 и активный GPT-4o Mini; отключенные GPT-5/o3-mini убраны)
+    {
+        "OpenAI",
+        L"api.openai.com",
+        L"/v1/chat/completions",
+        L"/v1/models",
+        false,
+        {
+            { "gpt-6-luna",    "GPT-6 Luna",    "Fastest & most efficient OpenAI model" },
+            { "gpt-6.1-terra", "GPT-6.1 Terra", "Visual reasoning & design specialist" },
+            { "gpt-6.1-sol",   "GPT-6.1 Sol",   "High intelligence balanced model" },
+            { "gpt-4o-mini",   "GPT-4o Mini",   "Classic lightweight universal model" }
+        }
+    },
+    // 2: DeepSeek (только актуальные DeepSeek V4; отключенные deepseek-chat / reasoner убраны)
+    {
+        "DeepSeek",
+        L"api.deepseek.com",
+        L"/chat/completions",
+        L"/models",
+        false,
+        {
+            { "deepseek-v4-flash", "DeepSeek V4 Flash", "1M context fast generation model" },
+            { "deepseek-v4-pro",   "DeepSeek V4 Pro",   "1M context flagship coding/art model" },
+            { "deepseek-v4-flash", "DeepSeek V4 Flash (Fast)", "Recommended for quick GD builds" },
+            { "deepseek-v4-pro",   "DeepSeek V4 Pro (Max)",    "Recommended for complex structures" }
+        }
+    },
+    // 3: Groq (только актуальные Production-модели; отключенные на бесплатном тарифе llama-3.3 убраны)
+    {
+        "Groq",
+        L"api.groq.com",
+        L"/openai/v1/chat/completions",
+        L"/openai/v1/models",
+        false,
+        {
+            { "openai/gpt-oss-120b", "GPT-OSS 120B",   "500 tok/s flagship open-weight model" },
+            { "openai/gpt-oss-20b",  "GPT-OSS 20B",    "1000 tok/s ultra-fast instant model" },
+            { "qwen/qwen3.8-27b",    "Qwen 3.8 27B",   "450 tok/s strong coding & JSON model" },
+            { "openai/gpt-oss-120b", "GPT-OSS 120B+",  "Default production Groq model" }
+        }
+    },
+    // 4: OpenRouter (актуальные бесплатные и топовые модели)
+    {
+        "OpenRouter",
+        L"openrouter.ai",
+        L"/api/v1/chat/completions",
+        L"/api/v1/models",
+        false,
+        {
+            { "openrouter/free",                        "OpenRouter Auto-Free", "Automatically picks active free model" },
+            { "google/gemma-4-31b-it:free",             "Gemma 4 31B (Free)",   "Google Gemma 4 free model" },
+            { "nvidia/nemotron-3-super-120b-a12b:free", "Nemotron 3 120B (Free)","NVIDIA 120B free model" },
+            { "deepseek/deepseek-v4-flash",             "DeepSeek V4 Flash",    "Fast low-cost OpenRouter model" }
+        }
+    }
 };
 
 static bool g_apiConfigLoaded = false;
 static bool g_apiVerifiedAndConnected = false;
-static int g_apiProviderIndex = 0;
+static int g_apiProviderIndex = 0; // По умолчанию 0 = Gemini
+static int g_selectedModelIndex[5] = { 0, 0, 0, 0, 0 };
 static std::string g_connectedApiKey;
+static std::string g_discoveredGeminiModel; // Модель, автоматически найденная у ключа пользователя
+
+static const char* getCurrentModelID(int provIdx) {
+    provIdx = std::clamp(provIdx, 0, 4);
+    int mIdx = std::clamp(g_selectedModelIndex[provIdx], 0, 3);
+    return kApiProviders[provIdx].models[mIdx].modelId;
+}
 
 static bool hasPlausibleKeyFormat(std::string const& rawKey) {
     std::string k = trimWhitespace(rawKey);
-    if (k.size() < 16) return false;
+    if (k.size() < 14) return false;
     for (char c : k) {
         if (c <= 32 || c > 126) return false;
     }
@@ -322,10 +406,10 @@ static bool hasPlausibleKeyFormat(std::string const& rawKey) {
 
 static int detectProviderFromKey(std::string const& rawKey, int currentIdx) {
     std::string key = trimWhitespace(rawKey);
-    if (key.rfind("AIza", 0) == 0) return 1;   // Gemini
+    if (key.rfind("AIza", 0) == 0) return 0;   // Gemini
     if (key.rfind("gsk_", 0) == 0) return 3;   // Groq
     if (key.rfind("sk-or-", 0) == 0) return 4; // OpenRouter
-    if (key.rfind("sk-", 0) == 0) return (currentIdx == 2) ? 2 : 0;
+    if (key.rfind("sk-", 0) == 0) return (currentIdx == 2) ? 2 : 1; // OpenAI или DeepSeek
     return currentIdx;
 }
 
@@ -352,11 +436,22 @@ static std::string jsonEscape(std::string const& s) {
     return out;
 }
 
-// Выполнение реального HTTPS POST запроса через WinHTTP (динамическая загрузка winhttp.dll)
-static bool performWinHttpPost(
-    int providerIdx,
-    std::string const& apiKey,
-    std::string const& jsonPayload,
+static std::wstring utf8ToWideASCII(std::string const& s) {
+    std::wstring w;
+    w.reserve(s.size());
+    for (unsigned char c : s) {
+        w.push_back(static_cast<wchar_t>(c));
+    }
+    return w;
+}
+
+// Универсальный HTTPS-клиент через системный winhttp.dll (поддерживает GET и POST)
+static bool performWinHttpRequest(
+    const wchar_t* verbW,
+    const wchar_t* hostW,
+    std::wstring const& pathW,
+    std::wstring const& extraHeadersW,
+    std::string const& bodyData,
     int& outHttpStatus,
     std::string& outResponseBody,
     std::string& outErrorText
@@ -364,8 +459,6 @@ static bool performWinHttpPost(
     outHttpStatus = 0;
     outResponseBody.clear();
     outErrorText.clear();
-
-    if (providerIdx < 0 || providerIdx >= 5) providerIdx = 0;
 
 #ifdef GEODE_IS_WINDOWS
     using HINTERNET_T = void*;
@@ -401,11 +494,11 @@ static bool performWinHttpPost(
 
     if (!pOpen || !pConnect || !pOpenReq || !pSendReq || !pRecvResp || !pQueryHdr || !pQueryData || !pReadData || !pClose) {
         FreeLibrary(hWinHttp);
-        outErrorText = "WinHTTP functions missing";
+        outErrorText = "WinHTTP exports missing";
         return false;
     }
 
-    HINTERNET_T hSession = pOpen(L"GDArtAgent/1.0", 0, nullptr, nullptr, 0);
+    HINTERNET_T hSession = pOpen(L"GDArtAgent/2.0", 0, nullptr, nullptr, 0);
     if (!hSession) {
         FreeLibrary(hWinHttp);
         outErrorText = "Failed to open HTTP session";
@@ -413,43 +506,40 @@ static bool performWinHttpPost(
     }
 
     if (pSetTimeouts) {
-        pSetTimeouts(hSession, 6000, 6000, 10000, 20000);
+        pSetTimeouts(hSession, 6000, 6000, 10000, 22000);
     }
 
-    HINTERNET_T hConnect = pConnect(hSession, kApiProviders[providerIdx].hostW, 443, 0);
+    HINTERNET_T hConnect = pConnect(hSession, hostW, 443, 0);
     if (!hConnect) {
         pClose(hSession);
         FreeLibrary(hWinHttp);
-        outErrorText = "Cannot connect to AI server";
+        outErrorText = "Cannot connect to AI host";
         return false;
     }
 
     constexpr DWORD kWinHttpFlagSecure = 0x00800000;
     HINTERNET_T hRequest = pOpenReq(
-        hConnect, L"POST", kApiProviders[providerIdx].pathW,
+        hConnect, verbW, pathW.c_str(),
         nullptr, nullptr, nullptr, kWinHttpFlagSecure
     );
     if (!hRequest) {
         pClose(hConnect);
         pClose(hSession);
         FreeLibrary(hWinHttp);
-        outErrorText = "Failed to create HTTPS request";
+        outErrorText = "Failed to open HTTPS request";
         return false;
     }
 
-    std::wstring headersW = L"Content-Type: application/json\r\nAuthorization: Bearer ";
-    for (unsigned char c : apiKey) {
-        headersW.push_back(static_cast<wchar_t>(c));
-    }
-    headersW += L"\r\n";
+    LPVOID bodyPtr = bodyData.empty() ? nullptr : const_cast<char*>(bodyData.data());
+    DWORD bodyLen  = static_cast<DWORD>(bodyData.size());
 
     BOOL sent = pSendReq(
         hRequest,
-        headersW.c_str(),
-        static_cast<DWORD>(headersW.size()),
-         const_cast<char*>(jsonPayload.data()),
-        static_cast<DWORD>(jsonPayload.size()),
-        static_cast<DWORD>(jsonPayload.size()),
+        extraHeadersW.empty() ? nullptr : extraHeadersW.c_str(),
+        static_cast<DWORD>(extraHeadersW.size()),
+        bodyPtr,
+        bodyLen,
+        bodyLen,
         0
     );
 
@@ -458,7 +548,7 @@ static bool performWinHttpPost(
         pClose(hConnect);
         pClose(hSession);
         FreeLibrary(hWinHttp);
-        outErrorText = "Network error contacting AI API";
+        outErrorText = "Network error contacting AI server";
         return false;
     }
 
@@ -485,40 +575,85 @@ static bool performWinHttpPost(
     FreeLibrary(hWinHttp);
     return (outHttpStatus == 200);
 #else
-    (void)apiKey;
-    (void)jsonPayload;
+    (void)verbW; (void)hostW; (void)pathW; (void)extraHeadersW; (void)bodyData;
     outErrorText = "Windows required for WinHTTP";
     return false;
 #endif
 }
 
-// Реальная проверка достоверности API-ключа на сервере провайдера!
+// Извлекает первую доступную flash/pro модель из ответа GET /v1beta/models?key=...
+static void extractAvailableGeminiModelFromList(std::string const& modelsJson) {
+    for (const char* preferred : { "gemini-flash-latest", "gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite", "gemini-2.0-flash" }) {
+        std::string needle = std::string("\"models/") + preferred + "\"";
+        if (modelsJson.find(needle) != std::string::npos) {
+            g_discoveredGeminiModel = preferred;
+            return;
+        }
+    }
+    size_t pos = modelsJson.find("\"models/gemini-");
+    if (pos != std::string::npos) {
+        pos += 8; // пропускаем `"models/`
+        size_t endQuote = modelsJson.find('\"', pos);
+        if (endQuote != std::string::npos && endQuote > pos) {
+            g_discoveredGeminiModel = modelsJson.substr(pos, endQuote - pos);
+        }
+    }
+}
+
+// Надежная проверка API-ключа через GET /models (НИКОГДА не выдает 404 из-за имени модели!)
 static bool verifyApiKeyWithServer(int providerIdx, std::string const& rawKey, std::string& outErrorMsg) {
     std::string key = trimWhitespace(rawKey);
     if (!hasPlausibleKeyFormat(key)) {
-        outErrorMsg = "Key format invalid (too short or has spaces)";
+        outErrorMsg = "Key format invalid (too short or contains spaces)";
         return false;
     }
 
-    std::string payload = fmt::format(
-        "{{\"model\":\"{}\",\"messages\":[{{\"role\":\"user\",\"content\":\"ping\"}}],\"max_tokens\":5}}",
-        kApiProviders[providerIdx].defaultModel
-    );
-
+    providerIdx = std::clamp(providerIdx, 0, 4);
     int httpStatus = 0;
     std::string respBody;
     std::string netErr;
-    bool ok = performWinHttpPost(providerIdx, key, payload, httpStatus, respBody, netErr);
 
-    if (ok && httpStatus == 200 && respBody.find("choices") != std::string::npos) {
-        return true;
+    if (kApiProviders[providerIdx].isGeminiNative) {
+        // Для Gemini проверяем ключ официальным методом GET /v1beta/models?key=API_KEY
+        std::wstring pathW = std::wstring(kApiProviders[providerIdx].modelsListPathW) + L"?key=" + utf8ToWideASCII(key);
+        bool ok = performWinHttpRequest(
+            L"GET",
+            kApiProviders[providerIdx].hostW,
+            pathW,
+            L"",
+            "",
+            httpStatus,
+            respBody,
+            netErr
+        );
+        if (ok && httpStatus == 200 && respBody.find("\"models\"") != std::string::npos) {
+            extractAvailableGeminiModelFromList(respBody);
+            return true;
+        }
+    } else {
+        // Для OpenAI / DeepSeek / Groq / OpenRouter проверяем ключ через GET /models с Bearer-токеном
+        std::wstring headersW = L"Authorization: Bearer " + utf8ToWideASCII(key) + L"\r\n";
+        bool ok = performWinHttpRequest(
+            L"GET",
+            kApiProviders[providerIdx].hostW,
+            kApiProviders[providerIdx].modelsListPathW,
+            headersW,
+            "",
+            httpStatus,
+            respBody,
+            netErr
+        );
+        if (ok && httpStatus == 200) {
+            return true;
+        }
     }
-    if (httpStatus == 401 || httpStatus == 403) {
-        outErrorMsg = fmt::format("Invalid API Key (HTTP {}) — key rejected by {}", httpStatus, kApiProviders[providerIdx].name);
+
+    if (httpStatus == 400 || httpStatus == 401 || httpStatus == 403) {
+        outErrorMsg = fmt::format("Invalid API Key (HTTP {}) — rejected by {}", httpStatus, kApiProviders[providerIdx].name);
         return false;
     }
     if (httpStatus > 0) {
-        outErrorMsg = fmt::format("API Error HTTP {} from {}", httpStatus, kApiProviders[providerIdx].name);
+        outErrorMsg = fmt::format("Server returned HTTP {} from {}", httpStatus, kApiProviders[providerIdx].name);
         return false;
     }
     outErrorMsg = netErr.empty() ? "Connection failed" : netErr;
@@ -533,7 +668,8 @@ static void saveVerifiedApiToDisk(int provIdx, std::string const& rawKey) {
     g_apiVerifiedAndConnected = true;
     std::ofstream out("ai_decor_api.cfg", std::ios::trunc);
     if (out.is_open()) {
-        out << g_apiProviderIndex << "\n" << g_connectedApiKey << "\n";
+        out << g_apiProviderIndex << " " << g_selectedModelIndex[g_apiProviderIndex] << "\n"
+            << g_connectedApiKey << "\n";
     }
 }
 
@@ -543,12 +679,16 @@ static void loadAndVerifySavedApiFromDisk() {
 
     std::ifstream in("ai_decor_api.cfg");
     if (!in.is_open()) return;
-    int prov = 0;
+    std::string firstLine;
     std::string key;
-    if (in >> prov) {
-        std::getline(in >> std::ws, key);
+    if (std::getline(in, firstLine) && std::getline(in, key)) {
+        std::istringstream iss(firstLine);
+        int prov = 0;
+        int modIdx = 0;
+        iss >> prov >> modIdx;
         key = trimWhitespace(key);
         if (prov >= 0 && prov < 5 && hasPlausibleKeyFormat(key)) {
+            g_selectedModelIndex[prov] = std::clamp(modIdx, 0, 3);
             std::string dummyErr;
             if (verifyApiKeyWithServer(prov, key, dummyErr)) {
                 g_apiProviderIndex = prov;
@@ -605,7 +745,7 @@ static float extractJsonFloatField(std::string const& json, std::string const& k
 }
 
 static int extractJsonIntField(std::string const& json, std::string const& key, int defaultVal) {
-    return static_cast<int>( std::lround(extractJsonFloatField(json, key, static_cast<float>(defaultVal))) );
+    return static_cast<int>(std::lround(extractJsonFloatField(json, key, static_cast<float>(defaultVal))));
 }
 
 static bool extractJsonBoolField(std::string const& json, std::string const& key, bool defaultVal) {
@@ -684,7 +824,7 @@ static void parseCustomElementsFromAIJson(std::string const& innerJson, std::vec
     }
 }
 
-// Запрос к реальной подключенной нейросети (единственное системное правило: сразу общаться по GD и строить то, что просит игрок)
+// Запрос к реальной нейросети (с поддержкой нативного Gemini generateContent + автоматическим обходом 404!)
 static AIDecisionResult queryRealNeuralNetwork(
     std::string const& userMessage,
     ContourAnalysis const& contour,
@@ -721,47 +861,103 @@ static AIDecisionResult queryRealNeuralNetwork(
         variantNum
     );
 
-    std::string messagesJson = fmt::format(
-        "{{\"role\":\"system\",\"content\":\"{}\"}}",
-        jsonEscape(systemRule)
-    );
-
-    size_t startHist = (g_chatHistory.size() > 6) ? (g_chatHistory.size() - 6) : 0;
-    for (size_t i = startHist; i < g_chatHistory.size(); ++i) {
-        messagesJson += fmt::format(
-            ",{{\"role\":\"{}\",\"content\":\"{}\"}}",
-            g_chatHistory[i].role,
-            jsonEscape(g_chatHistory[i].content)
-        );
-    }
-    messagesJson += fmt::format(
-        ",{{\"role\":\"user\",\"content\":\"{}\"}}",
-        jsonEscape(userMessage)
-    );
-
-    std::string payload = fmt::format(
-        "{{\"model\":\"{}\",\"messages\":[{}],\"temperature\":0.85,\"max_tokens\":900}}",
-        kApiProviders[g_apiProviderIndex].defaultModel,
-        messagesJson
-    );
-
     int httpStatus = 0;
     std::string rawResp;
     std::string errText;
-    if (!performWinHttpPost(g_apiProviderIndex, g_connectedApiKey, payload, httpStatus, rawResp, errText)) {
-        res.httpSuccess = false;
-        res.replyText = fmt::format("API Error (HTTP {}): {}", httpStatus, errText);
-        return res;
+    std::string assistantContent;
+
+    if (kApiProviders[g_apiProviderIndex].isGeminiNative) {
+        // Формат запроса нативного Gemini API (generateContent)
+        std::string combinedPrompt = systemRule + "\n\nConversation history:\n";
+        size_t startHist = (g_chatHistory.size() > 6) ? (g_chatHistory.size() - 6) : 0;
+        for (size_t i = startHist; i < g_chatHistory.size(); ++i) {
+            combinedPrompt += g_chatHistory[i].role + ": " + g_chatHistory[i].content + "\n";
+        }
+        combinedPrompt += "User: " + userMessage;
+
+        std::string geminiBody = fmt::format(
+            "{{\"contents\":[{{\"role\":\"user\",\"parts\":[{{\"text\":\"{}\"}}]}}],\"generationConfig\":{{\"temperature\":0.85,\"maxOutputTokens\":900}}}}",
+            jsonEscape(combinedPrompt)
+        );
+
+        // Пробуем выбранную модель, а если 404 — автоматически пробуем все активные модели Gemini!
+        std::vector<std::string> candidateModels = { getCurrentModelID(0) };
+        if (!g_discoveredGeminiModel.empty()) candidateModels.push_back(g_discoveredGeminiModel);
+        for (int m = 0; m < 4; ++m) {
+            candidateModels.push_back(kApiProviders[0].models[m].modelId);
+        }
+
+        bool ok = false;
+        for (auto const& modName : candidateModels) {
+            std::wstring pathW = L"/v1beta/models/" + utf8ToWideASCII(modName) + L":generateContent?key=" + utf8ToWideASCII(g_connectedApiKey);
+            std::wstring hdrW  = L"Content-Type: application/json\r\n";
+            if (performWinHttpRequest(L"POST", kApiProviders[0].hostW, pathW, hdrW, geminiBody, httpStatus, rawResp, errText)) {
+                ok = true;
+                break;
+            }
+            if (httpStatus != 404) break;
+        }
+
+        if (!ok) {
+            res.httpSuccess = false;
+            res.replyText = fmt::format("Gemini API Error (HTTP {}): {}", httpStatus, errText);
+            return res;
+        }
+        assistantContent = extractJsonStringField(rawResp, "text");
+    } else {
+        // Формат OpenAI / DeepSeek / Groq / OpenRouter
+        std::string messagesJson = fmt::format(
+            "{{\"role\":\"system\",\"content\":\"{}\"}}",
+            jsonEscape(systemRule)
+        );
+        size_t startHist = (g_chatHistory.size() > 6) ? (g_chatHistory.size() - 6) : 0;
+        for (size_t i = startHist; i < g_chatHistory.size(); ++i) {
+            messagesJson += fmt::format(
+                ",{{\"role\":\"{}\",\"content\":\"{}\"}}",
+                g_chatHistory[i].role,
+                jsonEscape(g_chatHistory[i].content)
+            );
+        }
+        messagesJson += fmt::format(
+            ",{{\"role\":\"user\",\"content\":\"{}\"}}",
+            jsonEscape(userMessage)
+        );
+
+        std::vector<std::string> candidateModels = { getCurrentModelID(g_apiProviderIndex) };
+        for (int m = 0; m < 4; ++m) {
+            candidateModels.push_back(kApiProviders[g_apiProviderIndex].models[m].modelId);
+        }
+
+        bool ok = false;
+        std::wstring hdrW = L"Content-Type: application/json\r\nAuthorization: Bearer " + utf8ToWideASCII(g_connectedApiKey) + L"\r\n";
+
+        for (auto const& modName : candidateModels) {
+            std::string payload = fmt::format(
+                "{{\"model\":\"{}\",\"messages\":[{}],\"temperature\":0.85,\"max_tokens\":900}}",
+                modName,
+                messagesJson
+            );
+            if (performWinHttpRequest(L"POST", kApiProviders[g_apiProviderIndex].hostW, kApiProviders[g_apiProviderIndex].chatPathW, hdrW, payload, httpStatus, rawResp, errText)) {
+                ok = true;
+                break;
+            }
+            if (httpStatus != 404 && httpStatus != 400) break;
+        }
+
+        if (!ok) {
+            res.httpSuccess = false;
+            res.replyText = fmt::format("API Error (HTTP {}): {}", httpStatus, errText);
+            return res;
+        }
+        assistantContent = extractJsonStringField(rawResp, "content");
     }
 
     res.httpSuccess = true;
-    std::string assistantContent = extractJsonStringField(rawResp, "content");
     if (assistantContent.empty()) {
         res.replyText = "AI response received.";
         return res;
     }
 
-    // Если модель вернула JSON внутри content — разбираем поля решения ИИ
     size_t jsonStart = assistantContent.find('{');
     size_t jsonEnd   = assistantContent.rfind('}');
     if (jsonStart != std::string::npos && jsonEnd != std::string::npos && jsonEnd > jsonStart) {
@@ -785,20 +981,19 @@ static AIDecisionResult queryRealNeuralNetwork(
         bool c5 = extractJsonRGBArray(innerJson, "glow_rgb",    res.glowRGB);
         res.hasCustomPalette = (c1 || c2 || c3 || c4 || c5);
 
-        res.want3D          = extractJsonBoolField(innerJson, "want_3d", true);
-        res.wantNeon        = extractJsonBoolField(innerJson, "want_neon", true);
-        res.wantGrass       = extractJsonBoolField(innerJson, "want_grass", false);
-        res.wantSnowCap     = extractJsonBoolField(innerJson, "want_snow", false);
-        res.wantBrickPattern= extractJsonBoolField(innerJson, "want_brick", false);
+        res.want3D             = extractJsonBoolField(innerJson, "want_3d", true);
+        res.wantNeon           = extractJsonBoolField(innerJson, "want_neon", true);
+        res.wantGrass          = extractJsonBoolField(innerJson, "want_grass", false);
+        res.wantSnowCap        = extractJsonBoolField(innerJson, "want_snow", false);
+        res.wantBrickPattern   = extractJsonBoolField(innerJson, "want_brick", false);
         res.wantCrystalPattern = extractJsonBoolField(innerJson, "want_crystal", false);
-        res.wantTreePattern = extractJsonBoolField(innerJson, "want_tree", false);
-        res.emblemType      = std::clamp(extractJsonIntField(innerJson, "emblem", 0), 0, 5);
-        res.patternStyle    = std::clamp(extractJsonIntField(innerJson, "pattern", 0), 0, 5);
-        res.suggestedCount  = std::clamp(extractJsonIntField(innerJson, "count", 130), 20, 450);
+        res.wantTreePattern    = extractJsonBoolField(innerJson, "want_tree", false);
+        res.emblemType         = std::clamp(extractJsonIntField(innerJson, "emblem", 0), 0, 5);
+        res.patternStyle       = std::clamp(extractJsonIntField(innerJson, "pattern", 0), 0, 5);
+        res.suggestedCount     = std::clamp(extractJsonIntField(innerJson, "count", 130), 20, 450);
 
         parseCustomElementsFromAIJson(innerJson, res.customElements);
     } else {
-        // Если нейросеть ответила свободным текстом без JSON — показываем её прямой ответ
         res.taskMode = AITaskMode::ChatOnly;
         res.replyText = assistantContent;
     }
@@ -1483,7 +1678,6 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
     auto islands = splitIntoIslands(contour.occupiedCells);
     int totalCells = (std::max)(1, contour.cellCount());
 
-    // 1. РЕЖИМ "ТОЛЬКО 3D"
     if (ai.taskMode == AITaskMode::Only3D) {
         for (auto const& isl : islands) {
             for (auto const& [gx, gy] : isl.cells) {
@@ -1516,7 +1710,6 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         return result;
     }
 
-    // 2. РЕЖИМ "ТОЛЬКО НЕОН"
     if (ai.taskMode == AITaskMode::OnlyNeon) {
         for (auto const& isl : islands) {
             for (auto const& [gx, gy] : isl.cells) {
@@ -1545,7 +1738,6 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         return result;
     }
 
-    // 3. РЕЖИМ "ТОЛЬКО ЗАЛИВКА"
     if (ai.taskMode == AITaskMode::OnlyFill) {
         for (auto const& isl : islands) {
             for (auto const& [gx, gy] : isl.cells) {
@@ -1557,7 +1749,6 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         return result;
     }
 
-    // 4. ПОЛНОЦЕННАЯ ГЕНЕРАЦИЯ АРТА И ДЕКОРА ИИ (FullDecor)
     int effectiveCap = (std::min)(maxObjectLimit, (std::max)(40, ai.suggestedCount));
     float densityRatio = std::clamp(static_cast<float>(effectiveCap) / (totalCells * 8.f), 0.5f, 3.0f);
     float microScale = std::clamp(0.38f / std::sqrt(densityRatio), 0.16f, 0.38f);
@@ -1596,7 +1787,6 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
             int localCol = gx - isl.minGX;
             int localRow = gy - isl.minGY;
 
-            // Слой +0: Полная базовая заливка клетки + внутренний текстурный тон
             addSpec(result, 211, cx, cy, 1.00f, 1.00f, 0.f, LayerRole::Fill, ColorSlot::DarkFill, 1, 0, false);
 
             if (ai.wantBrickPattern) {
@@ -1605,13 +1795,11 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                 addSpec(result, 211, cx, cy, 0.86f, 0.86f, 0.f, LayerRole::Fill, ColorSlot::MidTone, 2, 1, false, 52);
             }
 
-            // Снежная шапка / иней на верхних гранях (если ИИ включила wantSnowCap)
             if (topOpen && ai.wantSnowCap) {
                 addSpec(result, 211, cx, cy + 10.5f, 1.00f, 0.30f, 0.f, LayerRole::InnerDetail, ColorSlot::HighlightOutline, 7, 0, false, 235);
                 addSpec(result, 211, cx - 6.f, cy + 6.5f, 0.42f, 0.16f, 0.f, LayerRole::InnerDetail, ColorSlot::BrightMain, 7, 1, false, 210);
             }
 
-            // Слой +2: Четкая обводка + 3D-блоки (с учетом переключателя Inside / Overhang)
             if (topOpen)    addSpec(result, 211, cx, cy + 14.2f, 1.02f, 0.06f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0, false);
             if (leftOpen)   addSpec(result, 211, cx - 14.2f, cy, 0.06f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0, false);
             if (rightOpen)  addSpec(result, 211, cx + 14.2f, cy, 0.06f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::HighlightOutline, 11, 0, false);
@@ -1631,7 +1819,6 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                 }
             }
 
-            // Слой +3: Неон и трава
             if (ai.wantNeon) {
                 if (topOpen) {
                     if (allowOverhang) {
@@ -1655,7 +1842,6 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                 addSpec(result, gID, cx - 4.f, cy + 15.8f, 0.44f, 0.46f, 0.f, LayerRole::NeonAndGrass, ColorSlot::BrightMain, 15, 1, true);
             }
 
-            // Внутренние структурные детали в каждой клетке
             if (ai.wantCrystalPattern) {
                 addSpec(result, 211, cx, cy, 0.36f, 0.36f, 45.f, LayerRole::InnerDetail, ColorSlot::MidTone, 4, 1, false);
                 addSpec(result, cat.idSmallTriangle, cx, cy, microScale, microScale, static_cast<float>((localCol * 90) % 360), LayerRole::InnerDetail, ColorSlot::BrightMain, 6, 1, false);
@@ -1668,7 +1854,6 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         }
     }
 
-    // 5. Кастомные элементы рисунка (elements), которые ИИ-нейросеть сгенерировала сама по координатам!
     float spanW = static_cast<float>((std::max)(1, contour.maxGX - contour.minGX + 1)) * 30.f;
     float spanH = static_cast<float>((std::max)(1, contour.maxGY - contour.minGY + 1)) * 30.f;
     float originX = contour.minGX * 30.f;
@@ -1680,7 +1865,6 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         int cellGX = static_cast<int>(std::floor(worldX / 30.f));
         int cellGY = static_cast<int>(std::floor(worldY / 30.f));
 
-        // Если элемент попадает внутрь выделенного контура (или разрешен Overhang) — ставим его!
         if (contour.occupiedCells.count({ cellGX, cellGY }) > 0 || allowOverhang) {
             GeneratedObjectSpec cs;
             cs.objectId       = resolveAIElementObjectID(el.shapeType, cat);
@@ -1695,7 +1879,7 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
             cs.customOpacity  = el.opacity;
             cs.customBlending = el.blending;
             cs.zOrder         = el.zOrder;
-            cs.priorityTier   = 0; // Кастомные элементы от самой ИИ имеют высший приоритет!
+            cs.priorityTier   = 0;
             cs.noTouch        = true;
             cs.noGlow         = true;
             result.push_back(cs);
@@ -1824,8 +2008,43 @@ static std::string readWindowsClipboardText() {
 }
 
 // ============================================================================
-// ИНТЕРФЕЙС "ART AGENT" (1-в-1 по скриншотам image_b9641c.png и image_b963fe.jpg)
-// + Строгая блокировка входа без достоверного проверенного API-ключа!
+// Помощник создания 100% НЕПРОЗРАЧНЫХ цветных плашек через CCLayerColor
+// (чтобы фон, кнопки и превью никогда не были прозрачными!)
+// ============================================================================
+static CCLayerColor* createSolidPanel(float width, float height, ccColor3B color, GLubyte alpha = 255) {
+    auto* panel = CCLayerColor::create(ccColor4B{ color.r, color.g, color.b, alpha }, width, height);
+    panel->ignoreAnchorPointForPosition(false);
+    panel->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
+    return panel;
+}
+
+static CCMenuItemSpriteExtra* createSolidButton(
+    float width,
+    float height,
+    ccColor3B bgColor,
+    const char* text,
+    float textScale,
+    ccColor3B textColor,
+    CCObject* target,
+    SEL_MenuHandler selector
+) {
+    auto* bg = createSolidPanel(width, height, bgColor, 255);
+    auto* border = createSolidPanel(width + 2.f, height + 2.f, ccColor3B{ 62, 66, 78 }, 255);
+    border->setPosition(CCPoint{ width * 0.5f, height * 0.5f });
+    border->setZOrder(-1);
+    bg->addChild(border);
+
+    auto* lbl = CCLabelBMFont::create(text, "chatFont.fnt");
+    lbl->setScale(textScale);
+    lbl->setColor(textColor);
+    lbl->setPosition(CCPoint{ width * 0.5f, height * 0.5f });
+    bg->addChild(lbl);
+
+    return CCMenuItemSpriteExtra::create(bg, target, selector);
+}
+
+// ============================================================================
+// ГЛАВНОЕ ОКНО МОДА (3 ЭКРАНА: API Gate / Art Agent Main / AI Model Selector)
 // ============================================================================
 class AIDecorPopup;
 static AIDecorPopup* g_activePopup = nullptr;
@@ -1834,22 +2053,21 @@ class AIDecorPopup : public geode::Popup {
 protected:
     EditorUI* m_editorUI = nullptr;
     ContourAnalysis m_contour;
-    bool m_isApiGateStage = false;
+    PopupStage m_stage = PopupStage::ApiGate;
+    PopupStage m_returnStageAfterModel = PopupStage::ApiGate;
     bool m_russianLayout = true;
     int m_providerIdx = 0;
     int m_previewTab = 0; // 0 = Shape, 1 = Drawing, 2 = In GD
     std::string m_inputBuffer;
     bool m_prevKeyStates[256]{};
 
-    // Элементы экрана API Gate
     CCLabelBMFont* m_inputDisplayLabel = nullptr;
     CCLabelBMFont* m_langBadgeLabel = nullptr;
-    CCLabelBMFont* m_providerBtnLabel = nullptr;
     CCLabelBMFont* m_apiGateStatusLabel = nullptr;
-    CCScale9Sprite* m_checkBoxBg = nullptr;
+    CCLayerColor* m_checkBoxBg = nullptr;
     CCNode* m_checkTickContainer = nullptr;
 
-    // Элементы интерфейса Art Agent (по скриншотам)
+    // Элементы интерфейса Art Agent
     CCLabelBMFont* m_agentReplyLine1 = nullptr;
     CCLabelBMFont* m_agentReplyLine2 = nullptr;
     CCLabelBMFont* m_agentReplyLine3 = nullptr;
@@ -1861,60 +2079,58 @@ protected:
     CCLabelBMFont* m_stepPlaceLabel = nullptr;
 
     // Правая панель Art Agent (Shape | Drawing | In GD)
-    CCScale9Sprite* m_tabShapeBg = nullptr;
-    CCScale9Sprite* m_tabDrawingBg = nullptr;
-    CCScale9Sprite* m_tabInGDBg = nullptr;
+    CCLayerColor* m_tabShapeBg = nullptr;
+    CCLayerColor* m_tabDrawingBg = nullptr;
+    CCLayerColor* m_tabInGDBg = nullptr;
     CCNode* m_previewCanvasContent = nullptr;
     CCLabelBMFont* m_previewSubInfoLabel = nullptr;
     CCLabelBMFont* m_limitValueLabel = nullptr;
-    CCScale9Sprite* m_insideTabBg = nullptr;
-    CCScale9Sprite* m_overhangTabBg = nullptr;
-    CCLabelBMFont* m_anotherVariantLabel = nullptr;
+    CCLayerColor* m_insideTabBg = nullptr;
+    CCLayerColor* m_overhangTabBg = nullptr;
 
-    bool init(EditorUI* ui, ContourAnalysis contour, bool forceApiGate) {
-        if (!Popup::init(490.f, 286.f)) return false;
+    bool init(EditorUI* ui, ContourAnalysis contour, PopupStage requestedStage, PopupStage prevStage) {
+        if (!Popup::init(492.f, 288.f)) return false;
 
         g_activePopup = this;
         m_editorUI = ui;
         m_contour = std::move(contour);
+        m_returnStageAfterModel = prevStage;
 
         loadAndVerifySavedApiFromDisk();
         m_providerIdx = g_apiProviderIndex;
 
-        // Строго не пускаем в мод, пока не введен и не проверен достоверный API-ключ!
-        m_isApiGateStage = forceApiGate || !g_apiVerifiedAndConnected;
-        m_russianLayout = !m_isApiGateStage;
-
-        if (m_isApiGateStage && !g_connectedApiKey.empty()) {
-            m_inputBuffer = g_connectedApiKey;
+        if (requestedStage == PopupStage::ModelSelector) {
+            m_stage = PopupStage::ModelSelector;
+        } else if (!g_apiVerifiedAndConnected || requestedStage == PopupStage::ApiGate) {
+            m_stage = PopupStage::ApiGate;
+        } else {
+            m_stage = PopupStage::ArtAgentMain;
         }
 
-        if constexpr (requires { this->m_bgSprite; }) {
-            if (this->m_bgSprite) {
-                this->m_bgSprite->setColor(ccColor3B{ 15, 16, 20 });
-            }
+        m_russianLayout = (m_stage == PopupStage::ArtAgentMain);
+
+        if (m_stage == PopupStage::ApiGate && !g_connectedApiKey.empty()) {
+            m_inputBuffer = g_connectedApiKey;
         }
 
         auto size = m_mainLayer->getContentSize();
         auto center = CCPoint{ size.width / 2.f, size.height / 2.f };
 
-        // Темно-угольный корпус окна в стиле Art Agent
-        auto outerFrame = CCScale9Sprite::create("square02b_001.png");
-        outerFrame->setContentSize(CCSize{ size.width, size.height });
-        outerFrame->setColor(ccColor3B{ 42, 44, 52 });
-        outerFrame->setPosition(center);
-        outerFrame->setZOrder(-2);
-        m_mainLayer->addChild(outerFrame);
+        // Сплошной непрозрачный темно-серый корпус окна
+        auto* outerBorder = createSolidPanel(size.width, size.height, ccColor3B{ 68, 72, 84 }, 255);
+        outerBorder->setPosition(center);
+        outerBorder->setZOrder(-3);
+        m_mainLayer->addChild(outerBorder);
 
-        auto innerDark = CCScale9Sprite::create("square02b_001.png");
-        innerDark->setContentSize(CCSize{ size.width - 4.f, size.height - 4.f });
-        innerDark->setColor(ccColor3B{ 15, 16, 20 });
-        innerDark->setPosition(center);
-        innerDark->setZOrder(-1);
-        m_mainLayer->addChild(innerDark);
+        auto* innerBody = createSolidPanel(size.width - 4.f, size.height - 4.f, ccColor3B{ 18, 19, 24 }, 255);
+        innerBody->setPosition(center);
+        innerBody->setZOrder(-2);
+        m_mainLayer->addChild(innerBody);
 
-        if (m_isApiGateStage) {
+        if (m_stage == PopupStage::ApiGate) {
             setupStrictApiGateUI(center);
+        } else if (m_stage == PopupStage::ModelSelector) {
+            setupModelSelectorWindowUI(center);
         } else {
             setupArtAgentMainUI(center);
         }
@@ -1932,8 +2148,7 @@ protected:
     }
 
     void createCheckmarkBadge(CCPoint pos, bool checked) {
-        m_checkBoxBg = CCScale9Sprite::create("square02b_001.png");
-        m_checkBoxBg->setContentSize(CCSize{ 20.f, 20.f });
+        m_checkBoxBg = createSolidPanel(20.f, 20.f, checked ? ccColor3B{ 42, 205, 95 } : ccColor3B{ 58, 62, 72 }, 255);
         m_checkBoxBg->setPosition(pos);
         m_mainLayer->addChild(m_checkBoxBg);
 
@@ -1941,16 +2156,12 @@ protected:
         m_checkTickContainer->setPosition(pos);
         m_mainLayer->addChild(m_checkTickContainer);
 
-        auto shortLeg = CCScale9Sprite::create("square02b_001.png");
-        shortLeg->setContentSize(CCSize{ 3.4f, 7.8f });
-        shortLeg->setColor(ccColor3B{ 255, 255, 255 });
+        auto* shortLeg = createSolidPanel(3.4f, 7.8f, ccColor3B{ 255, 255, 255 }, 255);
         shortLeg->setRotation(-40.f);
         shortLeg->setPosition(CCPoint{ -2.8f, -1.4f });
         m_checkTickContainer->addChild(shortLeg);
 
-        auto longLeg = CCScale9Sprite::create("square02b_001.png");
-        longLeg->setContentSize(CCSize{ 3.4f, 12.8f });
-        longLeg->setColor(ccColor3B{ 255, 255, 255 });
+        auto* longLeg = createSolidPanel(3.4f, 12.8f, ccColor3B{ 255, 255, 255 }, 255);
         longLeg->setRotation(38.f);
         longLeg->setPosition(CCPoint{ 2.4f, 1.0f });
         m_checkTickContainer->addChild(longLeg);
@@ -1960,7 +2171,7 @@ protected:
 
     void setCheckmarkState(bool checked) {
         if (m_checkBoxBg) {
-            m_checkBoxBg->setColor(checked ? ccColor3B{ 42, 205, 95 } : ccColor3B{ 58, 60, 68 });
+            m_checkBoxBg->setColor(checked ? ccColor3B{ 42, 205, 95 } : ccColor3B{ 58, 62, 72 });
         }
         if (m_checkTickContainer) {
             m_checkTickContainer->setScale(checked ? 1.0f : 0.0f);
@@ -1977,190 +2188,259 @@ protected:
     }
 
     // ========================================================================
-    // ЭКРАН 1: СТРОГАЯ ПРОВЕРКА ДОСТОВЕРНОСТИ API-КЛЮЧА ПЕРЕД ВХОДОМ В МОД
+    // ЭКРАН 1: СТРОГАЯ ПРОВЕРКА ДОСТОВЕРНОСТИ API-КЛЮЧА + КНОПКА ВЫБОРА МОДЕЛИ
     // ========================================================================
     void setupStrictApiGateUI(CCPoint center) {
         this->setTitle("ART AGENT — PODKLYUCHENIE II PO API");
 
         if (g_apiVerifiedAndConnected) {
-            auto backSpr = ButtonSprite::create("Back");
-            backSpr->setScale(0.50f);
-            auto backBtn = CCMenuItemSpriteExtra::create(backSpr, this, menu_selector(AIDecorPopup::onBackToArtAgent));
+            auto* backBtn = createSolidButton(
+                76.f, 22.f, ccColor3B{ 46, 50, 62 },
+                "Back", 0.48f, ccColor3B{ 235, 240, 250 },
+                this, menu_selector(AIDecorPopup::onBackToArtAgent)
+            );
             backBtn->setPosition(CCPoint{ center.x + 190.f, center.y + 118.f });
             m_buttonMenu->addChild(backBtn);
         }
 
-        auto cardBg = CCScale9Sprite::create("square02b_001.png");
-        cardBg->setContentSize(CCSize{ 430.f, 110.f });
-        cardBg->setColor(ccColor3B{ 24, 25, 31 });
-        cardBg->setPosition(CCPoint{ center.x, center.y + 30.f });
+        auto* cardBg = createSolidPanel(440.f, 122.f, ccColor3B{ 28, 30, 38 }, 255);
+        cardBg->setPosition(CCPoint{ center.x, center.y + 28.f });
         m_mainLayer->addChild(cardBg);
 
-        createCheckmarkBadge(CCPoint{ center.x - 190.f, center.y + 62.f }, g_apiVerifiedAndConnected);
+        createCheckmarkBadge(CCPoint{ center.x - 196.f, center.y + 68.f }, g_apiVerifiedAndConnected);
 
         std::string initStatus = g_apiVerifiedAndConnected
-            ? fmt::format("Dostoverniy API podtverzhden: {} ({})", kApiProviders[m_providerIdx].name, maskApiKeyPreview(g_connectedApiKey))
-            : "Vhod zakrit: Vvedite dostoverniy API-klyuch neyroseti dlya proverki!";
+            ? fmt::format("API Key Verified: {} ({})", kApiProviders[m_providerIdx].name, maskApiKeyPreview(g_connectedApiKey))
+            : "Vvedite dostoverniy API-klyuch (proverka cherez GET /models bez oshibki 404!)";
         m_apiGateStatusLabel = CCLabelBMFont::create(initStatus.c_str(), "chatFont.fnt");
-        m_apiGateStatusLabel->setScale(0.54f);
-        m_apiGateStatusLabel->setColor(g_apiVerifiedAndConnected ? ccColor3B{ 110, 245, 155 } : ccColor3B{ 240, 180, 115 });
-        m_apiGateStatusLabel->setPosition(CCPoint{ center.x + 10.f, center.y + 62.f });
+        m_apiGateStatusLabel->setScale(0.50f);
+        m_apiGateStatusLabel->setColor(g_apiVerifiedAndConnected ? ccColor3B{ 110, 245, 155 } : ccColor3B{ 245, 195, 120 });
+        m_apiGateStatusLabel->setPosition(CCPoint{ center.x + 10.f, center.y + 68.f });
         m_mainLayer->addChild(m_apiGateStatusLabel);
 
-        // Кнопка переключения провайдера (OpenAI / Gemini / DeepSeek / Groq / OpenRouter)
-        auto provBg = CCScale9Sprite::create("square02b_001.png");
-        provBg->setContentSize(CCSize{ 300.f, 26.f });
-        provBg->setColor(ccColor3B{ 38, 40, 48 });
-        std::string provText = fmt::format("Provider: {} (Click to switch)", kApiProviders[m_providerIdx].name);
-        m_providerBtnLabel = CCLabelBMFont::create(provText.c_str(), "chatFont.fnt");
-        m_providerBtnLabel->setScale(0.55f);
-        m_providerBtnLabel->setColor(ccColor3B{ 245, 248, 255 });
-        m_providerBtnLabel->setPosition(CCPoint{ 150.f, 13.f });
-        provBg->addChild(m_providerBtnLabel);
-
-        auto provBtn = CCMenuItemSpriteExtra::create(provBg, this, menu_selector(AIDecorPopup::onCycleApiProvider));
-        provBtn->setPosition(CCPoint{ center.x, center.y + 24.f });
+        // Две удобные кнопки выбора: [Провайдер] и [Окошко выбора модели ИИ]
+        std::string provText = fmt::format("Provider: {} (Switch)", kApiProviders[m_providerIdx].name);
+        auto* provBtn = createSolidButton(
+            195.f, 26.f, ccColor3B{ 44, 48, 58 },
+            provText.c_str(), 0.48f, ccColor3B{ 245, 248, 255 },
+            this, menu_selector(AIDecorPopup::onCycleApiProvider)
+        );
+        provBtn->setPosition(CCPoint{ center.x - 108.f, center.y + 30.f });
         m_buttonMenu->addChild(provBtn);
 
-        auto hintLbl = CCLabelBMFont::create(
-            "Mod proveryaet klyuch cherez realniy HTTPS-zapros k API pered otkritiem!",
+        std::string modBtnText = fmt::format("Model: {} (Change)", getCurrentModelID(m_providerIdx));
+        auto* openModWinBtn = createSolidButton(
+            215.f, 26.f, ccColor3B{ 56, 62, 78 },
+            modBtnText.c_str(), 0.45f, ccColor3B{ 165, 230, 255 },
+            this, menu_selector(AIDecorPopup::onOpenModelSelectorFromGate)
+        );
+        openModWinBtn->setPosition(CCPoint{ center.x + 106.f, center.y + 30.f });
+        m_buttonMenu->addChild(openModWinBtn);
+
+        auto* hintLbl = CCLabelBMFont::create(
+            "Nazhmite 'Model: ... (Change)' chtobi vibrat aktualnuyu model II v otdelnom okoshke!",
             "chatFont.fnt"
         );
-        hintLbl->setScale(0.48f);
-        hintLbl->setColor(ccColor3B{ 155, 162, 175 });
+        hintLbl->setScale(0.45f);
+        hintLbl->setColor(ccColor3B{ 170, 178, 192 });
         hintLbl->setPosition(CCPoint{ center.x, center.y - 8.f });
         m_mainLayer->addChild(hintLbl);
 
-        // Поле ввода API-ключа
-        auto inputBg = CCScale9Sprite::create("square02b_001.png");
-        inputBg->setContentSize(CCSize{ 430.f, 34.f });
-        inputBg->setColor(ccColor3B{ 22, 23, 28 });
-        inputBg->setPosition(CCPoint{ center.x, center.y - 52.f });
+        // Непрозрачное поле ввода API-ключа
+        auto* inputBg = createSolidPanel(440.f, 34.f, ccColor3B{ 12, 13, 17 }, 255);
+        inputBg->setPosition(CCPoint{ center.x, center.y - 54.f });
         m_mainLayer->addChild(inputBg);
 
         m_inputDisplayLabel = CCLabelBMFont::create("", "chatFont.fnt");
-        m_inputDisplayLabel->setScale(0.56f);
-        m_inputDisplayLabel->setPosition(CCPoint{ center.x, center.y - 52.f });
+        m_inputDisplayLabel->setScale(0.55f);
+        m_inputDisplayLabel->setPosition(CCPoint{ center.x, center.y - 54.f });
         m_mainLayer->addChild(m_inputDisplayLabel);
         refreshInputLabel();
 
-        // Кнопки [Paste Ctrl+V] [Clear] [Verify & Connect API]
-        auto pasteBg = CCScale9Sprite::create("square02b_001.png");
-        pasteBg->setContentSize(CCSize{ 125.f, 30.f });
-        pasteBg->setColor(ccColor3B{ 38, 40, 48 });
-        auto pasteLbl = CCLabelBMFont::create("Paste (Ctrl+V)", "chatFont.fnt");
-        pasteLbl->setScale(0.52f);
-        pasteLbl->setPosition(CCPoint{ 62.5f, 15.f });
-        pasteBg->addChild(pasteLbl);
-        auto pasteBtn = CCMenuItemSpriteExtra::create(pasteBg, this, menu_selector(AIDecorPopup::onPasteApiClicked));
-        pasteBtn->setPosition(CCPoint{ center.x - 150.f, center.y - 102.f });
+        // Нижние кнопки с четкими непрозрачными плашками
+        auto* pasteBtn = createSolidButton(
+            130.f, 30.f, ccColor3B{ 44, 48, 58 },
+            "Paste (Ctrl+V)", 0.50f, ccColor3B{ 240, 245, 255 },
+            this, menu_selector(AIDecorPopup::onPasteApiClicked)
+        );
+        pasteBtn->setPosition(CCPoint{ center.x - 155.f, center.y - 104.f });
         m_buttonMenu->addChild(pasteBtn);
 
-        auto clearBg = CCScale9Sprite::create("square02b_001.png");
-        clearBg->setContentSize(CCSize{ 85.f, 30.f });
-        clearBg->setColor(ccColor3B{ 38, 40, 48 });
-        auto clearLbl = CCLabelBMFont::create("Clear", "chatFont.fnt");
-        clearLbl->setScale(0.52f);
-        clearLbl->setPosition(CCPoint{ 42.5f, 15.f });
-        clearBg->addChild(clearLbl);
-        auto clearBtn = CCMenuItemSpriteExtra::create(clearBg, this, menu_selector(AIDecorPopup::onClearApiClicked));
-        clearBtn->setPosition(CCPoint{ center.x - 32.f, center.y - 102.f });
+        auto* clearBtn = createSolidButton(
+            90.f, 30.f, ccColor3B{ 44, 48, 58 },
+            "Clear", 0.50f, ccColor3B{ 240, 245, 255 },
+            this, menu_selector(AIDecorPopup::onClearApiClicked)
+        );
+        clearBtn->setPosition(CCPoint{ center.x - 35.f, center.y - 104.f });
         m_buttonMenu->addChild(clearBtn);
 
-        auto verifyBg = CCScale9Sprite::create("square02b_001.png");
-        verifyBg->setContentSize(CCSize{ 185.f, 30.f });
-        verifyBg->setColor(ccColor3B{ 225, 58, 92 });
-        auto verifyLbl = CCLabelBMFont::create("Verify & Connect API", "chatFont.fnt");
-        verifyLbl->setScale(0.54f);
-        verifyLbl->setColor(ccColor3B{ 255, 255, 255 });
-        verifyLbl->setPosition(CCPoint{ 92.5f, 15.f });
-        verifyBg->addChild(verifyLbl);
-        auto verifyBtn = CCMenuItemSpriteExtra::create(verifyBg, this, menu_selector(AIDecorPopup::onVerifyAndConnectApi));
-        verifyBtn->setPosition(CCPoint{ center.x + 120.f, center.y - 102.f });
+        auto* verifyBtn = createSolidButton(
+            195.f, 30.f, ccColor3B{ 228, 58, 92 },
+            "Verify & Connect API", 0.52f, ccColor3B{ 255, 255, 255 },
+            this, menu_selector(AIDecorPopup::onVerifyAndConnectApi)
+        );
+        verifyBtn->setPosition(CCPoint{ center.x + 122.f, center.y - 104.f });
         m_buttonMenu->addChild(verifyBtn);
     }
 
     // ========================================================================
-    // ЭКРАН 2: ОСНОВНОЙ ИНТЕРФЕЙС "ART AGENT" (1-в-1 по скриншотам!)
+    // ЭКРАН 2: ОКОШКО ВЫБОРА АКТУАЛЬНОЙ МОДЕЛИ ИИ (Только поддерживаемые модели!)
+    // ========================================================================
+    void setupModelSelectorWindowUI(CCPoint center) {
+        this->setTitle("VIBOR AKTUALNOY MODELI II");
+
+        // Верхняя плашка выбора провайдера [< Provider: Gemini >] + кнопка [Назад]
+        std::string provHeader = fmt::format("Provider: {} (Click to switch)", kApiProviders[m_providerIdx].name);
+        auto* provSwitchBtn = createSolidButton(
+            260.f, 26.f, ccColor3B{ 44, 48, 60 },
+            provHeader.c_str(), 0.50f, ccColor3B{ 165, 230, 255 },
+            this, menu_selector(AIDecorPopup::onCycleProviderInModelWindow)
+        );
+        provSwitchBtn->setPosition(CCPoint{ center.x - 50.f, center.y + 88.f });
+        m_buttonMenu->addChild(provSwitchBtn);
+
+        auto* backBtn = createSolidButton(
+            110.f, 26.f, ccColor3B{ 62, 66, 78 },
+            "Nazad / Done", 0.48f, ccColor3B{ 245, 248, 255 },
+            this, menu_selector(AIDecorPopup::onCloseModelSelectorWindow)
+        );
+        backBtn->setPosition(CCPoint{ center.x + 155.f, center.y + 88.f });
+        m_buttonMenu->addChild(backBtn);
+
+        auto* subInfo = CCLabelBMFont::create(
+            "Vse ustarevshie modeli ubrani. Nazhmite na lyubuyu podderzhivaemuyu model nizhe:",
+            "chatFont.fnt"
+        );
+        subInfo->setScale(0.45f);
+        subInfo->setColor(ccColor3B{ 175, 182, 195 });
+        subInfo->setPosition(CCPoint{ center.x, center.y + 62.f });
+        m_mainLayer->addChild(subInfo);
+
+        int activeIdx = std::clamp(g_selectedModelIndex[m_providerIdx], 0, 3);
+        SEL_MenuHandler const modelCallbacks[4] = {
+            menu_selector(AIDecorPopup::onPickModel0),
+            menu_selector(AIDecorPopup::onPickModel1),
+            menu_selector(AIDecorPopup::onPickModel2),
+            menu_selector(AIDecorPopup::onPickModel3)
+        };
+
+        for (int i = 0; i < 4; ++i) {
+            float rowY = center.y + 28.f - i * 42.f;
+            bool isSelected = (i == activeIdx);
+
+            ccColor3B cardColor = isSelected ? ccColor3B{ 36, 68, 52 } : ccColor3B{ 28, 30, 38 };
+            auto* rowBg = createSolidPanel(430.f, 34.f, cardColor, 255);
+            auto* rowBorder = createSolidPanel(
+                432.f, 36.f,
+                isSelected ? ccColor3B{ 46, 215, 105 } : ccColor3B{ 54, 58, 68 },
+                255
+            );
+            rowBorder->setPosition(CCPoint{ 215.f, 17.f });
+            rowBorder->setZOrder(-1);
+            rowBg->addChild(rowBorder);
+
+            std::string titleLine = fmt::format(
+                "{}{}  [{}]",
+                isSelected ? "[ACTIVE] " : "",
+                kApiProviders[m_providerIdx].models[i].displayTitle,
+                kApiProviders[m_providerIdx].models[i].modelId
+            );
+            auto* titleLbl = CCLabelBMFont::create(titleLine.c_str(), "chatFont.fnt");
+            titleLbl->setScale(0.50f);
+            titleLbl->setColor(isSelected ? ccColor3B{ 125, 255, 165 } : ccColor3B{ 240, 245, 255 });
+            titleLbl->setPosition(CCPoint{ 215.f, 22.f });
+            rowBg->addChild(titleLbl);
+
+            auto* descLbl = CCLabelBMFont::create(kApiProviders[m_providerIdx].models[i].badgeDesc, "chatFont.fnt");
+            descLbl->setScale(0.42f);
+            descLbl->setColor(ccColor3B{ 170, 178, 192 });
+            descLbl->setPosition(CCPoint{ 215.f, 9.f });
+            rowBg->addChild(descLbl);
+
+            auto* itemBtn = CCMenuItemSpriteExtra::create(rowBg, this, modelCallbacks[i]);
+            itemBtn->setPosition(CCPoint{ center.x, rowY });
+            m_buttonMenu->addChild(itemBtn);
+        }
+    }
+
+    // ========================================================================
+    // ЭКРАН 3: ГЛАВНЫЙ ИНТЕРФЕЙС "ART AGENT" (1-в-1 по скриншотам!)
     // ========================================================================
     void setupArtAgentMainUI(CCPoint center) {
         this->setTitle("");
 
         // --- ВЕРХНЯЯ ПАНЕЛЬ (Шапка Art Agent) ---
-        auto headerTitle = CCLabelBMFont::create("Art Agent", "chatFont.fnt");
-        headerTitle->setScale(0.60f);
-        headerTitle->setColor(ccColor3B{ 240, 242, 248 });
-        headerTitle->setPosition(CCPoint{ center.x, center.y + 125.f });
+        auto* headerTitle = CCLabelBMFont::create("Art Agent", "chatFont.fnt");
+        headerTitle->setScale(0.58f);
+        headerTitle->setColor(ccColor3B{ 245, 248, 255 });
+        headerTitle->setPosition(CCPoint{ center.x + 15.f, center.y + 125.f });
         m_mainLayer->addChild(headerTitle);
 
-        // Левая верхняя капсула: [✓ API: OpenAI] + розовая кнопка [+] для смены API!
-        auto balPill = CCScale9Sprite::create("square02b_001.png");
-        balPill->setContentSize(CCSize{ 118.f, 22.f });
-        balPill->setColor(ccColor3B{ 26, 27, 33 });
-        balPill->setPosition(CCPoint{ center.x - 174.f, center.y + 125.f });
+        // Левая капсула API + зеленая галочка + розовая кнопка [+] смены API
+        auto* balPill = createSolidPanel(106.f, 22.f, ccColor3B{ 28, 30, 38 }, 255);
+        balPill->setPosition(CCPoint{ center.x - 180.f, center.y + 125.f });
         m_mainLayer->addChild(balPill);
 
-        createCheckmarkBadge(CCPoint{ center.x - 220.f, center.y + 125.f }, true);
+        createCheckmarkBadge(CCPoint{ center.x - 221.f, center.y + 125.f }, true);
 
         std::string apiTag = fmt::format("API {}", kApiProviders[m_providerIdx].name);
-        auto apiTagLbl = CCLabelBMFont::create(apiTag.c_str(), "chatFont.fnt");
-        apiTagLbl->setScale(0.46f);
-        apiTagLbl->setColor(ccColor3B{ 225, 230, 240 });
-        apiTagLbl->setPosition(CCPoint{ center.x - 176.f, center.y + 125.f });
+        auto* apiTagLbl = CCLabelBMFont::create(apiTag.c_str(), "chatFont.fnt");
+        apiTagLbl->setScale(0.44f);
+        apiTagLbl->setColor(ccColor3B{ 230, 235, 245 });
+        apiTagLbl->setPosition(CCPoint{ center.x - 182.f, center.y + 125.f });
         m_mainLayer->addChild(apiTagLbl);
 
-        auto plusBg = CCScale9Sprite::create("square02b_001.png");
-        plusBg->setContentSize(CCSize{ 24.f, 18.f });
-        plusBg->setColor(ccColor3B{ 232, 65, 98 });
-        auto plusLbl = CCLabelBMFont::create("+", "bigFont.fnt");
-        plusLbl->setScale(0.38f);
-        plusLbl->setPosition(CCPoint{ 12.f, 10.f });
-        plusBg->addChild(plusLbl);
-        auto changeApiBtn = CCMenuItemSpriteExtra::create(plusBg, this, menu_selector(AIDecorPopup::onOpenApiGate));
-        changeApiBtn->setPosition(CCPoint{ center.x - 129.f, center.y + 125.f });
+        auto* changeApiBtn = createSolidButton(
+            24.f, 20.f, ccColor3B{ 232, 65, 98 },
+            "+", 0.55f, ccColor3B{ 255, 255, 255 },
+            this, menu_selector(AIDecorPopup::onOpenApiGate)
+        );
+        changeApiBtn->setPosition(CCPoint{ center.x - 138.f, center.y + 125.f });
         m_buttonMenu->addChild(changeApiBtn);
 
-        // Кнопка раскладки [RUS/ENG] справа вверху
-        auto langBg = CCScale9Sprite::create("square02b_001.png");
-        langBg->setContentSize(CCSize{ 44.f, 18.f });
-        langBg->setColor(ccColor3B{ 34, 36, 44 });
+        // Кнопка открытия окошка выбора модели ИИ прямо из шапки Art Agent!
+        std::string shortMod = fmt::format("Model: {}", getCurrentModelID(m_providerIdx));
+        if (shortMod.size() > 22) shortMod = shortMod.substr(0, 22);
+        auto* modelBtn = createSolidButton(
+            112.f, 20.f, ccColor3B{ 38, 42, 54 },
+            shortMod.c_str(), 0.38f, ccColor3B{ 165, 230, 255 },
+            this, menu_selector(AIDecorPopup::onOpenModelSelectorFromMain)
+        );
+        modelBtn->setPosition(CCPoint{ center.x - 64.f, center.y + 125.f });
+        m_buttonMenu->addChild(modelBtn);
+
+        // Кнопка переключения раскладки [RUS/ENG]
+        auto* langBg = createSolidPanel(44.f, 20.f, ccColor3B{ 38, 42, 54 }, 255);
         m_langBadgeLabel = CCLabelBMFont::create("RUS", "chatFont.fnt");
         m_langBadgeLabel->setScale(0.45f);
-        m_langBadgeLabel->setColor(ccColor3B{ 235, 240, 250 });
-        m_langBadgeLabel->setPosition(CCPoint{ 22.f, 9.f });
+        m_langBadgeLabel->setColor(ccColor3B{ 240, 245, 255 });
+        m_langBadgeLabel->setPosition(CCPoint{ 22.f, 10.f });
         langBg->addChild(m_langBadgeLabel);
-        auto langBtn = CCMenuItemSpriteExtra::create(langBg, this, menu_selector(AIDecorPopup::onToggleLanguage));
-        langBtn->setPosition(CCPoint{ center.x + 188.f, center.y + 125.f });
+        auto* langBtn = CCMenuItemSpriteExtra::create(langBg, this, menu_selector(AIDecorPopup::onToggleLanguage));
+        langBtn->setPosition(CCPoint{ center.x + 185.f, center.y + 125.f });
         m_buttonMenu->addChild(langBtn);
 
-        // Тонкая разделительная линия шапки и центральной колонки
-        auto topDivider = CCScale9Sprite::create("square02b_001.png");
-        topDivider->setContentSize(CCSize{ 482.f, 1.2f });
-        topDivider->setColor(ccColor3B{ 34, 36, 42 });
+        // Разделительные линии
+        auto* topDivider = createSolidPanel(484.f, 1.5f, ccColor3B{ 42, 45, 54 }, 255);
         topDivider->setPosition(CCPoint{ center.x, center.y + 109.f });
         m_mainLayer->addChild(topDivider);
 
-        auto midDivider = CCScale9Sprite::create("square02b_001.png");
-        midDivider->setContentSize(CCSize{ 1.2f, 246.f });
-        midDivider->setColor(ccColor3B{ 34, 36, 42 });
+        auto* midDivider = createSolidPanel(1.5f, 246.f, ccColor3B{ 42, 45, 54 }, 255);
         midDivider->setPosition(CCPoint{ center.x - 4.f, center.y - 14.f });
         m_mainLayer->addChild(midDivider);
 
         // ====================================================================
-        // ЛЕВАЯ КОЛОНКА: Живой ИИ-Агент + Карточка выделения + Статус шагов
+        // ЛЕВАЯ КОЛОНКА: Карточка ответа ИИ-Агента + Карточка выделения и шагов
         // ====================================================================
         float leftX = center.x - 122.f;
 
-        // 1. Верхняя карточка ответа ИИ-Агента
-        auto agentCard = CCScale9Sprite::create("square02b_001.png");
-        agentCard->setContentSize(CCSize{ 222.f, 64.f });
-        agentCard->setColor(ccColor3B{ 24, 25, 30 });
+        auto* agentCard = createSolidPanel(222.f, 64.f, ccColor3B{ 26, 28, 35 }, 255);
         agentCard->setPosition(CCPoint{ leftX, center.y + 68.f });
         m_mainLayer->addChild(agentCard);
 
-        auto agentTitle = CCLabelBMFont::create("Agent", "chatFont.fnt");
+        auto* agentTitle = CCLabelBMFont::create("Agent", "chatFont.fnt");
         agentTitle->setScale(0.44f);
-        agentTitle->setColor(ccColor3B{ 130, 135, 148 });
+        agentTitle->setColor(ccColor3B{ 140, 146, 160 });
         agentTitle->setPosition(CCPoint{ leftX - 88.f, center.y + 90.f });
         m_mainLayer->addChild(agentTitle);
 
@@ -2169,44 +2449,37 @@ protected:
             m_contour.cellCount()
         );
         m_agentReplyLine1 = CCLabelBMFont::create(initMsg1.c_str(), "chatFont.fnt");
-        m_agentReplyLine1->setScale(0.46f);
-        m_agentReplyLine1->setColor(ccColor3B{ 235, 238, 245 });
+        m_agentReplyLine1->setScale(0.45f);
+        m_agentReplyLine1->setColor(ccColor3B{ 240, 242, 248 });
         m_agentReplyLine1->setPosition(CCPoint{ leftX, center.y + 73.f });
         m_mainLayer->addChild(m_agentReplyLine1);
 
-        m_agentReplyLine2 = CCLabelBMFont::create("You can write in Russian or English.", "chatFont.fnt");
-        m_agentReplyLine2->setScale(0.46f);
+        m_agentReplyLine2 = CCLabelBMFont::create("You can write in any language.", "chatFont.fnt");
+        m_agentReplyLine2->setScale(0.45f);
         m_agentReplyLine2->setColor(ccColor3B{ 210, 215, 225 });
         m_agentReplyLine2->setPosition(CCPoint{ leftX, center.y + 58.f });
         m_mainLayer->addChild(m_agentReplyLine2);
 
         m_agentReplyLine3 = CCLabelBMFont::create("", "chatFont.fnt");
-        m_agentReplyLine3->setScale(0.44f);
+        m_agentReplyLine3->setScale(0.43f);
         m_agentReplyLine3->setColor(ccColor3B{ 185, 192, 205 });
         m_agentReplyLine3->setPosition(CCPoint{ leftX, center.y + 44.f });
         m_mainLayer->addChild(m_agentReplyLine3);
 
-        // 2. Средняя карточка запроса пользователя и статуса шагов (Shape / Plan / Drawing / Vector / Place)
-        auto stepsCard = CCScale9Sprite::create("square02b_001.png");
-        stepsCard->setContentSize(CCSize{ 222.f, 92.f });
-        stepsCard->setColor(ccColor3B{ 22, 23, 28 });
+        // Средняя карточка: Selection + чеклист (Shape / Plan / Drawing / Vector / Place)
+        auto* stepsCard = createSolidPanel(222.f, 92.f, ccColor3B{ 24, 26, 32 }, 255);
         stepsCard->setPosition(CCPoint{ leftX, center.y - 16.f });
         m_mainLayer->addChild(stepsCard);
 
-        // Мини-иконка выделенной формы (синий фон + зеленая форма, как на скриншоте 2)
-        auto miniThumbBg = CCScale9Sprite::create("square02b_001.png");
-        miniThumbBg->setContentSize(CCSize{ 34.f, 22.f });
-        miniThumbBg->setColor(ccColor3B{ 22, 92, 210 });
+        auto* miniThumbBg = createSolidPanel(34.f, 22.f, ccColor3B{ 22, 92, 212 }, 255);
         miniThumbBg->setPosition(CCPoint{ leftX - 86.f, center.y + 14.f });
         m_mainLayer->addChild(miniThumbBg);
 
-        auto miniShapeIcon = CCScale9Sprite::create("square02b_001.png");
-        miniShapeIcon->setContentSize(CCSize{ 16.f, 14.f });
-        miniShapeIcon->setColor(ccColor3B{ 35, 210, 45 });
+        auto* miniShapeIcon = createSolidPanel(16.f, 14.f, ccColor3B{ 38, 215, 50 }, 255);
         miniShapeIcon->setPosition(CCPoint{ leftX - 86.f, center.y + 14.f });
         m_mainLayer->addChild(miniShapeIcon);
 
-        auto selTitle = CCLabelBMFont::create("Selection", "chatFont.fnt");
+        auto* selTitle = CCLabelBMFont::create("Selection", "chatFont.fnt");
         selTitle->setScale(0.44f);
         selTitle->setColor(ccColor3B{ 232, 82, 105 });
         selTitle->setPosition(CCPoint{ leftX - 42.f, center.y + 19.f });
@@ -2220,28 +2493,25 @@ protected:
         m_mainLayer->addChild(m_userPromptLine1);
 
         m_userPromptLine2 = CCLabelBMFont::create("Prompt: waiting for your message...", "chatFont.fnt");
-        m_userPromptLine2->setScale(0.43f);
+        m_userPromptLine2->setScale(0.42f);
         m_userPromptLine2->setColor(ccColor3B{ 220, 225, 235 });
         m_userPromptLine2->setPosition(CCPoint{ leftX, center.y - 8.f });
         m_mainLayer->addChild(m_userPromptLine2);
 
-        // Чеклист прогресса (Shape / Plan / Drawing / Vector / Place) с розовыми индикаторами
         auto addStepRow = [&](float yPos, const char* stepName, std::string const& rightVal) -> CCLabelBMFont* {
-            auto dot = CCScale9Sprite::create("square02b_001.png");
-            dot->setContentSize(CCSize{ 7.f, 7.f });
-            dot->setColor(ccColor3B{ 232, 65, 98 });
+            auto* dot = createSolidPanel(7.f, 7.f, ccColor3B{ 232, 65, 98 }, 255);
             dot->setPosition(CCPoint{ leftX - 98.f, yPos });
             m_mainLayer->addChild(dot);
 
-            auto nameL = CCLabelBMFont::create(stepName, "chatFont.fnt");
+            auto* nameL = CCLabelBMFont::create(stepName, "chatFont.fnt");
             nameL->setScale(0.41f);
             nameL->setColor(ccColor3B{ 215, 220, 230 });
             nameL->setPosition(CCPoint{ leftX - 68.f, yPos });
             m_mainLayer->addChild(nameL);
 
-            auto valL = CCLabelBMFont::create(rightVal.c_str(), "chatFont.fnt");
+            auto* valL = CCLabelBMFont::create(rightVal.c_str(), "chatFont.fnt");
             valL->setScale(0.41f);
-            valL->setColor(ccColor3B{ 140, 146, 160 });
+            valL->setColor(ccColor3B{ 145, 152, 168 });
             valL->setPosition(CCPoint{ leftX + 26.f, yPos });
             m_mainLayer->addChild(valL);
             return valL;
@@ -2252,23 +2522,19 @@ protected:
         m_stepVectorLabel  = addStepRow(center.y - 47.f, "Vector",  "waiting");
         m_stepPlaceLabel   = addStepRow(center.y - 59.f, "Place",   "waiting");
 
-        // 3. Строка быстрых примеров (For example: [Stone with snow] [Tree with glow] [Crystal] [3D + Neon])
-        auto exHeader = CCLabelBMFont::create("For example", "chatFont.fnt");
+        // Примеры (For example)
+        auto* exHeader = CCLabelBMFont::create("For example", "chatFont.fnt");
         exHeader->setScale(0.40f);
-        exHeader->setColor(ccColor3B{ 130, 135, 148 });
+        exHeader->setColor(ccColor3B{ 135, 140, 155 });
         exHeader->setPosition(CCPoint{ leftX - 88.f, center.y - 72.f });
         m_mainLayer->addChild(exHeader);
 
         auto addExampleChip = [&](const char* label, CCPoint pos, SEL_MenuHandler cb) {
-            auto chipBg = CCScale9Sprite::create("square02b_001.png");
-            chipBg->setContentSize(CCSize{ 52.f, 15.f });
-            chipBg->setColor(ccColor3B{ 30, 32, 38 });
-            auto chipLbl = CCLabelBMFont::create(label, "chatFont.fnt");
-            chipLbl->setScale(0.34f);
-            chipLbl->setColor(ccColor3B{ 215, 220, 230 });
-            chipLbl->setPosition(CCPoint{ 26.f, 7.5f });
-            chipBg->addChild(chipLbl);
-            auto btn = CCMenuItemSpriteExtra::create(chipBg, this, cb);
+            auto* btn = createSolidButton(
+                52.f, 15.f, ccColor3B{ 34, 36, 44 },
+                label, 0.34f, ccColor3B{ 220, 225, 235 },
+                this, cb
+            );
             btn->setPosition(pos);
             m_buttonMenu->addChild(btn);
         };
@@ -2278,33 +2544,26 @@ protected:
         addExampleChip("Crystal",    CCPoint{ leftX + 27.f, center.y - 86.f }, menu_selector(AIDecorPopup::onPresetCrystal));
         addExampleChip("Only 3D",    CCPoint{ leftX + 82.f, center.y - 86.f }, menu_selector(AIDecorPopup::onPresetOnly3D));
 
-        // 4. Нижняя строка ввода с голубым неоновым бликом сверху и розовой кнопкой [ > ]
-        auto glowStrip = CCScale9Sprite::create("square02b_001.png");
-        glowStrip->setContentSize(CCSize{ 160.f, 2.f });
-        glowStrip->setColor(ccColor3B{ 110, 215, 255 });
-        glowStrip->setPosition(CCPoint{ leftX - 15.f, center.y - 102.f });
+        // Нижняя строка ввода чата
+        auto* glowStrip = createSolidPanel(165.f, 2.f, ccColor3B{ 110, 215, 255 }, 255);
+        glowStrip->setPosition(CCPoint{ leftX - 15.f, center.y - 101.f });
         m_mainLayer->addChild(glowStrip);
 
-        auto inputBarBg = CCScale9Sprite::create("square02b_001.png");
-        inputBarBg->setContentSize(CCSize{ 222.f, 28.f });
-        inputBarBg->setColor(ccColor3B{ 24, 25, 30 });
+        auto* inputBarBg = createSolidPanel(222.f, 28.f, ccColor3B{ 26, 28, 35 }, 255);
         inputBarBg->setPosition(CCPoint{ leftX, center.y - 116.f });
         m_mainLayer->addChild(inputBarBg);
 
         m_inputDisplayLabel = CCLabelBMFont::create("", "chatFont.fnt");
-        m_inputDisplayLabel->setScale(0.46f);
+        m_inputDisplayLabel->setScale(0.45f);
         m_inputDisplayLabel->setPosition(CCPoint{ leftX - 14.f, center.y - 116.f });
         m_mainLayer->addChild(m_inputDisplayLabel);
         refreshInputLabel();
 
-        auto sendArrowBg = CCScale9Sprite::create("square02b_001.png");
-        sendArrowBg->setContentSize(CCSize{ 26.f, 22.f });
-        sendArrowBg->setColor(ccColor3B{ 195, 48, 78 });
-        auto sendArrowLbl = CCLabelBMFont::create(">", "bigFont.fnt");
-        sendArrowLbl->setScale(0.42f);
-        sendArrowLbl->setPosition(CCPoint{ 13.f, 12.f });
-        sendArrowBg->addChild(sendArrowLbl);
-        auto sendBtn = CCMenuItemSpriteExtra::create(sendArrowBg, this, menu_selector(AIDecorPopup::onSendToNeuralNet));
+        auto* sendBtn = createSolidButton(
+            26.f, 22.f, ccColor3B{ 215, 52, 85 },
+            ">", 0.52f, ccColor3B{ 255, 255, 255 },
+            this, menu_selector(AIDecorPopup::onSendToNeuralNet)
+        );
         sendBtn->setPosition(CCPoint{ leftX + 94.f, center.y - 116.f });
         m_buttonMenu->addChild(sendBtn);
 
@@ -2313,21 +2572,18 @@ protected:
         // ====================================================================
         float rightX = center.x + 118.f;
 
-        auto tabBarBg = CCScale9Sprite::create("square02b_001.png");
-        tabBarBg->setContentSize(CCSize{ 224.f, 22.f });
-        tabBarBg->setColor(ccColor3B{ 24, 25, 30 });
+        auto* tabBarBg = createSolidPanel(224.f, 22.f, ccColor3B{ 26, 28, 35 }, 255);
         tabBarBg->setPosition(CCPoint{ rightX, center.y + 92.f });
         m_mainLayer->addChild(tabBarBg);
 
-        auto createTabButton = [&](const char* title, CCPoint pos, SEL_MenuHandler cb, CCScale9Sprite*& outBg) {
-            outBg = CCScale9Sprite::create("square02b_001.png");
-            outBg->setContentSize(CCSize{ 72.f, 18.f });
-            auto lbl = CCLabelBMFont::create(title, "chatFont.fnt");
+        auto createTabButton = [&](const char* title, CCPoint pos, SEL_MenuHandler cb, CCLayerColor*& outBg) {
+            outBg = createSolidPanel(72.f, 18.f, ccColor3B{ 26, 28, 35 }, 255);
+            auto* lbl = CCLabelBMFont::create(title, "chatFont.fnt");
             lbl->setScale(0.45f);
             lbl->setColor(ccColor3B{ 245, 248, 255 });
             lbl->setPosition(CCPoint{ 36.f, 9.f });
             outBg->addChild(lbl);
-            auto btn = CCMenuItemSpriteExtra::create(outBg, this, cb);
+            auto* btn = CCMenuItemSpriteExtra::create(outBg, this, cb);
             btn->setPosition(pos);
             m_buttonMenu->addChild(btn);
         };
@@ -2336,24 +2592,16 @@ protected:
         createTabButton("Drawing", CCPoint{ rightX,        center.y + 92.f }, menu_selector(AIDecorPopup::onTabDrawing), m_tabDrawingBg);
         createTabButton("In GD",   CCPoint{ rightX + 73.f, center.y + 92.f }, menu_selector(AIDecorPopup::onTabInGD),    m_tabInGDBg);
 
-        // Синее превью-полотно в стиле редактора GD (как на обоих скриншотах!)
-        auto canvasBg = CCScale9Sprite::create("square02b_001.png");
-        canvasBg->setContentSize(CCSize{ 224.f, 128.f });
-        canvasBg->setColor(ccColor3B{ 18, 92, 212 });
+        // Сплошное синее превью-полотно в стиле редактора GD
+        auto* canvasBg = createSolidPanel(224.f, 128.f, ccColor3B{ 18, 92, 212 }, 255);
         canvasBg->setPosition(CCPoint{ rightX, center.y + 10.f });
         m_mainLayer->addChild(canvasBg);
 
-        // Светящаяся голубая рамка выделения внутри синего превью (как на скриншоте 1)
-        auto selectionFrame = CCScale9Sprite::create("square02b_001.png");
-        selectionFrame->setContentSize(CCSize{ 166.f, 108.f });
-        selectionFrame->setColor(ccColor3B{ 95, 195, 255 });
-        selectionFrame->setOpacity(95);
+        auto* selectionFrame = createSolidPanel(166.f, 108.f, ccColor3B{ 95, 195, 255 }, 120);
         selectionFrame->setPosition(CCPoint{ rightX, center.y + 10.f });
         m_mainLayer->addChild(selectionFrame);
 
-        auto selectionInner = CCScale9Sprite::create("square02b_001.png");
-        selectionInner->setContentSize(CCSize{ 162.f, 104.f });
-        selectionInner->setColor(ccColor3B{ 18, 92, 212 });
+        auto* selectionInner = createSolidPanel(162.f, 104.f, ccColor3B{ 18, 92, 212 }, 255);
         selectionInner->setPosition(CCPoint{ rightX, center.y + 10.f });
         m_mainLayer->addChild(selectionInner);
 
@@ -2361,109 +2609,85 @@ protected:
         m_previewCanvasContent->setPosition(CCPoint{ rightX, center.y + 10.f });
         m_mainLayer->addChild(m_previewCanvasContent);
 
-        // Строка размеров под превью: "180 x 180 units | 30 blocks"
         std::string dimText = fmt::format(
             "{} x {} units  |  {} blocks",
             m_contour.widthUnits(), m_contour.heightUnits(), m_contour.cellCount()
         );
         m_previewSubInfoLabel = CCLabelBMFont::create(dimText.c_str(), "chatFont.fnt");
         m_previewSubInfoLabel->setScale(0.44f);
-        m_previewSubInfoLabel->setColor(ccColor3B{ 170, 176, 190 });
+        m_previewSubInfoLabel->setColor(ccColor3B{ 175, 182, 195 });
         m_previewSubInfoLabel->setPosition(CCPoint{ rightX, center.y - 62.f });
         m_mainLayer->addChild(m_previewSubInfoLabel);
 
         // Кнопки [< Limit 16000 >] и [Inside | Overhang]
-        auto limitPill = CCScale9Sprite::create("square02b_001.png");
-        limitPill->setContentSize(CCSize{ 108.f, 22.f });
-        limitPill->setColor(ccColor3B{ 24, 25, 30 });
+        auto* limitPill = createSolidPanel(108.f, 22.f, ccColor3B{ 26, 28, 35 }, 255);
         limitPill->setPosition(CCPoint{ rightX - 58.f, center.y - 84.f });
         m_mainLayer->addChild(limitPill);
 
         std::string limStr = fmt::format("Limit  {}", g_objectLimit);
         m_limitValueLabel = CCLabelBMFont::create(limStr.c_str(), "chatFont.fnt");
         m_limitValueLabel->setScale(0.42f);
-        m_limitValueLabel->setColor(ccColor3B{ 230, 235, 245 });
+        m_limitValueLabel->setColor(ccColor3B{ 235, 240, 250 });
         m_limitValueLabel->setPosition(CCPoint{ rightX - 58.f, center.y - 84.f });
         m_mainLayer->addChild(m_limitValueLabel);
 
-        auto makeSmallNavBtn = [&](const char* txt, CCPoint pos, SEL_MenuHandler cb) {
-            auto bg = CCScale9Sprite::create("square02b_001.png");
-            bg->setContentSize(CCSize{ 18.f, 18.f });
-            bg->setColor(ccColor3B{ 38, 40, 48 });
-            auto l = CCLabelBMFont::create(txt, "chatFont.fnt");
-            l->setScale(0.45f);
-            l->setPosition(CCPoint{ 9.f, 9.f });
-            bg->addChild(l);
-            auto b = CCMenuItemSpriteExtra::create(bg, this, cb);
-            b->setPosition(pos);
-            m_buttonMenu->addChild(b);
-        };
-        makeSmallNavBtn("<", CCPoint{ rightX - 101.f, center.y - 84.f }, menu_selector(AIDecorPopup::onLimitDec));
-        makeSmallNavBtn(">", CCPoint{ rightX - 15.f,  center.y - 84.f }, menu_selector(AIDecorPopup::onLimitInc));
+        auto* decBtn = createSolidButton(18.f, 18.f, ccColor3B{ 42, 46, 56 }, "<", 0.45f, ccColor3B{ 245, 248, 255 }, this, menu_selector(AIDecorPopup::onLimitDec));
+        decBtn->setPosition(CCPoint{ rightX - 101.f, center.y - 84.f });
+        m_buttonMenu->addChild(decBtn);
 
-        // Переключатель [Inside | Overhang]
-        auto modePill = CCScale9Sprite::create("square02b_001.png");
-        modePill->setContentSize(CCSize{ 108.f, 22.f });
-        modePill->setColor(ccColor3B{ 24, 25, 30 });
+        auto* incBtn = createSolidButton(18.f, 18.f, ccColor3B{ 42, 46, 56 }, ">", 0.45f, ccColor3B{ 245, 248, 255 }, this, menu_selector(AIDecorPopup::onLimitInc));
+        incBtn->setPosition(CCPoint{ rightX - 15.f, center.y - 84.f });
+        m_buttonMenu->addChild(incBtn);
+
+        auto* modePill = createSolidPanel(108.f, 22.f, ccColor3B{ 26, 28, 35 }, 255);
         modePill->setPosition(CCPoint{ rightX + 58.f, center.y - 84.f });
         m_mainLayer->addChild(modePill);
 
-        auto createModeHalf = [&](const char* txt, CCPoint pos, SEL_MenuHandler cb, CCScale9Sprite*& outBg) {
-            outBg = CCScale9Sprite::create("square02b_001.png");
-            outBg->setContentSize(CCSize{ 51.f, 18.f });
-            auto l = CCLabelBMFont::create(txt, "chatFont.fnt");
+        auto createModeHalf = [&](const char* txt, CCPoint pos, SEL_MenuHandler cb, CCLayerColor*& outBg) {
+            outBg = createSolidPanel(51.f, 18.f, ccColor3B{ 26, 28, 35 }, 255);
+            auto* l = CCLabelBMFont::create(txt, "chatFont.fnt");
             l->setScale(0.40f);
             l->setColor(ccColor3B{ 245, 248, 255 });
             l->setPosition(CCPoint{ 25.5f, 9.f });
             outBg->addChild(l);
-            auto b = CCMenuItemSpriteExtra::create(outBg, this, cb);
+            auto* b = CCMenuItemSpriteExtra::create(outBg, this, cb);
             b->setPosition(pos);
             m_buttonMenu->addChild(b);
         };
         createModeHalf("Inside",   CCPoint{ rightX + 32.f, center.y - 84.f }, menu_selector(AIDecorPopup::onSelectInside),   m_insideTabBg);
         createModeHalf("Overhang", CCPoint{ rightX + 84.f, center.y - 84.f }, menu_selector(AIDecorPopup::onSelectOverhang), m_overhangTabBg);
 
-        // Нижние кнопки: [Another variant (1)] и [Keep]
-        auto varBg = CCScale9Sprite::create("square02b_001.png");
-        varBg->setContentSize(CCSize{ 108.f, 28.f });
-        varBg->setColor(ccColor3B{ 26, 27, 33 });
+        // Нижние кнопки: [Another variant] и [Keep]
         std::string varStr = fmt::format("Another variant ({})", g_variantIndex);
-        m_anotherVariantLabel = CCLabelBMFont::create(varStr.c_str(), "chatFont.fnt");
-        m_anotherVariantLabel->setScale(0.42f);
-        m_anotherVariantLabel->setColor(ccColor3B{ 205, 210, 222 });
-        m_anotherVariantLabel->setPosition(CCPoint{ 54.f, 14.f });
-        varBg->addChild(m_anotherVariantLabel);
-        auto varBtn = CCMenuItemSpriteExtra::create(varBg, this, menu_selector(AIDecorPopup::onAnotherVariantClicked));
+        auto* varBtn = createSolidButton(
+            108.f, 28.f, ccColor3B{ 30, 32, 40 },
+            varStr.c_str(), 0.42f, ccColor3B{ 215, 220, 232 },
+            this, menu_selector(AIDecorPopup::onAnotherVariantClicked)
+        );
         varBtn->setPosition(CCPoint{ rightX - 58.f, center.y - 116.f });
         m_buttonMenu->addChild(varBtn);
 
-        auto keepBg = CCScale9Sprite::create("square02b_001.png");
-        keepBg->setContentSize(CCSize{ 108.f, 28.f });
-        keepBg->setColor(ccColor3B{ 148, 38, 66 });
-        auto keepLbl = CCLabelBMFont::create("Keep", "chatFont.fnt");
-        keepLbl->setScale(0.50f);
-        keepLbl->setColor(ccColor3B{ 255, 240, 245 });
-        keepLbl->setPosition(CCPoint{ 54.f, 14.f });
-        keepBg->addChild(keepLbl);
-        auto keepBtn = CCMenuItemSpriteExtra::create(keepBg, this, menu_selector(AIDecorPopup::onKeepClicked));
+        auto* keepBtn = createSolidButton(
+            108.f, 28.f, ccColor3B{ 158, 38, 68 },
+            "Keep", 0.50f, ccColor3B{ 255, 245, 248 },
+            this, menu_selector(AIDecorPopup::onKeepClicked)
+        );
         keepBtn->setPosition(CCPoint{ rightX + 58.f, center.y - 116.f });
         m_buttonMenu->addChild(keepBtn);
 
         refreshRightPanelTabsAndCanvas();
     }
 
-    // Отрисовка мини-превью выбранной фигуры (Shape) или готового арта (Drawing / In GD) на синем полотне!
     void refreshRightPanelTabsAndCanvas() {
-        if (m_tabShapeBg)   m_tabShapeBg->setColor((m_previewTab == 0) ? ccColor3B{ 232, 65, 98 } : ccColor3B{ 24, 25, 30 });
-        if (m_tabDrawingBg) m_tabDrawingBg->setColor((m_previewTab == 1) ? ccColor3B{ 232, 65, 98 } : ccColor3B{ 24, 25, 30 });
-        if (m_tabInGDBg)    m_tabInGDBg->setColor((m_previewTab == 2) ? ccColor3B{ 232, 65, 98 } : ccColor3B{ 24, 25, 30 });
+        if (m_tabShapeBg)   m_tabShapeBg->setColor((m_previewTab == 0) ? ccColor3B{ 232, 65, 98 } : ccColor3B{ 26, 28, 35 });
+        if (m_tabDrawingBg) m_tabDrawingBg->setColor((m_previewTab == 1) ? ccColor3B{ 232, 65, 98 } : ccColor3B{ 26, 28, 35 });
+        if (m_tabInGDBg)    m_tabInGDBg->setColor((m_previewTab == 2) ? ccColor3B{ 232, 65, 98 } : ccColor3B{ 26, 28, 35 });
 
-        if (m_insideTabBg)   m_insideTabBg->setColor(!g_overhangAllowed ? ccColor3B{ 232, 65, 98 } : ccColor3B{ 24, 25, 30 });
-        if (m_overhangTabBg) m_overhangTabBg->setColor(g_overhangAllowed  ? ccColor3B{ 232, 65, 98 } : ccColor3B{ 24, 25, 30 });
+        if (m_insideTabBg)   m_insideTabBg->setColor(!g_overhangAllowed ? ccColor3B{ 232, 65, 98 } : ccColor3B{ 26, 28, 35 });
+        if (m_overhangTabBg) m_overhangTabBg->setColor(g_overhangAllowed  ? ccColor3B{ 232, 65, 98 } : ccColor3B{ 26, 28, 35 });
 
         if (!m_previewCanvasContent) return;
 
-        // Очищаем старый контент превью, заменяя контейнер новым узлом
         CCPoint canvasPos = m_previewCanvasContent->getPosition();
         m_previewCanvasContent->setScale(0.f);
         m_previewCanvasContent = CCNode::create();
@@ -2481,36 +2705,35 @@ protected:
         float startY = -totalH * 0.5f + cellPx * 0.5f;
 
         if (m_previewTab == 0 || !g_hasGeneratedArt) {
-            // Вкладка "Shape": Белый силуэт выделенной игроком фигуры на синей сетке (как на скриншоте 1!)
             for (auto const& [gx, gy] : m_contour.occupiedCells) {
                 float px = startX + (gx - m_contour.minGX) * cellPx;
                 float py = startY + (gy - m_contour.minGY) * cellPx;
-                auto blockSpr = CCScale9Sprite::create("square02b_001.png");
-                blockSpr->setContentSize(CCSize{ cellPx + 0.8f, cellPx + 0.8f });
-                blockSpr->setColor(ccColor3B{ 242, 245, 250 });
+                auto* blockSpr = createSolidPanel(cellPx + 0.5f, cellPx + 0.5f, ccColor3B{ 245, 248, 255 }, 255);
                 blockSpr->setPosition(CCPoint{ px, py });
                 m_previewCanvasContent->addChild(blockSpr);
             }
         } else {
-            // Вкладка "Drawing" / "In GD": Показываем сгенерированный ИИ цветной арт внутри формы (как на скриншоте 2!)
             for (auto const& [gx, gy] : m_contour.occupiedCells) {
                 float px = startX + (gx - m_contour.minGX) * cellPx;
                 float py = startY + (gy - m_contour.minGY) * cellPx;
 
-                auto fillSpr = CCScale9Sprite::create("square02b_001.png");
-                fillSpr->setContentSize(CCSize{ cellPx + 0.5f, cellPx + 0.5f });
-                fillSpr->setColor(g_lastPreviewPalette.slotColors[static_cast<int>(ColorSlot::DarkFill)]);
+                auto* fillSpr = createSolidPanel(
+                    cellPx + 0.5f, cellPx + 0.5f,
+                    g_lastPreviewPalette.slotColors[static_cast<int>(ColorSlot::DarkFill)],
+                    255
+                );
                 fillSpr->setPosition(CCPoint{ px, py });
                 m_previewCanvasContent->addChild(fillSpr);
 
-                auto texSpr = CCScale9Sprite::create("square02b_001.png");
-                texSpr->setContentSize(CCSize{ cellPx * 0.72f, cellPx * 0.72f });
-                texSpr->setColor(g_lastPreviewPalette.slotColors[static_cast<int>(ColorSlot::MidTone)]);
+                auto* texSpr = createSolidPanel(
+                    cellPx * 0.72f, cellPx * 0.72f,
+                    g_lastPreviewPalette.slotColors[static_cast<int>(ColorSlot::MidTone)],
+                    255
+                );
                 texSpr->setPosition(CCPoint{ px, py });
                 m_previewCanvasContent->addChild(texSpr);
             }
 
-            // Отображаем кастомные детали ИИ в превью
             float worldMinX = m_contour.minGX * 30.f;
             float worldMinY = m_contour.minGY * 30.f;
             float scaleRatio = cellPx / 30.f;
@@ -2523,16 +2746,14 @@ protected:
                 float px = -totalW * 0.5f + (s.x - worldMinX) * scaleRatio;
                 float py = -totalH * 0.5f + (s.y - worldMinY) * scaleRatio;
 
-                auto detSpr = CCScale9Sprite::create("square02b_001.png");
                 float w = std::clamp(s.scaleX * cellPx * 0.65f, 2.5f, cellPx * 1.1f);
                 float h = std::clamp(s.scaleY * cellPx * 0.65f, 2.5f, cellPx * 1.1f);
-                detSpr->setContentSize(CCSize{ w, h });
-                detSpr->setRotation(s.rotation);
-
                 ccColor3B col = (s.colorSlot == ColorSlot::CustomRGB)
                     ? s.customColor
                     : g_lastPreviewPalette.slotColors[std::clamp(static_cast<int>(s.colorSlot), 0, 5)];
-                detSpr->setColor(col);
+
+                auto* detSpr = createSolidPanel(w, h, col, 255);
+                detSpr->setRotation(s.rotation);
                 detSpr->setPosition(CCPoint{ px, py });
                 m_previewCanvasContent->addChild(detSpr);
             }
@@ -2542,15 +2763,15 @@ protected:
     void refreshInputLabel() {
         if (!m_inputDisplayLabel) return;
         if (m_inputBuffer.empty()) {
-            if (m_isApiGateStage) {
+            if (m_stage == PopupStage::ApiGate) {
                 m_inputDisplayLabel->setString("Paste valid API key (Ctrl+V) or type here...");
             } else {
                 m_inputDisplayLabel->setString("Describe the art or ask AI...");
             }
-            m_inputDisplayLabel->setColor(ccColor3B{ 125, 130, 145 });
+            m_inputDisplayLabel->setColor(ccColor3B{ 140, 146, 162 });
         } else {
             std::string shown = m_inputBuffer;
-            size_t maxLen = m_isApiGateStage ? 48 : 30;
+            size_t maxLen = (m_stage == PopupStage::ApiGate) ? 48 : 30;
             if (shown.size() > maxLen) {
                 shown = "..." + shown.substr(shown.size() - (maxLen - 3));
             }
@@ -2560,35 +2781,62 @@ protected:
         }
     }
 
-    void reopenPopup(bool forceApiGate) {
+    void reopenWithStage(PopupStage nextStage, PopupStage returnStage = PopupStage::ApiGate) {
         EditorUI* ui = m_editorUI;
         ContourAnalysis contourCopy = m_contour;
         restoreLockedContourPositions();
         g_activePopup = nullptr;
         this->onClose(nullptr);
-        if (auto* next = AIDecorPopup::create(ui, std::move(contourCopy), forceApiGate)) {
+        if (auto* next = AIDecorPopup::create(ui, std::move(contourCopy), nextStage, returnStage)) {
             next->show();
         }
     }
 
-    // Обработчики экрана проверки API-ключа
+    // Обработчики переключения провайдера и окна выбора модели
     void onCycleApiProvider(CCObject*) {
-        m_providerIdx = (m_providerIdx + 1) % 5;
-        if (m_providerBtnLabel) {
-            std::string provText = fmt::format("Provider: {} (Click to switch)", kApiProviders[m_providerIdx].name);
-            m_providerBtnLabel->setString(provText.c_str());
-        }
+        g_apiProviderIndex = (g_apiProviderIndex + 1) % 5;
+        reopenWithStage(PopupStage::ApiGate);
     }
+
+    void onOpenModelSelectorFromGate(CCObject*) {
+        reopenWithStage(PopupStage::ModelSelector, PopupStage::ApiGate);
+    }
+
+    void onOpenModelSelectorFromMain(CCObject*) {
+        reopenWithStage(PopupStage::ModelSelector, PopupStage::ArtAgentMain);
+    }
+
+    void onCycleProviderInModelWindow(CCObject*) {
+        g_apiProviderIndex = (g_apiProviderIndex + 1) % 5;
+        reopenWithStage(PopupStage::ModelSelector, m_returnStageAfterModel);
+    }
+
+    void onCloseModelSelectorWindow(CCObject*) {
+        reopenWithStage(m_returnStageAfterModel);
+    }
+
+    void selectModelSlot(int slotIdx) {
+        g_selectedModelIndex[m_providerIdx] = std::clamp(slotIdx, 0, 3);
+        if (g_apiVerifiedAndConnected && !g_connectedApiKey.empty()) {
+            saveVerifiedApiToDisk(m_providerIdx, g_connectedApiKey);
+        }
+        reopenWithStage(m_returnStageAfterModel);
+    }
+
+    void onPickModel0(CCObject*) { selectModelSlot(0); }
+    void onPickModel1(CCObject*) { selectModelSlot(1); }
+    void onPickModel2(CCObject*) { selectModelSlot(2); }
+    void onPickModel3(CCObject*) { selectModelSlot(3); }
 
     void onPasteApiClicked(CCObject*) {
         std::string clip = readWindowsClipboardText();
         if (!clip.empty()) {
             m_inputBuffer = clip;
             if (m_inputBuffer.size() > 180) m_inputBuffer.resize(180);
-            m_providerIdx = detectProviderFromKey(m_inputBuffer, m_providerIdx);
-            if (m_providerBtnLabel) {
-                std::string provText = fmt::format("Provider: {} (Auto-detected)", kApiProviders[m_providerIdx].name);
-                m_providerBtnLabel->setString(provText.c_str());
+            int det = detectProviderFromKey(m_inputBuffer, m_providerIdx);
+            if (det != m_providerIdx) {
+                g_apiProviderIndex = det;
+                m_providerIdx = det;
             }
             refreshInputLabel();
         }
@@ -2603,6 +2851,7 @@ protected:
     void onVerifyAndConnectApi(CCObject*) {
         std::string key = trimWhitespace(m_inputBuffer);
         m_providerIdx = detectProviderFromKey(key, m_providerIdx);
+        g_apiProviderIndex = m_providerIdx;
 
         std::string errMsg;
         if (!verifyApiKeyWithServer(m_providerIdx, key, errMsg)) {
@@ -2614,19 +2863,18 @@ protected:
             return;
         }
 
-        // Ключ реально проверен сервером — загорается зеленая галочка и открывается Art Agent!
         setCheckmarkState(true);
         saveVerifiedApiToDisk(m_providerIdx, key);
-        reopenPopup(false);
+        reopenWithStage(PopupStage::ArtAgentMain);
     }
 
     void onOpenApiGate(CCObject*) {
-        reopenPopup(true);
+        reopenWithStage(PopupStage::ApiGate);
     }
 
     void onBackToArtAgent(CCObject*) {
         if (g_apiVerifiedAndConnected) {
-            reopenPopup(false);
+            reopenWithStage(PopupStage::ArtAgentMain);
         }
     }
 
@@ -2637,12 +2885,10 @@ protected:
         }
     }
 
-    // Вкладки превью справа
     void onTabShape(CCObject*)   { m_previewTab = 0; refreshRightPanelTabsAndCanvas(); }
     void onTabDrawing(CCObject*) { m_previewTab = 1; refreshRightPanelTabsAndCanvas(); }
     void onTabInGD(CCObject*)    { m_previewTab = 2; refreshRightPanelTabsAndCanvas(); }
 
-    // Регулятор лимита и режима Inside / Overhang
     void onLimitDec(CCObject*) {
         g_objectLimit = (std::max)(50, g_objectLimit - 1000);
         if (m_limitValueLabel) {
@@ -2662,7 +2908,6 @@ protected:
     void onSelectInside(CCObject*)   { g_overhangAllowed = false; refreshRightPanelTabsAndCanvas(); }
     void onSelectOverhang(CCObject*) { g_overhangAllowed = true;  refreshRightPanelTabsAndCanvas(); }
 
-    // Быстрые чипы-примеры (For example)
     void onPresetStoneSnow(CCObject*) { m_inputBuffer = "Stone with snow and icy glow"; refreshInputLabel(); onSendToNeuralNet(nullptr); }
     void onPresetTreeGlow(CCObject*)  { m_inputBuffer = "Tree with neon glow and leaves"; refreshInputLabel(); onSendToNeuralNet(nullptr); }
     void onPresetCrystal(CCObject*)   { m_inputBuffer = "Glowing crystal structure"; refreshInputLabel(); onSendToNeuralNet(nullptr); }
@@ -2675,10 +2920,6 @@ protected:
             m_inputBuffer = g_lastBuildPrompt;
         }
         g_variantIndex++;
-        if (m_anotherVariantLabel) {
-            std::string s = fmt::format("Another variant ({})", g_variantIndex);
-            m_anotherVariantLabel->setString(s.c_str());
-        }
         onSendToNeuralNet(nullptr);
     }
 
@@ -2686,7 +2927,6 @@ protected:
         this->onClose(nullptr);
     }
 
-    // Отправка сообщения реальной подключенной ИИ-нейросети
     void onSendToNeuralNet(CCObject*) {
         restoreLockedContourPositions();
 
@@ -2702,7 +2942,6 @@ protected:
             m_userPromptLine2->setString(shortP.c_str());
         }
 
-        // Вызываем реальную нейросеть по HTTPS!
         AIDecisionResult ai = queryRealNeuralNetwork(
             promptText,
             m_contour,
@@ -2711,7 +2950,6 @@ protected:
             g_variantIndex
         );
 
-        // Выводим свободный ответ нейросети в карточку Agent (3 строки)
         auto replyLines = wrapTextLines(ai.replyText, 44, 3);
         if (m_agentReplyLine1) m_agentReplyLine1->setString(replyLines[0].c_str());
         if (m_agentReplyLine2) m_agentReplyLine2->setString(replyLines[1].c_str());
@@ -2722,7 +2960,6 @@ protected:
             return;
         }
 
-        // Если нейросеть решила, что это обычный диалог ("action": "chat") — ничего не строим!
         if (ai.taskMode == AITaskMode::ChatOnly) {
             if (m_stepPlanLabel)    m_stepPlanLabel->setString("chat response");
             if (m_stepDrawingLabel) m_stepDrawingLabel->setString("idle");
@@ -2731,7 +2968,6 @@ protected:
             return;
         }
 
-        // Если нейросеть решила отменить постройку ("action": "undo")
         if (ai.taskMode == AITaskMode::UndoLast) {
             int rem = clearLastPlacedObjects();
             g_hasGeneratedArt = false;
@@ -2744,7 +2980,6 @@ protected:
             return;
         }
 
-        // Иначе нейросеть генерирует постройку / арт!
         g_lastBuildPrompt = promptText;
         std::mt19937 rng(std::random_device{}());
         EditorTabCatalog catalog = loadEditorTabCatalog(m_editorUI);
@@ -2764,7 +2999,7 @@ protected:
         g_lastPreviewSpecs = specs;
         g_lastPreviewPalette = palette;
         g_hasGeneratedArt = true;
-        m_previewTab = 1; // Переключаем правое превью на вкладку "Drawing", как на скриншоте 2!
+        m_previewTab = 1;
         refreshRightPanelTabsAndCanvas();
 
         if (m_stepPlanLabel) {
@@ -2786,6 +3021,7 @@ protected:
 
     void updateKeyboardAndLock(float) {
         restoreLockedContourPositions();
+        if (m_stage == PopupStage::ModelSelector) return;
 
 #ifdef GEODE_IS_WINDOWS
         bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -2805,7 +3041,7 @@ protected:
         }
 
         if (ctrlDown && wasJustPressed('V')) {
-            if (m_isApiGateStage) {
+            if (m_stage == PopupStage::ApiGate) {
                 onPasteApiClicked(nullptr);
             } else {
                 std::string clip = readWindowsClipboardText();
@@ -2827,7 +3063,7 @@ protected:
         }
 
         if (wasJustPressed(VK_RETURN)) {
-            if (m_isApiGateStage) {
+            if (m_stage == PopupStage::ApiGate) {
                 onVerifyAndConnectApi(nullptr);
             } else {
                 onSendToNeuralNet(nullptr);
@@ -2856,7 +3092,7 @@ protected:
             for (auto const& entry : kRusKeyTable) {
                 if (wasJustPressed(entry.vk)) {
                     if (m_inputBuffer.size() < 160) {
-                        if (m_russianLayout && !m_isApiGateStage) {
+                        if (m_russianLayout && m_stage == PopupStage::ArtAgentMain) {
                             m_inputBuffer += entry.rusPhonetic;
                         } else {
                             m_inputBuffer.push_back(shiftDown ? entry.engShift : entry.engLower);
@@ -2882,9 +3118,14 @@ public:
         this->onClose(nullptr);
     }
 
-    static AIDecorPopup* create(EditorUI* ui, ContourAnalysis contour, bool forceApiGate = false) {
+    static AIDecorPopup* create(
+        EditorUI* ui,
+        ContourAnalysis contour,
+        PopupStage requestedStage = PopupStage::ArtAgentMain,
+        PopupStage prevStage = PopupStage::ApiGate
+    ) {
         auto ret = new AIDecorPopup();
-        if (ret && ret->init(ui, std::move(contour), forceApiGate)) {
+        if (ret && ret->init(ui, std::move(contour), requestedStage, prevStage)) {
             ret->autorelease();
             return ret;
         }
@@ -2926,7 +3167,7 @@ class $modify(AIDecorEditorUI, EditorUI) {
         }
 
         ContourAnalysis contour = analyzeSelectedContour(this);
-        if (auto* popup = AIDecorPopup::create(this, std::move(contour), false)) {
+        if (auto* popup = AIDecorPopup::create(this, std::move(contour), PopupStage::ArtAgentMain)) {
             popup->show();
         }
     }
