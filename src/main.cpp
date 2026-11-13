@@ -310,7 +310,7 @@ struct ApiProviderConfig {
 };
 
 static constexpr ApiProviderConfig kApiProviders[5] = {
-    // 0: Google Gemini (используем нативный v1beta/models/...:generateContent без ошибки 404!)
+    // 0: Google Gemini (актуальная линейка с новейшей Gemini 4 Hydrogen!)
     {
         "Gemini",
         L"generativelanguage.googleapis.com",
@@ -318,8 +318,8 @@ static constexpr ApiProviderConfig kApiProviders[5] = {
         L"/v1beta/models",
         true,
         {
-            { "gemini-flash-latest",   "Gemini Flash Latest",     "Always active auto-alias (Recommended)" },
-            { "gemini-3.8-flash",      "Gemini 3.8 Flash",        "Latest flagship high-speed model" },
+            { "gemini-4-hydrogen",     "Gemini 4 Hydrogen",       "Newest Gemini 4 fast agentic model (Recommended)" },
+            { "gemini-3.8-flash",      "Gemini 3.8 Flash",        "High-speed Gemini 3.8 model" },
             { "gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite",   "Ultra-fast low-latency model" },
             { "gemini-2.5-flash-lite", "Gemini 2.5 Flash-Lite",   "Stable long-term supported model" }
         }
@@ -583,7 +583,7 @@ static bool performWinHttpRequest(
 
 // Извлекает первую доступную flash/pro модель из ответа GET /v1beta/models?key=...
 static void extractAvailableGeminiModelFromList(std::string const& modelsJson) {
-    for (const char* preferred : { "gemini-flash-latest", "gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite", "gemini-2.0-flash" }) {
+    for (const char* preferred : { "gemini-4-hydrogen", "gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite" }) {
         std::string needle = std::string("\"models/") + preferred + "\"";
         if (modelsJson.find(needle) != std::string::npos) {
             g_discoveredGeminiModel = preferred;
@@ -601,8 +601,15 @@ static void extractAvailableGeminiModelFromList(std::string const& modelsJson) {
 }
 
 // Надежная проверка API-ключа через GET /models (НИКОГДА не выдает 404 из-за имени модели!)
+static std::string sanitizeApiKeyString(std::string s) {
+    s = trimWhitespace(s);
+    while (!s.empty() && (s.front() == '"' || s.front() == '\'')) s.erase(s.begin());
+    while (!s.empty() && (s.back() == '"' || s.back() == '\'' || s.back() == '\0')) s.pop_back();
+    return trimWhitespace(s);
+}
+
 static bool verifyApiKeyWithServer(int providerIdx, std::string const& rawKey, std::string& outErrorMsg) {
-    std::string key = trimWhitespace(rawKey);
+    std::string key = sanitizeApiKeyString(rawKey);
     if (!hasPlausibleKeyFormat(key)) {
         outErrorMsg = "Key format invalid (too short or contains spaces)";
         return false;
@@ -614,13 +621,13 @@ static bool verifyApiKeyWithServer(int providerIdx, std::string const& rawKey, s
     std::string netErr;
 
     if (kApiProviders[providerIdx].isGeminiNative) {
-        // Для Gemini проверяем ключ официальным методом GET /v1beta/models?key=API_KEY
-        std::wstring pathW = std::wstring(kApiProviders[providerIdx].modelsListPathW) + L"?key=" + utf8ToWideASCII(key);
+        // Способ 1: Официальный заголовок x-goog-api-key на GET /v1beta/models
+        std::wstring hdrW = L"x-goog-api-key: " + utf8ToWideASCII(key) + L"\r\n";
         bool ok = performWinHttpRequest(
             L"GET",
             kApiProviders[providerIdx].hostW,
-            pathW,
-            L"",
+            kApiProviders[providerIdx].modelsListPathW,
+            hdrW,
             "",
             httpStatus,
             respBody,
@@ -630,8 +637,15 @@ static bool verifyApiKeyWithServer(int providerIdx, std::string const& rawKey, s
             extractAvailableGeminiModelFromList(respBody);
             return true;
         }
+
+        // Способ 2: Проверка прямым запросом к выбранной модели (gemini-4-hydrogen) через x-goog-api-key
+        std::string pingBody = "{\"contents\":[{\"parts\":[{\"text\":\"hi\"}]}],\"generationConfig\":{\"maxOutputTokens\":4}}";
+        std::wstring genHdrW = L"Content-Type: application/json\r\nx-goog-api-key: " + utf8ToWideASCII(key) + L"\r\n";
+        std::wstring genPathW = L"/v1beta/models/" + utf8ToWideASCII(getCurrentModelID(0)) + L":generateContent";
+        if (performWinHttpRequest(L"POST", kApiProviders[providerIdx].hostW, genPathW, genHdrW, pingBody, httpStatus, respBody, netErr) && httpStatus == 200) {
+            return true;
+        }
     } else {
-        // Для OpenAI / DeepSeek / Groq / OpenRouter проверяем ключ через GET /models с Bearer-токеном
         std::wstring headersW = L"Authorization: Bearer " + utf8ToWideASCII(key) + L"\r\n";
         bool ok = performWinHttpRequest(
             L"GET",
@@ -648,12 +662,15 @@ static bool verifyApiKeyWithServer(int providerIdx, std::string const& rawKey, s
         }
     }
 
-    if (httpStatus == 400 || httpStatus == 401 || httpStatus == 403) {
-        outErrorMsg = fmt::format("Invalid API Key (HTTP {}) — rejected by {}", httpStatus, kApiProviders[providerIdx].name);
+    // Извлекаем точное сообщение ошибки от сервера, чтобы пользователь видел причину
+    std::string serverMsg = extractJsonStringField(respBody, "message");
+    if (!serverMsg.empty()) {
+        if (serverMsg.size() > 64) serverMsg = serverMsg.substr(0, 61) + "...";
+        outErrorMsg = fmt::format("HTTP {}: {}", httpStatus, serverMsg);
         return false;
     }
     if (httpStatus > 0) {
-        outErrorMsg = fmt::format("Server returned HTTP {} from {}", httpStatus, kApiProviders[providerIdx].name);
+        outErrorMsg = fmt::format("HTTP {} rejected by {}", httpStatus, kApiProviders[providerIdx].name);
         return false;
     }
     outErrorMsg = netErr.empty() ? "Connection failed" : netErr;
@@ -889,8 +906,8 @@ static AIDecisionResult queryRealNeuralNetwork(
 
         bool ok = false;
         for (auto const& modName : candidateModels) {
-            std::wstring pathW = L"/v1beta/models/" + utf8ToWideASCII(modName) + L":generateContent?key=" + utf8ToWideASCII(g_connectedApiKey);
-            std::wstring hdrW  = L"Content-Type: application/json\r\n";
+            std::wstring pathW = L"/v1beta/models/" + utf8ToWideASCII(modName) + L":generateContent";
+            std::wstring hdrW  = L"Content-Type: application/json\r\nx-goog-api-key: " + utf8ToWideASCII(g_connectedApiKey) + L"\r\n";
             if (performWinHttpRequest(L"POST", kApiProviders[0].hostW, pathW, hdrW, geminiBody, httpStatus, rawResp, errText)) {
                 ok = true;
                 break;
@@ -2004,7 +2021,7 @@ static std::string readWindowsClipboardText() {
         CloseClipboard();
     }
 #endif
-    return trimWhitespace(out);
+    return sanitizeApiKeyString(out);
 }
 
 // ============================================================================
@@ -2849,7 +2866,7 @@ protected:
     }
 
     void onVerifyAndConnectApi(CCObject*) {
-        std::string key = trimWhitespace(m_inputBuffer);
+        std::string key = sanitizeApiKeyString(m_inputBuffer);
         m_providerIdx = detectProviderFromKey(key, m_providerIdx);
         g_apiProviderIndex = m_providerIdx;
 
