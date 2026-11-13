@@ -17,6 +17,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -960,72 +961,130 @@ static bool loadReferenceImageFromPath(std::string const& filePath, std::string&
     return true;
 }
 
-// Открытие системного диалога выбора файла Windows (через comdlg32.dll динамически без линковки)
-static bool pickReferenceImageDialog(std::string& outStatus) {
+// Чтение скопированного файла картинки (CF_HDROP) или пути к картинке из буфера обмена Windows (без открытия окон!)
+static bool tryLoadReferenceImageFromClipboard(std::string& outStatus) {
 #ifdef GEODE_IS_WINDOWS
-    struct OPENFILENAMEA_LOCAL {
-        uint32_t lStructSize;
-        void* hwndOwner;
-        void* hInstance;
-        const char* lpstrFilter;
-        char* lpstrCustomFilter;
-        uint32_t nMaxCustFilter;
-        uint32_t nFilterIndex;
-        char* lpstrFile;
-        uint32_t nMaxFile;
-        char* lpstrFileTitle;
-        uint32_t nMaxFileTitle;
-        const char* lpstrInitialDir;
-        const char* lpstrTitle;
-        uint32_t Flags;
-        uint16_t nFileOffset;
-        uint16_t nFileExtension;
-        const char* lpstrDefExt;
-        uintptr_t lCustData;
-        void* lpfnHook;
-        const char* lpTemplateName;
-        void* pvReserved;
-        uint32_t dwReserved;
-        uint32_t FlagsEx;
-    };
+    if (!OpenClipboard(nullptr)) return false;
 
-    HMODULE hComDlg = LoadLibraryA("comdlg32.dll");
-    if (!hComDlg) {
-        outStatus = "comdlg32.dll unavailable";
-        return false;
-    }
-    using FnGetOpenFileNameA = BOOL(WINAPI*)(OPENFILENAMEA_LOCAL*);
-    auto pGetOpen = reinterpret_cast<FnGetOpenFileNameA>(GetProcAddress(hComDlg, "GetOpenFileNameA"));
-    if (!pGetOpen) {
-        FreeLibrary(hComDlg);
-        outStatus = "GetOpenFileNameA missing";
-        return false;
+    // 1. Проверяем CF_HDROP (если игрок нажал Ctrl+C на файле картинки в Проводнике Windows)
+    constexpr uint32_t kCF_HDROP = 15;
+    HANDLE hDrop = GetClipboardData(kCF_HDROP);
+    if (hDrop) {
+        HMODULE hShell = LoadLibraryA("shell32.dll");
+        if (hShell) {
+            using FnDragQueryFileA = uint32_t(WINAPI*)( void*, uint32_t, char*, uint32_t );
+            auto pDragQuery = reinterpret_cast<FnDragQueryFileA>(GetProcAddress(hShell, "DragQueryFileA"));
+            if (pDragQuery) {
+                char pathBuf[1024]{};
+                if (pDragQuery(hDrop, 0, pathBuf, sizeof(pathBuf)) > 0 && pathBuf[0] != 0) {
+                    CloseClipboard();
+                    FreeLibrary(hShell);
+                    return loadReferenceImageFromPath(std::string(pathBuf), outStatus);
+                }
+            }
+            FreeLibrary(hShell);
+        }
     }
 
-    char fileBuf[1024]{};
-    static constexpr char kFilterStr[] =
-        "Reference Images (*.png;*.jpg;*.jpeg;*.webp;*.bmp)\0*.png;*.jpg;*.jpeg;*.webp;*.bmp\0All Files (*.*)\0*.*\0";
-
-    OPENFILENAMEA_LOCAL ofn{};
-    ofn.lStructSize = sizeof(OPENFILENAMEA_LOCAL);
-    ofn.hwndOwner = nullptr;
-    ofn.lpstrFilter = kFilterStr;
-    ofn.lpstrFile = fileBuf;
-    ofn.nMaxFile = sizeof(fileBuf);
-    ofn.lpstrTitle = "Select Reference Image for AI Art Agent";
-    ofn.Flags = 0x00080000 | 0x00001000 | 0x00000800 | 0x00000008;
-
-    BOOL picked = pGetOpen(&ofn);
-    FreeLibrary(hComDlg);
-
-    if (!picked || fileBuf[0] == 0) {
-        outStatus = "Selection cancelled";
-        return false;
+    // 2. Проверяем текстовый путь в буфере обмена (если скопирован путь к .png/.jpg/.webp/.bmp)
+    HANDLE hText = GetClipboardData(CF_TEXT);
+    if (hText) {
+        char const* rawTxt = static_cast<char const*>(GlobalLock(hText));
+        if (rawTxt) {
+            std::string candidate = sanitizeApiKeyString(rawTxt);
+            GlobalUnlock(hText);
+            std::string lower = candidate;
+            for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (lower.find(".png") != std::string::npos ||
+                lower.find(".jpg") != std::string::npos ||
+                lower.find(".jpeg") != std::string::npos ||
+                lower.find(".webp") != std::string::npos ||
+                lower.find(".bmp") != std::string::npos) {
+                CloseClipboard();
+                return loadReferenceImageFromPath(candidate, outStatus);
+            }
+        }
     }
-    return loadReferenceImageFromPath(std::string(fileBuf), outStatus);
-#else
-    outStatus = "File dialog requires Windows";
+
+    CloseClipboard();
+#endif
+    (void)outStatus;
     return false;
+}
+
+// Асинхронный выбор файла в отдельном фоновом потоке std::thread,
+// чтобы основной поток рендера Geometry Dash НИКОГДА не зависал и окно выбора легко закрывалось!
+static bool g_fileDialogThreadActive = false;
+static bool g_fileDialogHasResult = false;
+static bool g_fileDialogPickedSuccess = false;
+static std::string g_fileDialogPickedPath;
+
+static void startAsyncReferenceImageDialog() {
+    if (g_fileDialogThreadActive) return;
+    g_fileDialogThreadActive = true;
+    g_fileDialogHasResult = false;
+    g_fileDialogPickedSuccess = false;
+    g_fileDialogPickedPath.clear();
+
+#ifdef GEODE_IS_WINDOWS
+    std::thread([]() {
+        // Классический 76-байтный размер OPENFILENAMEA (OPENFILENAME_SIZE_VERSION_400A)
+        // гарантирует 100% совпадение ABI на 32-битной и 64-битной Windows и мгновенное закрытие!
+        struct OPENFILENAMEA_COMPAT {
+            uint32_t lStructSize;
+            void* hwndOwner;
+            void* hInstance;
+            const char* lpstrFilter;
+            char* lpstrCustomFilter;
+            uint32_t nMaxCustFilter;
+            uint32_t nFilterIndex;
+            char* lpstrFile;
+            uint32_t nMaxFile;
+            char* lpstrFileTitle;
+            uint32_t nMaxFileTitle;
+            const char* lpstrInitialDir;
+            const char* lpstrTitle;
+            uint32_t Flags;
+            uint16_t nFileOffset;
+            uint16_t nFileExtension;
+            const char* lpstrDefExt;
+            uintptr_t lCustData;
+            void* lpfnHook;
+            const char* lpTemplateName;
+        };
+
+        HMODULE hComDlg = LoadLibraryA("comdlg32.dll");
+        if (hComDlg) {
+            using FnGetOpenFileNameA = BOOL(WINAPI*)(OPENFILENAMEA_COMPAT*);
+            auto pGetOpen = reinterpret_cast<FnGetOpenFileNameA>(GetProcAddress(hComDlg, "GetOpenFileNameA"));
+            if (pGetOpen) {
+                char fileBuf[1024]{};
+                static constexpr char kFilterStr[] =
+                    "Reference Images (*.png;*.jpg;*.jpeg;*.webp;*.bmp)\0*.png;*.jpg;*.jpeg;*.webp;*.bmp\0All Files (*.*)\0*.*\0";
+
+                OPENFILENAMEA_COMPAT ofn{};
+                ofn.lStructSize = sizeof(OPENFILENAMEA_COMPAT);
+                ofn.hwndOwner = nullptr; // Не блокируем окно GD!
+                ofn.lpstrFilter = kFilterStr;
+                ofn.lpstrFile = fileBuf;
+                ofn.nMaxFile = sizeof(fileBuf);
+                ofn.lpstrTitle = "Select Reference Image for AI Art Agent";
+                ofn.Flags = 0x00080000 | 0x00001000 | 0x00000800 | 0x00000008;
+
+                BOOL picked = pGetOpen(&ofn);
+                if (picked && fileBuf[0] != 0) {
+                    g_fileDialogPickedPath = std::string(fileBuf);
+                    g_fileDialogPickedSuccess = true;
+                }
+            }
+            FreeLibrary(hComDlg);
+        }
+        g_fileDialogHasResult = true;
+        g_fileDialogThreadActive = false;
+    }).detach();
+#else
+    g_fileDialogHasResult = true;
+    g_fileDialogThreadActive = false;
 #endif
 }
 
@@ -2548,88 +2607,93 @@ static CCLayerColor* createSolidPanel(float width, float height, ccColor3B color
     return panel;
 }
 
-static CCDrawNode* createSmoothRoundedRect(float width, float height, float radius, ccColor4F color) {
-    auto* dn = CCDrawNode::create();
-    float hw = width * 0.5f;
-    float hh = height * 0.5f;
-    float r = std::clamp(radius, 1.f, (std::min)(hw, hh));
-
-    // Для пилюли (строка ввода) достаточно одного drawSegment — без наложений при любой прозрачности
-    if (r >= hh - 0.5f) {
-        float x0 = -hw + r;
-        float x1 =  hw - r;
-        if (x1 < x0) {
-            x0 = 0.f;
-            x1 = 0.f;
-        }
-        dn->drawSegment(CCPoint{ x0, 0.f }, CCPoint{ x1, 0.f }, r, color);
-        return dn;
-    }
-
-    float x0 = -hw + r;
-    float x1 =  hw - r;
-    float y0 = -hh + r;
-    float y1 =  hh - r;
-
-    dn->drawSegment(CCPoint{ x0, y1 }, CCPoint{ x1, y1 }, r, color);
-    dn->drawSegment(CCPoint{ x0, y0 }, CCPoint{ x1, y0 }, r, color);
-    dn->drawSegment(CCPoint{ x0, y0 }, CCPoint{ x0, y1 }, r, color);
-    dn->drawSegment(CCPoint{ x1, y0 }, CCPoint{ x1, y1 }, r, color);
-
-    float step = (std::max)(2.f, r * 0.9f);
-    for (float y = y0 + step; y < y1; y += step) {
-        dn->drawSegment(CCPoint{ x0, y }, CCPoint{ x1, y }, r, color);
-    }
-    return dn;
-}
-
 static ccColor4F toColor4F(ccColor3B c, GLubyte alpha = 255) {
     return ccColor4F{ c.r / 255.f, c.g / 255.f, c.b / 255.f, alpha / 255.f };
 }
 
-static CCDrawNode* createSmoothGradientRoundedRect(
+// Генерация настоящей RGBA8888 текстуры с идеальными кругами на углах и антиалиасингом (SDF).
+// Работает как обычный CCSprite — поэтому на 100% отображается в Geometry Dash без багов шейдера CCDrawNode!
+static CCSprite* createSmoothGradientRoundedRect(
     float width,
     float height,
     float radius,
     ccColor4F topColor,
     ccColor4F bottomColor
 ) {
-    auto* dn = CCDrawNode::create();
-    float hw = width * 0.5f;
-    float hh = height * 0.5f;
-    float r = std::clamp(radius, 2.f, (std::min)(hw, hh));
+    int texW = std::clamp(static_cast<int>(std::lround(width * 2.0f)), 8, 1024);
+    int texH = std::clamp(static_cast<int>(std::lround(height * 2.0f)), 8, 640);
+    float radPx = std::clamp(radius * 2.0f, 2.0f, (std::min)(texW, texH) * 0.5f);
 
-    int steps = 110;
-    float bandRadius = (height / static_cast<float>(steps)) * 0.85f + 0.8f;
+    std::vector<uint8_t> rgba(static_cast<size_t>(texW * texH * 4), 0);
+    float halfW = texW * 0.5f;
+    float halfH = texH * 0.5f;
+    float innerW = halfW - radPx;
+    float innerH = halfH - radPx;
 
-    for (int i = 0; i <= steps; ++i) {
-        float t = static_cast<float>(i) / static_cast<float>(steps); // 0 = вверху, 1 = внизу
-        float y = (hh - bandRadius) - t * (height - 2.f * bandRadius);
+    for (int py = 0; py < texH; ++py) {
+        float t = (texH > 1) ? (static_cast<float>(py) / static_cast<float>(texH - 1)) : 0.f;
+        float rf = std::clamp(topColor.r + (bottomColor.r - topColor.r) * t, 0.f, 1.f);
+        float gf = std::clamp(topColor.g + (bottomColor.g - topColor.g) * t, 0.f, 1.f);
+        float bf = std::clamp(topColor.b + (bottomColor.b - topColor.b) * t, 0.f, 1.f);
+        float af = std::clamp(topColor.a + (bottomColor.a - topColor.a) * t, 0.f, 1.f);
 
-        // Вычисляем точный отступ по X на скругленных углах сверху и снизу
-        float dyCorner = 0.f;
-        if (y > hh - r) {
-            dyCorner = y - (hh - r);
-        } else if (y < -hh + r) {
-            dyCorner = (-hh + r) - y;
+        uint8_t r8 = static_cast<uint8_t>(std::lround(rf * 255.f));
+        uint8_t g8 = static_cast<uint8_t>(std::lround(gf * 255.f));
+        uint8_t b8 = static_cast<uint8_t>(std::lround(bf * 255.f));
+
+        float dy = std::fabs((py + 0.5f) - halfH) - innerH;
+
+        for (int px = 0; px < texW; ++px) {
+            float dx = std::fabs((px + 0.5f) - halfW) - innerW;
+            float dist = 0.f;
+            if (dx > 0.f && dy > 0.f) {
+                dist = std::sqrt(dx * dx + dy * dy) - radPx;
+            } else {
+                dist = (std::max)(dx, dy) - radPx;
+            }
+
+            if (dist >= 0.75f) continue;
+
+            // Плавное сглаживание краев (anti-aliasing) в 1.5 пикселя
+            float cov = std::clamp(0.5f - dist / 1.5f, 0.f, 1.f);
+            uint8_t a8 = static_cast<uint8_t>(std::lround(af * cov * 255.f));
+            if (a8 == 0) continue;
+
+            size_t idx = static_cast<size_t>((py * texW + px) * 4);
+            // В Cocos2d-x kCCTexture2DPixelFormat_RGBA8888 использует не-премультиплицированный или премультиплицированный альфа
+            rgba[idx + 0] = r8;
+            rgba[idx + 1] = g8;
+            rgba[idx + 2] = b8;
+            rgba[idx + 3] = a8;
         }
-
-        float maxDy = (std::max)(0.f, r - bandRadius);
-        float clampedDy = (std::min)(dyCorner, maxDy);
-        float dxCorner = (maxDy > 0.01f) ? std::sqrt((std::max)(0.f, maxDy * maxDy - clampedDy * clampedDy)) : 0.f;
-        float halfSpanX = (hw - r) + dxCorner;
-        if (halfSpanX < 0.f) halfSpanX = 0.f;
-
-        ccColor4F rowCol{
-            topColor.r + (bottomColor.r - topColor.r) * t,
-            topColor.g + (bottomColor.g - topColor.g) * t,
-            topColor.b + (bottomColor.b - topColor.b) * t,
-            topColor.a + (bottomColor.a - topColor.a) * t
-        };
-
-        dn->drawSegment(CCPoint{ -halfSpanX, y }, CCPoint{ halfSpanX, y }, bandRadius, rowCol);
     }
-    return dn;
+
+    auto* tex = new CCTexture2D();
+    if (tex && tex->initWithData(
+            rgba.data(),
+            kCCTexture2DPixelFormat_RGBA8888,
+            texW,
+            texH,
+            CCSize{ static_cast<float>(texW), static_cast<float>(texH) }
+        )) {
+        tex->autorelease();
+        auto* spr = CCSprite::createWithTexture(tex);
+        if (spr) {
+            spr->setScaleX(width / static_cast<float>(texW));
+            spr->setScaleY(height / static_cast<float>(texH));
+            return spr;
+        }
+    } else {
+        CC_SAFE_DELETE(tex);
+    }
+
+    // Фолбэк на случай нехватки видеопамяти
+    auto* fallback = CCSprite::create();
+    return fallback;
+}
+
+static CCSprite* createSmoothRoundedRect(float width, float height, float radius, ccColor4F color) {
+    return createSmoothGradientRoundedRect(width, height, radius, color, color);
 }
 
 static CCMenuItemSpriteExtra* createSolidButton(
@@ -3622,15 +3686,18 @@ protected:
     void onSelectOverhang(CCObject*) { g_overhangAllowed = true;  refreshRightPanelTabsAndCanvas(); }
 
     void onAttachReferenceImage(CCObject*) {
-        std::string statusMsg;
-        if (pickReferenceImageDialog(statusMsg)) {
-            g_chatHistory.push_back({ "assistant", "Reference attached: " + g_referenceFileName + ". Write a prompt or click 'Build Ref' and I will recreate it with self-verification!" });
+        std::string clipStatus;
+        // 1. Сначала мгновенно проверяем, не скопировал ли игрок картинку или путь в буфер обмена (Ctrl+C)
+        if (tryLoadReferenceImageFromClipboard(clipStatus)) {
+            g_chatHistory.push_back({ "assistant", "Reference loaded from clipboard: " + g_referenceFileName + "! Click 'Build Ref' or write a prompt." });
             if (m_stepPlanLabel) m_stepPlanLabel->setString("Ref: loaded");
-        } else if (statusMsg != "Selection cancelled") {
-            g_chatHistory.push_back({ "assistant", "Ref load info: " + statusMsg });
+            rebuildChatScrollFeed();
+            refreshRightPanelTabsAndCanvas();
+            return;
         }
-        rebuildChatScrollFeed();
-        refreshRightPanelTabsAndCanvas();
+        // 2. Запускаем окно выбора файла в отдельном потоке (игра НЕ зависает, окно легко закрывается!)
+        startAsyncReferenceImageDialog();
+        if (m_stepPlanLabel) m_stepPlanLabel->setString("Ref: picking...");
     }
 
     void onClearReferenceImage(CCObject*) {
@@ -3777,6 +3844,26 @@ protected:
 
     void updateKeyboardAndLock(float) {
         restoreLockedContourPositions();
+
+        // Проверяем завершение фонового диалога выбора картинки-референса
+        if (g_fileDialogHasResult) {
+            g_fileDialogHasResult = false;
+            if (g_fileDialogPickedSuccess && !g_fileDialogPickedPath.empty()) {
+                std::string statusMsg;
+                if (loadReferenceImageFromPath(g_fileDialogPickedPath, statusMsg)) {
+                    g_chatHistory.push_back({ "assistant", "Reference attached: " + g_referenceFileName + ". Click 'Build Ref' or write your task!" });
+                    if (m_stepPlanLabel) m_stepPlanLabel->setString("Ref: loaded");
+                } else {
+                    g_chatHistory.push_back({ "assistant", "Ref load error: " + statusMsg });
+                    if (m_stepPlanLabel) m_stepPlanLabel->setString("Ref: error");
+                }
+                rebuildChatScrollFeed();
+                refreshRightPanelTabsAndCanvas();
+            } else {
+                if (m_stepPlanLabel) m_stepPlanLabel->setString("Plan: ready");
+            }
+        }
+
         if (m_stage == PopupStage::ModelSelector) return;
 
 #ifdef GEODE_IS_WINDOWS
@@ -3800,11 +3887,19 @@ protected:
             if (m_stage == PopupStage::ApiGate) {
                 onPasteApiClicked(nullptr);
             } else {
-                std::string clip = readWindowsClipboardText();
-                if (!clip.empty()) {
-                    m_inputBuffer += utf8ToGDReadable(clip);
-                    if (m_inputBuffer.size() > 160) m_inputBuffer.resize(160);
-                    refreshInputLabel();
+                std::string refStatus;
+                if (tryLoadReferenceImageFromClipboard(refStatus)) {
+                    g_chatHistory.push_back({ "assistant", "Reference pasted via Ctrl+V: " + g_referenceFileName + "!" });
+                    if (m_stepPlanLabel) m_stepPlanLabel->setString("Ref: loaded");
+                    rebuildChatScrollFeed();
+                    refreshRightPanelTabsAndCanvas();
+                } else {
+                    std::string clip = readWindowsClipboardText();
+                    if (!clip.empty()) {
+                        m_inputBuffer += utf8ToGDReadable(clip);
+                        if (m_inputBuffer.size() > 160) m_inputBuffer.resize(160);
+                        refreshInputLabel();
+                    }
                 }
             }
             return;
