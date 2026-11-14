@@ -961,12 +961,12 @@ static bool loadReferenceImageFromPath(std::string const& filePath, std::string&
     return true;
 }
 
-// Чтение скопированного файла картинки (CF_HDROP) или пути к картинке из буфера обмена Windows (без открытия окон!)
+// Чтение скопированной картинки (CF_DIB / скриншот Win+Shift+S), файла (CF_HDROP) или пути из буфера обмена Windows
 static bool tryLoadReferenceImageFromClipboard(std::string& outStatus) {
 #ifdef GEODE_IS_WINDOWS
     if (!OpenClipboard(nullptr)) return false;
 
-    // 1. Проверяем CF_HDROP (если игрок нажал Ctrl+C на файле картинки в Проводнике Windows)
+    // 1. Проверяем CF_HDROP (если игрок скопировал файл картинки через Ctrl+C в Проводнике)
     constexpr uint32_t kCF_HDROP = 15;
     HANDLE hDrop = GetClipboardData(kCF_HDROP);
     if (hDrop) {
@@ -986,7 +986,58 @@ static bool tryLoadReferenceImageFromClipboard(std::string& outStatus) {
         }
     }
 
-    // 2. Проверяем текстовый путь в буфере обмена (если скопирован путь к .png/.jpg/.webp/.bmp)
+    // 2. Проверяем CF_DIB (если игрок сделал скриншот Win+Shift+S или нажал "Копировать картинку" в браузере!)
+    constexpr uint32_t kCF_DIB = 8;
+    HANDLE hDib = GetClipboardData(kCF_DIB);
+    if (hDib) {
+        size_t dibSize = static_cast<size_t>(GlobalSize(hDib));
+        const uint8_t* dibPtr = static_cast<const uint8_t*>(GlobalLock(hDib));
+        if (dibPtr && dibSize >= 40 && dibSize <= 12 * 1024 * 1024) {
+            uint32_t headerSize = 0;
+            std::memcpy(&headerSize, dibPtr, 4);
+            uint32_t fileSize = static_cast<uint32_t>(14 + dibSize);
+            uint32_t pixelOffset = 14 + headerSize;
+            std::vector<uint8_t> bmpBytes(fileSize, 0);
+            bmpBytes[0] = 'B';
+            bmpBytes[1] = 'M';
+            std::memcpy(bmpBytes.data() + 2, &fileSize, 4);
+            std::memcpy(bmpBytes.data() + 10, &pixelOffset, 4);
+            std::memcpy(bmpBytes.data() + 14, dibPtr, dibSize);
+            GlobalUnlock(hDib);
+            CloseClipboard();
+
+            g_referenceMimeType = "image/bmp";
+            g_referenceBase64 = encodeBytesToBase64(bmpBytes);
+            g_referenceFilePath = "clipboard_image.bmp";
+            g_referenceFileName = "Clipboard Image";
+            g_referenceSampleGrid.assign(g_referenceGridW * g_referenceGridH, ccColor3B{ 120, 140, 180 });
+            CCImage img;
+            if (img.initWithImageData(bmpBytes.data(), static_cast<int>(bmpBytes.size()))) {
+                unsigned char* raw = img.getData();
+                int w = img.getWidth();
+                int h = img.getHeight();
+                int bpp = img.hasAlpha() ? 4 : 3;
+                if (raw && w > 0 && h > 0) {
+                    for (int gy = 0; gy < g_referenceGridH; ++gy) {
+                        for (int gx = 0; gx < g_referenceGridW; ++gx) {
+                            int px = std::clamp((gx * w + w / 2) / g_referenceGridW, 0, w - 1);
+                            int py = std::clamp(((g_referenceGridH - 1 - gy) * h + h / 2) / g_referenceGridH, 0, h - 1);
+                            size_t idx = static_cast<size_t>((py * w + px) * bpp);
+                            g_referenceSampleGrid[gy * g_referenceGridW + gx] = ccColor3B{
+                                raw[idx + 0], raw[idx + 1], raw[idx + 2]
+                            };
+                        }
+                    }
+                }
+            }
+            g_hasReferenceImage = true;
+            outStatus = "Ref loaded from clipboard";
+            return true;
+        }
+        if (dibPtr) GlobalUnlock(hDib);
+    }
+
+    // 3. Проверяем текстовый путь в буфере обмена
     HANDLE hText = GetClipboardData(CF_TEXT);
     if (hText) {
         char const* rawTxt = static_cast<char const*>(GlobalLock(hText));
@@ -1012,8 +1063,8 @@ static bool tryLoadReferenceImageFromClipboard(std::string& outStatus) {
     return false;
 }
 
-// Асинхронный выбор файла в отдельном фоновом потоке std::thread,
-// чтобы основной поток рендера Geometry Dash НИКОГДА не зависал и окно выбора легко закрывалось!
+// Асинхронный выбор файла в отдельном STA COM-потоке (с CoInitializeEx),
+// чтобы диалог Windows 10/11 гарантированно открывался поверх игры, не зависал и закрывался!
 static bool g_fileDialogThreadActive = false;
 static bool g_fileDialogHasResult = false;
 static bool g_fileDialogPickedSuccess = false;
@@ -1028,9 +1079,22 @@ static void startAsyncReferenceImageDialog() {
 
 #ifdef GEODE_IS_WINDOWS
     std::thread([]() {
-        // Классический 76-байтный размер OPENFILENAMEA (OPENFILENAME_SIZE_VERSION_400A)
-        // гарантирует 100% совпадение ABI на 32-битной и 64-битной Windows и мгновенное закрытие!
-        struct OPENFILENAMEA_COMPAT {
+        // Обязательная инициализация STA COM на фоновом потоке, иначе GetOpenFileNameA не открывается в Win10/11!
+        HMODULE hOle = LoadLibraryA("ole32.dll");
+        using FnCoInitEx = long(WINAPI*)(void*, uint32_t);
+        using FnCoUninit = void(WINAPI*)();
+        FnCoUninit pCoUninit = nullptr;
+        bool comInited = false;
+        if (hOle) {
+            auto pCoInit = reinterpret_cast<FnCoInitEx>(GetProcAddress(hOle, "CoInitializeEx"));
+            pCoUninit = reinterpret_cast<FnCoUninit>(GetProcAddress(hOle, "CoUninitialize"));
+            if (pCoInit) {
+                long hr = pCoInit(nullptr, 0x2); // COINIT_APARTMENTTHREADED
+                comInited = (hr >= 0);
+            }
+        }
+
+        struct OPENFILENAMEA_FULL {
             uint32_t lStructSize;
             void* hwndOwner;
             void* hInstance;
@@ -1051,20 +1115,23 @@ static void startAsyncReferenceImageDialog() {
             uintptr_t lCustData;
             void* lpfnHook;
             const char* lpTemplateName;
+            void* pvReserved;
+            uint32_t dwReserved;
+            uint32_t FlagsEx;
         };
 
         HMODULE hComDlg = LoadLibraryA("comdlg32.dll");
         if (hComDlg) {
-            using FnGetOpenFileNameA = BOOL(WINAPI*)(OPENFILENAMEA_COMPAT*);
+            using FnGetOpenFileNameA = BOOL(WINAPI*)(OPENFILENAMEA_FULL*);
             auto pGetOpen = reinterpret_cast<FnGetOpenFileNameA>(GetProcAddress(hComDlg, "GetOpenFileNameA"));
             if (pGetOpen) {
                 char fileBuf[1024]{};
                 static constexpr char kFilterStr[] =
                     "Reference Images (*.png;*.jpg;*.jpeg;*.webp;*.bmp)\0*.png;*.jpg;*.jpeg;*.webp;*.bmp\0All Files (*.*)\0*.*\0";
 
-                OPENFILENAMEA_COMPAT ofn{};
-                ofn.lStructSize = sizeof(OPENFILENAMEA_COMPAT);
-                ofn.hwndOwner = nullptr; // Не блокируем окно GD!
+                OPENFILENAMEA_FULL ofn{};
+                ofn.lStructSize = sizeof(OPENFILENAMEA_FULL);
+                ofn.hwndOwner = nullptr;
                 ofn.lpstrFilter = kFilterStr;
                 ofn.lpstrFile = fileBuf;
                 ofn.nMaxFile = sizeof(fileBuf);
@@ -1079,6 +1146,10 @@ static void startAsyncReferenceImageDialog() {
             }
             FreeLibrary(hComDlg);
         }
+
+        if (comInited && pCoUninit) pCoUninit();
+        if (hOle) FreeLibrary(hOle);
+
         g_fileDialogHasResult = true;
         g_fileDialogThreadActive = false;
     }).detach();
