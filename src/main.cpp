@@ -190,8 +190,8 @@ static std::vector<ccColor3B> g_referenceSampleGrid; // Сетка цветов 
 static int g_referenceGridW = 12;
 static int g_referenceGridH = 8;
 static std::vector<ccColor3B> g_referenceHighResGrid; // Высокоточная попиксельная карта 48x48 выбранной структуры из референса!
-static int g_refHighResW = 48;
-static int g_refHighResH = 48;
+static int g_refHighResW = 96;
+static int g_refHighResH = 96;
 static bool g_showFilledInShapeTab = false; // Кнопка переключения "Каркас / Заполнение" во вкладке Shape
 static std::vector<std::string> g_pastGeneratedThemes; // Список всех прошлых декоров (запрет повторов!)
 static int g_lastSelfScore = 0;
@@ -2066,9 +2066,11 @@ static int findFirstFreeEditorLayerBlock(LevelEditorLayer* editorLayer, int need
 // Считывание и полное заполнение выделенного контура
 // ============================================================================
 static bool isSpikeObjectID(int id) {
-    return id == 8 || id == 39 || id == 103 || id == 144 || id == 145 ||
-           id == 177 || id == 178 || id == 179 || id == 205 || id == 216 ||
-           id == 217 || id == 218 || id == 458 || id == 459;
+    return id == 8 || id == 9 || id == 39 || id == 61 || id == 103 ||
+           id == 133 || id == 136 || id == 144 || id == 145 ||
+           id == 177 || id == 178 || id == 179 || id == 191 || id == 205 ||
+           id == 216 || id == 217 || id == 218 || id == 392 || id == 421 ||
+           id == 422 || id == 458 || id == 459;
 }
 
 struct IslandBounds {
@@ -2266,6 +2268,27 @@ static ContourAnalysis analyzeSelectedContour(EditorUIType* ui) {
             info.minGY = (std::min)(info.minGY, gy);
             info.maxGY = (std::max)(info.maxGY, gy);
         }
+        for (auto const& sp : info.spikes) {
+            int sgx = static_cast<int>(std::floor(sp.x / 30.0f));
+            int sgy = static_cast<int>(std::floor(sp.y / 30.0f));
+            info.minGX = (std::min)(info.minGX, sgx);
+            info.maxGX = (std::max)(info.maxGX, sgx);
+            info.minGY = (std::min)(info.minGY, sgy);
+            info.maxGY = (std::max)(info.maxGY, sgy);
+        }
+    } else if (!info.spikes.empty()) {
+        int sgx0 = static_cast<int>(std::floor(info.spikes.front().x / 30.0f));
+        int sgy0 = static_cast<int>(std::floor(info.spikes.front().y / 30.0f));
+        info.minGX = info.maxGX = sgx0;
+        info.minGY = info.maxGY = sgy0;
+        for (auto const& sp : info.spikes) {
+            int sgx = static_cast<int>(std::floor(sp.x / 30.0f));
+            int sgy = static_cast<int>(std::floor(sp.y / 30.0f));
+            info.minGX = (std::min)(info.minGX, sgx);
+            info.maxGX = (std::max)(info.maxGX, sgx);
+            info.minGY = (std::min)(info.minGY, sgy);
+            info.maxGY = (std::max)(info.maxGY, sgy);
+        }
     }
 
     return info;
@@ -2390,6 +2413,261 @@ static ccColor3B lerpColor(ccColor3B a, ccColor3B b, float t) {
     };
 }
 
+// Детерминированный 2D-шум (Value Noise + FBM) для реалистичной микро-зернистости камня/штукатурки/металла/дерева
+static float hash2DNoise(int x, int y, int seed = 1337) {
+    uint32_t n = static_cast<uint32_t>(x * 374761393 + y * 668265263 + seed * 1442695041);
+    n = (n ^ (n >> 13)) * 1274126177u;
+    n = n ^ (n >> 16);
+    return static_cast<float>(n & 0xFFFFu) / 65535.0f; // 0.0 .. 1.0
+}
+
+static float sampleRealisticFBM(float wx, float wy, int seed) {
+    // 2 октавы плавного шума для органических пятен выветривания, трещин и рельефа
+    int ix0 = static_cast<int>(std::floor(wx * 0.22f));
+    int iy0 = static_cast<int>(std::floor(wy * 0.22f));
+    float n0 = hash2DNoise(ix0, iy0, seed);
+    int ix1 = static_cast<int>(std::floor(wx * 0.55f));
+    int iy1 = static_cast<int>(std::floor(wy * 0.55f));
+    float n1 = hash2DNoise(ix1, iy1, seed + 7919);
+    return n0 * 0.65f + n1 * 0.35f;
+}
+
+// Вычисление реалистичного цвета пикселя (с учетом референса 96x96, направленного света сверху-слева,
+// контактных теней Ambient Occlusion у краев, межблочных швов кладки и микро-зернистости материала!)
+static ccColor3B computeRealisticTexelColor(
+    float worldX,
+    float worldY,
+    float originX,
+    float originY,
+    float spanW,
+    float spanH,
+    bool topOpen,
+    bool bottomOpen,
+    bool leftOpen,
+    bool rightOpen,
+    float localSubU, // 0..1 внутри блока 30x30
+    float localSubV, // 0..1 внутри блока 30x30
+    AIDecisionResult const& ai,
+    int styleSeed
+) {
+    float u = std::clamp((worldX - originX) / spanW, 0.0f, 0.999f);
+    float v = std::clamp((worldY - originY) / spanH, 0.0f, 0.999f);
+
+    ccColor3B baseCol = ai.fillRGB;
+    bool hasRef = g_hasReferenceImage &&
+                  g_referenceHighResGrid.size() >= static_cast<size_t>(g_refHighResW * g_refHighResH);
+
+    if (hasRef) {
+        // Билинейная фильтрация из 96x96 карты референса + повышение локального микро-контраста (Unsharp Mask)
+        float fx = u * (g_refHighResW - 1);
+        float fy = v * (g_refHighResH - 1);
+        int x0 = std::clamp(static_cast<int>(fx), 0, g_refHighResW - 1);
+        int y0 = std::clamp(static_cast<int>(fy), 0, g_refHighResH - 1);
+        int x1 = std::clamp(x0 + 1, 0, g_refHighResW - 1);
+        int y1 = std::clamp(y0 + 1, 0, g_refHighResH - 1);
+        float tx = fx - x0;
+        float ty = fy - y0;
+
+        ccColor3B c00 = g_referenceHighResGrid[y0 * g_refHighResW + x0];
+        ccColor3B c10 = g_referenceHighResGrid[y0 * g_refHighResW + x1];
+        ccColor3B c01 = g_referenceHighResGrid[y1 * g_refHighResW + x0];
+        ccColor3B c11 = g_referenceHighResGrid[y1 * g_refHighResW + x1];
+        ccColor3B topMix = lerpColor(c00, c10, tx);
+        ccColor3B botMix = lerpColor(c01, c11, tx);
+        baseCol = lerpColor(topMix, botMix, ty);
+    } else {
+        // Без референса: реалистичный процедурный материал (кладки/камня/металла) на базе палитры ИИ
+        float n = sampleRealisticFBM(worldX, worldY, styleSeed);
+        baseCol = lerpColor(ai.fillRGB, ai.midRGB, std::clamp(n * 0.85f + v * 0.25f, 0.0f, 1.0f));
+        if (n > 0.72f) {
+            baseCol = lerpColor(baseCol, ai.mainRGB, (n - 0.72f) * 1.8f);
+        }
+        if (ai.hasGradient) {
+            ccColor3B gradCol = lerpColor(ai.gradBotRGB, ai.gradTopRGB, v);
+            baseCol = lerpColor(baseCol, gradCol, 0.55f);
+        }
+    }
+
+    // 1. Направленное освещение (Directional Light сверху-слева) + Ambient Occlusion снизу-справа
+    float shadeMul = 1.0f;
+    if (topOpen && localSubV > 0.72f)    shadeMul += 0.16f; // Верхняя световая фаска
+    if (leftOpen && localSubU < 0.25f)   shadeMul += 0.09f; // Левый боковой рефлекс
+    if (bottomOpen && localSubV < 0.28f) shadeMul -= 0.22f; // Глубокая тень у основания
+    if (rightOpen && localSubU > 0.75f)  shadeMul -= 0.12f; // Правая собственная тень
+
+    // 2. Тонкие реалистичные швы кладки / микро-стыки внутри блока (Mortar / Panel Seams)
+    if (!hasRef) {
+        bool isHorizontalSeam = (std::fabs(localSubV - 0.5f) < 0.07f);
+        bool isVerticalSeam   = (std::fabs(localSubU - ((localSubV > 0.5f) ? 0.33f : 0.67f)) < 0.07f);
+        if (isHorizontalSeam || isVerticalSeam) {
+            shadeMul -= 0.14f;
+        }
+    }
+
+    // 3. Микро-зернистость поверхности (Surface Grain +/- 6%), чтобы текстура была живой, а не пластиковой
+    float grain = (hash2DNoise(static_cast<int>(worldX * 2.f), static_cast<int>(worldY * 2.f), styleSeed + 99) - 0.5f) * 0.11f;
+    shadeMul = std::clamp(shadeMul + grain, 0.45f, 1.38f);
+
+    return ccColor3B{
+        static_cast<GLubyte>(std::clamp(static_cast<int>(std::lround(baseCol.r * shadeMul)), 0, 255)),
+        static_cast<GLubyte>(std::clamp(static_cast<int>(std::lround(baseCol.g * shadeMul)), 0, 255)),
+        static_cast<GLubyte>(std::clamp(static_cast<int>(std::lround(baseCol.b * shadeMul)), 0, 255))
+    };
+}
+
+// Генерация реалистичного попиксельного PBR-шипа ИЛИ неонового Glow-шипа (с любым поворотом 0/90/180/270 и масштабом!)
+static void appendSingleRealisticOrGlowSpike(
+    std::vector<GeneratedObjectSpec>& result,
+    SelectedSpikeInfo const& sp,
+    EditorTabCatalog const& cat,
+    AIDecisionResult const& ai,
+    float originX,
+    float originY,
+    float spanW,
+    float spanH,
+    int styleSeed
+) {
+    float rad = -sp.rotation * (3.14159265f / 180.0f);
+    float cosA = std::cos(rad);
+    float sinA = std::sin(rad);
+
+    auto localToWorld = [&](float lx, float ly) -> std::pair<float, float> {
+        float sx = lx * sp.scaleX * (sp.flipX ? -1.f : 1.f);
+        float sy = ly * sp.scaleY * (sp.flipY ? -1.f : 1.f);
+        float wx = sp.x + (sx * cosA - sy * sinA);
+        float wy = sp.y + (sx * sinA + sy * cosA);
+        return { wx, wy };
+    };
+
+    float spikeH = (sp.objectId == 39 || sp.objectId == 103) ? 15.0f : 30.0f;
+    float baseY  = -15.0f;
+
+    // 1. ВНУТРЕННЯЯ ПОПИКСЕЛЬНАЯ СТРУКТУРА РЕАЛИСТИЧНОГО ШИПА (7 пирамидальных ярусов от основания к острию):
+    //    Строго вписывается в треугольный силуэт шипа, с освещенной левой гранью и затененной правой гранью!
+    constexpr int kTiers = 7;
+    for (int t = 0; t < kTiers; ++t) {
+        float v0 = static_cast<float>(t) / static_cast<float>(kTiers);
+        float vMid = (t + 0.5f) / static_cast<float>(kTiers);
+        float ly = baseY + vMid * spikeH;
+
+        // Ширина треугольника сужается к острию (1 - vMid)
+        float halfWidthAtY = (1.0f - vMid) * 13.2f;
+        float tierHeight   = (spikeH / static_cast<float>(kTiers)) * 1.05f;
+        float syScale      = (tierHeight / 30.0f) * sp.scaleY;
+
+        // Делим ширину яруса на левую (освещенную) и правую (теневую) половины + центральный хребет
+        int colsInTier = (t < 3) ? 4 : ((t < 5) ? 2 : 1);
+        float totalTierW = halfWidthAtY * 2.0f;
+        float segW = (std::max)(1.8f, totalTierW / static_cast<float>(colsInTier));
+        float sxScale = (segW / 30.0f) * sp.scaleX;
+
+        for (int c = 0; c < colsInTier; ++c) {
+            float uLocal = (colsInTier > 1) ? (static_cast<float>(c) / static_cast<float>(colsInTier - 1)) : 0.5f; // 0 = левая грань, 1 = правая грань
+            float lx = -halfWidthAtY + (c + 0.5f) * segW;
+            auto [wx, wy] = localToWorld(lx, ly);
+
+            ccColor3B texCol = computeRealisticTexelColor(
+                wx, wy, originX, originY, spanW, spanH,
+                (t == kTiers - 1), (t == 0), (c == 0), (c == colsInTier - 1),
+                uLocal, vMid, ai, styleSeed + t * 31 + c * 17
+            );
+
+            // Усиливаем реалистичный граненый контраст лезвия шипа (левая грань светлее, правая — темнее, у базы — AO тень)
+            float facetMul = (uLocal < 0.5f) ? 1.18f : 0.78f;
+            if (v0 < 0.22f) facetMul *= 0.76f; // Темный пьедестал у основания шипа
+            if (t == kTiers - 1) facetMul *= 1.28f; // Острый сверкающий кончик шипа
+
+            ccColor3B finalFacetCol{
+                static_cast<GLubyte>(std::clamp(static_cast<int>(std::lround(texCol.r * facetMul)), 0, 255)),
+                static_cast<GLubyte>(std::clamp(static_cast<int>(std::lround(texCol.g * facetMul)), 0, 255)),
+                static_cast<GLubyte>(std::clamp(static_cast<int>(std::lround(texCol.b * facetMul)), 0, 255))
+            };
+
+            addSpec(
+                result, 211, wx, wy, sxScale, syScale, sp.rotation,
+                LayerRole::InnerDetail, ColorSlot::CustomRGB, 6 + t, 0, false,
+                245, 1, 2, finalFacetCol, false
+            );
+        }
+    }
+
+    // 2. ЦЕНТРАЛЬНЫЙ СВЕТОРАЗДЕЛ (ГРАНЬ ЛЕЗВИЯ) И МИКРО-ФАСКИ РЕАЛИСТИЧНОГО ШИПА:
+    {
+        auto [ridgeX, ridgeY] = localToWorld(-0.8f, baseY + spikeH * 0.45f);
+        ccColor3B ridgeCol = lerpColor(ai.mainRGB, ccColor3B{ 255, 255, 255 }, 0.45f);
+        addSpec(
+            result, 211, ridgeX, ridgeY, 0.045f * sp.scaleX, (spikeH / 30.0f) * 0.76f * sp.scaleY, sp.rotation,
+            LayerRole::InnerDetail, ColorSlot::CustomRGB, 14, 0, false,
+            190, 3, 3, ridgeCol, true
+        );
+
+        // Левая и правая наклонные режущие кромки (схождения под углом ~26.5 градусов к вершине)
+        float edgeAngleDeg = (spikeH > 20.f) ? 26.5f : 45.0f;
+        auto [leftEdgeX, leftEdgeY]   = localToWorld(-6.8f, baseY + spikeH * 0.48f);
+        auto [rightEdgeX, rightEdgeY] = localToWorld( 6.8f, baseY + spikeH * 0.48f);
+
+        addSpec(
+            result, 211, leftEdgeX, leftEdgeY, 0.048f * sp.scaleX, (spikeH / 30.0f) * 0.96f * sp.scaleY,
+            sp.rotation + edgeAngleDeg,
+            LayerRole::Outline3D, ColorSlot::CustomRGB, 15, 0, false,
+            240, 3, 3, ai.outlineRGB, false
+        );
+        addSpec(
+            result, 211, rightEdgeX, rightEdgeY, 0.048f * sp.scaleX, (spikeH / 30.0f) * 0.96f * sp.scaleY,
+            sp.rotation - edgeAngleDeg,
+            LayerRole::Outline3D, ColorSlot::CustomRGB, 15, 0, false,
+            215, 3, 3, lerpColor(ai.outlineRGB, ai.midRGB, 0.35f), false
+        );
+
+        // Темная контактная тень (Ambient Occlusion + пьедестал) в основании шипа
+        auto [baseDarkX, baseDarkY] = localToWorld(0.f, baseY + 1.8f);
+        addSpec(
+            result, 211, baseDarkX, baseDarkY, 0.94f * sp.scaleX, 0.11f * sp.scaleY, sp.rotation,
+            LayerRole::Outline3D, ColorSlot::CustomRGB, 14, 0, false,
+            225, 3, 3, ccColor3B{ 4, 5, 8 }, false
+        );
+    }
+
+    // 3. РЕЖИМ ШИПОВ GLOW (ОДНОСТОРОННИЙ НЕОН ПО НАКЛОННЫМ РЕБРАМ, ТЕМНЫЙ НИЗ И СВЕЧЕНИЕ ОСТРИЯ):
+    if (ai.wantNeon || ai.taskMode == AITaskMode::OnlyNeon) {
+        float edgeAngleDeg = (spikeH > 20.f) ? 26.5f : 45.0f;
+        auto [glowLeftX, glowLeftY]   = localToWorld(-5.2f, baseY + spikeH * 0.46f);
+        auto [glowRightX, glowRightY] = localToWorld( 5.2f, baseY + spikeH * 0.46f);
+        auto [glowBaseX, glowBaseY]   = localToWorld( 0.0f, baseY + 3.8f);
+        auto [glowTipX, glowTipY]     = localToWorld( 0.0f, baseY + spikeH - 3.5f);
+
+        // Левое и правое наклонные ребра: ОДНОСТОРОННИЙ неон с прозрачностью 65-75% (170..190) и Blending = true!
+        addSpec(
+            result, cat.idGlowEdgeSmall, glowLeftX, glowLeftY,
+            0.88f * sp.scaleX, 0.38f * sp.scaleY, sp.rotation + 90.f + edgeAngleDeg,
+            LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 18, 0, false,
+            185, 5, 4, ai.glowRGB, true
+        );
+        addSpec(
+            result, cat.idGlowEdgeSmall, glowRightX, glowRightY,
+            0.88f * sp.scaleX, 0.38f * sp.scaleY, sp.rotation - 90.f - edgeAngleDeg,
+            LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 18, 0, false,
+            172, 5, 4, ai.glowRGB, true
+        );
+
+        // Светящийся акцент на самом острие шипа (Blending = true, прозрачность 70% = 180)
+        addSpec(
+            result, cat.idSmallTriangle, glowTipX, glowTipY,
+            0.28f * sp.scaleX, 0.34f * sp.scaleY, sp.rotation,
+            LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 19, 0, false,
+            180, 7, 5, lerpColor(ai.glowRGB, ccColor3B{ 255, 255, 255 }, 0.5f), true
+        );
+
+        // Нижняя грань шипа: ТЕМНЫЙ (черный) односторонний неон для глубокого контраста основания!
+        addSpec(
+            result, cat.idGlowEdgeSmall, glowBaseX, glowBaseY,
+            0.96f * sp.scaleX, 0.44f * sp.scaleY, sp.rotation,
+            LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 17, 0, false,
+            195, 5, 4, ccColor3B{ 0, 0, 0 }, false
+        );
+    }
+}
+
 static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
     ContourAnalysis const& contour,
     EditorTabCatalog const& cat,
@@ -2464,6 +2742,15 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                 }
             }
         }
+        int spikeSeed = static_cast<int>(ai.glowRGB.r * 73 + g_variantIndex * 997);
+        float spanW = static_cast<float>((std::max)(1, contour.maxGX - contour.minGX + 1)) * 30.f;
+        float spanH = static_cast<float>((std::max)(1, contour.maxGY - contour.minGY + 1)) * 30.f;
+        for (auto const& sp : contour.spikes) {
+            appendSingleRealisticOrGlowSpike(
+                result, sp, cat, ai,
+                contour.minGX * 30.f, contour.minGY * 30.f, spanW, spanH, spikeSeed
+            );
+        }
         return result;
     }
 
@@ -2534,28 +2821,71 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                 );
             }
 
-            // ПОПИКСЕЛЬНАЯ ДЕТАЛИЗАЦИЯ РЕФЕРЕНСА ВНУТРИ КАЖДОГО БЛОКА СТРУКТУРЫ:
-            // Если загружен референс — разбиваем каждый блок 30x30 на сетку 4x4 (16 пикселей по 7.5x7.5 ед., масштаб 0.25f)
-            // и окрашиваем каждый пиксель в точный цвет выбранной структуры из 48x48 карты референса!
-            if (g_hasReferenceImage && g_referenceHighResGrid.size() >= static_cast<size_t>(g_refHighResW * g_refHighResH)) {
-                constexpr int kSubDiv = 4;
-                float stepPx = 30.0f / static_cast<float>(kSubDiv);
-                float subScale = 1.02f / static_cast<float>(kSubDiv); // ~0.255f
+            // РЕАЛИСТИЧНАЯ АДАПТИВНАЯ 6x6 МИКРО-ТЕКСТУРА ВНУТРИ КАЖДОГО БЛОКА СТРУКТУРЫ:
+            // Разбиваем каждый блок 30x30 на 6x6 = 36 текселей (по 5x5 ед., масштаб 0.168f)
+            // с PBR-освещением, контактными тенями AO и автоматическим объединением схожих соседних текселей!
+            {
+                constexpr int kSubDiv = 6;
+                float stepPx = 30.0f / static_cast<float>(kSubDiv); // 5.0 ед.
+                float baseScaleY = 1.02f / static_cast<float>(kSubDiv); // ~0.17f
+                int styleSeed = static_cast<int>(ai.fillRGB.r * 73 + ai.mainRGB.g * 151 + g_variantIndex * 997);
+
                 for (int sy = 0; sy < kSubDiv; ++sy) {
-                    for (int sx = 0; sx < kSubDiv; ++sx) {
-                        float pxWorld = (cx - 15.f) + (sx + 0.5f) * stepPx;
-                        float pyWorld = (cy - 15.f) + (sy + 0.5f) * stepPx;
-                        float u = std::clamp((pxWorld - originX) / spanW, 0.0f, 0.999f);
-                        float v = std::clamp((pyWorld - originY) / spanH, 0.0f, 0.999f);
-                        int hgx = std::clamp(static_cast<int>(u * g_refHighResW), 0, g_refHighResW - 1);
-                        int hgy = std::clamp(static_cast<int>(v * g_refHighResH), 0, g_refHighResH - 1);
-                        ccColor3B pixCol = g_referenceHighResGrid[hgy * g_refHighResW + hgx];
-                        addSpec(
-                            result, 211, pxWorld, pyWorld, subScale, subScale, 0.f,
-                            LayerRole::InnerDetail, ColorSlot::CustomRGB, 4, 0, false,
-                            245, -1, 1, pixCol, false
+                    float pyWorld = (cy - 15.f) + (sy + 0.5f) * stepPx;
+                    float localV = (sy + 0.5f) / static_cast<float>(kSubDiv);
+
+                    int sx = 0;
+                    while (sx < kSubDiv) {
+                        float pxFirst = (cx - 15.f) + (sx + 0.5f) * stepPx;
+                        float localU  = (sx + 0.5f) / static_cast<float>(kSubDiv);
+                        ccColor3B c0 = computeRealisticTexelColor(
+                            pxFirst, pyWorld, originX, originY, spanW, spanH,
+                            topOpen, bottomOpen, leftOpen, rightOpen,
+                            localU, localV, ai, styleSeed
                         );
+
+                        // Объединяем соседние пиксели в строке, если их цвет почти идентичен (экономит объекты без потери четкости!)
+                        int runLen = 1;
+                        while (sx + runLen < kSubDiv) {
+                            float pxNext = (cx - 15.f) + (sx + runLen + 0.5f) * stepPx;
+                            float nextU  = (sx + runLen + 0.5f) / static_cast<float>(kSubDiv);
+                            ccColor3B cNext = computeRealisticTexelColor(
+                                pxNext, pyWorld, originX, originY, spanW, spanH,
+                                topOpen, bottomOpen, leftOpen, rightOpen,
+                                nextU, localV, ai, styleSeed
+                            );
+                            int diff = std::abs(static_cast<int>(c0.r) - static_cast<int>(cNext.r)) +
+                                       std::abs(static_cast<int>(c0.g) - static_cast<int>(cNext.g)) +
+                                       std::abs(static_cast<int>(c0.b) - static_cast<int>(cNext.b));
+                            if (diff > 14) break;
+                            runLen++;
+                        }
+
+                        float mergedCenterX = (cx - 15.f) + (sx + runLen * 0.5f) * stepPx;
+                        float mergedScaleX  = (runLen * 1.02f) / static_cast<float>(kSubDiv);
+                        addSpec(
+                            result, 211, mergedCenterX, pyWorld, mergedScaleX, baseScaleY, 0.f,
+                            LayerRole::InnerDetail, ColorSlot::CustomRGB, 4, 0, false,
+                            245, -1, 1, c0, false
+                        );
+                        sx += runLen;
                     }
+                }
+
+                // Реалистичный микро-блик (Specular Rim Highlight) на верхней освещенной фаске и глубокая тень (AO) внизу
+                if (topOpen) {
+                    addSpec(
+                        result, 211, cx, cy + 13.4f, 0.96f, 0.045f, 0.f,
+                        LayerRole::InnerDetail, ColorSlot::CustomRGB, 10, 0, false,
+                        165, 1, 2, lerpColor(ai.mainRGB, ccColor3B{ 255, 255, 255 }, 0.55f), true
+                    );
+                }
+                if (bottomOpen) {
+                    addSpec(
+                        result, 211, cx, cy - 13.2f, 0.98f, 0.08f, 0.f,
+                        LayerRole::InnerDetail, ColorSlot::CustomRGB, 9, 0, false,
+                        185, 1, 2, ccColor3B{ 4, 5, 8 }, false
+                    );
                 }
             }
 
@@ -2652,6 +2982,44 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         result.push_back(cs);
     }
 
+    // 3. ДЕКОРИРОВАНИЕ РЕАЛИСТИЧНЫХ ШИПОВ И ШИПОВ GLOW:
+    //    - Декорируем все выделенные игроком шипы (contour.spikes)
+    //    - Если игрок попросил шипы в промпте ("ship", "spike"), а выделил только блоки —
+    //      автоматически добавляем реалистичные/Glow шипы на открытых верхних клетках структуры!
+    {
+        int spikeSeed = static_cast<int>(ai.fillRGB.r * 73 + ai.mainRGB.g * 151 + g_variantIndex * 997);
+        std::vector<SelectedSpikeInfo> spikesToDecorate = contour.spikes;
+
+        std::string lowerPrompt = g_lastBuildPrompt;
+        for (char& c : lowerPrompt) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        bool promptMentionsSpikes = (lowerPrompt.find("ship") != std::string::npos ||
+                                     lowerPrompt.find("spike") != std::string::npos);
+
+        if (spikesToDecorate.empty() && promptMentionsSpikes && allowOverhang) {
+            for (auto const& [gx, gy] : contour.occupiedCells) {
+                if (contour.occupiedCells.count({ gx, gy + 1 }) == 0) {
+                    if (((gx + gy + g_variantIndex) % 2) == 0) {
+                        SelectedSpikeInfo autoSp;
+                        autoSp.x = gx * 30.f + 15.f;
+                        autoSp.y = (gy + 1) * 30.f + 15.f;
+                        autoSp.rotation = 0.f;
+                        autoSp.scaleX = 1.0f;
+                        autoSp.scaleY = 1.0f;
+                        autoSp.objectId = 8;
+                        spikesToDecorate.push_back(autoSp);
+                    }
+                }
+            }
+        }
+
+        for (auto const& sp : spikesToDecorate) {
+            appendSingleRealisticOrGlowSpike(
+                result, sp, cat, ai,
+                originX, originY, spanW, spanH, spikeSeed
+            );
+        }
+    }
+
     std::stable_sort(result.begin(), result.end(), [](GeneratedObjectSpec const& a, GeneratedObjectSpec const& b) {
         return a.priorityTier < b.priorityTier;
     });
@@ -2700,12 +3068,21 @@ static SpawnSummary placeGeneratedArtInEditor(
     auto* editorLayer = ui->m_editorLayer;
     summary.firstLayer = findFirstFreeEditorLayerBlock(editorLayer, 6);
 
-    if (taskMode == AITaskMode::FullDecor || taskMode == AITaskMode::OnlyFill) {
+    if (taskMode == AITaskMode::FullDecor || taskMode == AITaskMode::OnlyFill || taskMode == AITaskMode::OnlyNeon) {
         for (GameObject* baseObj : contour.solidObjects) {
             if (!baseObj) continue;
             writeObjEditorLayers(baseObj, summary.firstLayer, 0);
             writeObjFlags(baseObj, 0, -3, false, true);
             bindObjectToColor(baseObj, palette, ColorSlot::DarkFill, ccColor3B{ 0, 0, 0 });
+        }
+        for (auto const& sp : contour.spikes) {
+            if (!sp.sourceObj) continue;
+            writeObjEditorLayers(sp.sourceObj, summary.firstLayer, 0);
+            writeObjFlags(sp.sourceObj, 1, -1, false, true);
+            bindObjectToColor(
+                sp.sourceObj, palette, ColorSlot::DarkFill, ccColor3B{ 0, 0, 0 }, 255, false,
+                true, palette.slotColors[static_cast<int>(ColorSlot::HighlightOutline)], 240, false
+            );
         }
     }
 
@@ -3691,9 +4068,9 @@ protected:
     CCSprite* createPixelArtDrawingPreviewSprite(float targetW, float targetH) {
         int cols = (std::max)(1, m_contour.maxGX - m_contour.minGX + 1);
         int rows = (std::max)(1, m_contour.maxGY - m_contour.minGY + 1);
-        int SubPx = 12; // 12x12 пикселей на каждую клетку блока для высокой четкости в Drawing!
-        int texW = std::clamp(cols * SubPx, 24, 384);
-        int texH = std::clamp(rows * SubPx, 24, 384);
+        int SubPx = 16; // 16x16 пикселей на каждую клетку блока для фотореалистичной четкости в Drawing!
+        int texW = std::clamp(cols * SubPx, 32, 512);
+        int texH = std::clamp(rows * SubPx, 32, 512);
 
         std::vector<uint8_t> rgba(static_cast<size_t>(texW * texH * 4), 0);
 
@@ -3702,37 +4079,52 @@ protected:
         float worldSpanW = cols * 30.f;
         float worldSpanH = rows * 30.f;
 
-        bool hasRefGrid = g_hasReferenceImage &&
-                          g_referenceHighResGrid.size() >= static_cast<size_t>(g_refHighResW * g_refHighResH);
+        AIDecisionResult previewAI;
+        previewAI.fillRGB    = g_hasGeneratedArt ? g_lastPreviewPalette.slotColors[static_cast<int>(ColorSlot::DarkFill)] : ccColor3B{ 34, 38, 48 };
+        previewAI.midRGB     = g_hasGeneratedArt ? g_lastPreviewPalette.slotColors[static_cast<int>(ColorSlot::MidTone)]  : ccColor3B{ 78, 88, 108 };
+        previewAI.mainRGB    = g_hasGeneratedArt ? g_lastPreviewPalette.slotColors[static_cast<int>(ColorSlot::BrightMain)] : ccColor3B{ 155, 175, 205 };
+        previewAI.outlineRGB = g_hasGeneratedArt ? g_lastPreviewPalette.slotColors[static_cast<int>(ColorSlot::HighlightOutline)] : ccColor3B{ 230, 240, 255 };
+        int styleSeed = static_cast<int>(previewAI.fillRGB.r * 73 + previewAI.mainRGB.g * 151 + g_variantIndex * 997);
 
-        ccColor3B baseFill = g_hasGeneratedArt
-            ? g_lastPreviewPalette.slotColors[static_cast<int>(ColorSlot::DarkFill)]
-            : ccColor3B{ 38, 44, 58 };
-        ccColor3B midFill = g_hasGeneratedArt
-            ? g_lastPreviewPalette.slotColors[static_cast<int>(ColorSlot::MidTone)]
-            : ccColor3B{ 82, 96, 124 };
-
-        // 1. Попиксельно заполняем каждую клетку структуры (текстурой референса 48x48 или стилем ИИ)
+        // 1. Попиксельно рендерим PBR-материал (96x96 карта референса + свет + тени AO + швы + зернистость)
         for (int py = 0; py < texH; ++py) {
             float v = 1.0f - (py + 0.5f) / static_cast<float>(texH); // 0 = низ, 1 = верх
             int gy = m_contour.minGY + std::clamp(static_cast<int>(v * rows), 0, rows - 1);
+            float localV = std::fmod(v * rows, 1.0f);
 
             for (int px = 0; px < texW; ++px) {
                 float u = (px + 0.5f) / static_cast<float>(texW);
                 int gx = m_contour.minGX + std::clamp(static_cast<int>(u * cols), 0, cols - 1);
 
-                // Рисуем строго внутри заполненного силуэта структуры!
-                if (m_contour.occupiedCells.count({ gx, gy }) == 0) continue;
+                float wx = worldMinX + u * worldSpanW;
+                float wy = worldMinY + v * worldSpanH;
 
-                ccColor3B pixCol = baseFill;
-                if (hasRefGrid) {
-                    int hgx = std::clamp(static_cast<int>(u * g_refHighResW), 0, g_refHighResW - 1);
-                    int hgy = std::clamp(static_cast<int>(v * g_refHighResH), 0, g_refHighResH - 1);
-                    pixCol = g_referenceHighResGrid[hgy * g_refHighResW + hgx];
-                } else {
-                    float checker = (((px / 3) + (py / 3)) % 2 == 0) ? 0.25f : 0.65f;
-                    pixCol = lerpColor(baseFill, midFill, checker * 0.5f + v * 0.5f);
+                bool inBlockCell = (m_contour.occupiedCells.count({ gx, gy }) > 0);
+                bool inSpikeTriangle = false;
+                if (!inBlockCell) {
+                    for (auto const& sp : m_contour.spikes) {
+                        float dx = (wx - sp.x) / (15.0f * (std::max)(0.2f, sp.scaleX));
+                        float dy = (wy - sp.y + 15.0f) / (30.0f * (std::max)(0.2f, sp.scaleY));
+                        if (dy >= 0.0f && dy <= 1.0f && std::fabs(dx) <= (1.0f - dy)) {
+                            inSpikeTriangle = true;
+                            break;
+                        }
+                    }
                 }
+                // Рисуем строго внутри силуэта блоков ИЛИ треугольного силуэта выделенных шипов!
+                if (!inBlockCell && !inSpikeTriangle) continue;
+
+                float localU = std::fmod(u * cols, 1.0f);
+                bool topOpen    = (m_contour.occupiedCells.count({ gx, gy + 1 }) == 0);
+                bool bottomOpen = (m_contour.occupiedCells.count({ gx, gy - 1 }) == 0);
+                bool leftOpen   = (m_contour.occupiedCells.count({ gx - 1, gy }) == 0);
+                bool rightOpen  = (m_contour.occupiedCells.count({ gx + 1, gy }) == 0);
+
+                ccColor3B pixCol = computeRealisticTexelColor(
+                    wx, wy, worldMinX, worldMinY, worldSpanW, worldSpanH,
+                    topOpen, bottomOpen, leftOpen, rightOpen,
+                    localU, localV, previewAI, styleSeed
+                );
 
                 size_t idx = static_cast<size_t>((py * texW + px) * 4);
                 rgba[idx + 0] = pixCol.r;
@@ -3848,6 +4240,21 @@ protected:
                 auto* blockSpr = createSolidPanel(cellPx - 0.6f, cellPx - 0.6f, cellCol, 255);
                 blockSpr->setPosition(CCPoint{ px, py });
                 m_previewCanvasContent->addChild(blockSpr);
+            }
+            // Показываем также все выделенные шипы во вкладке Shape (ступенчатым треугольником)
+            for (auto const& sp : m_contour.spikes) {
+                int sgx = static_cast<int>(std::floor(sp.x / 30.0f));
+                int sgy = static_cast<int>(std::floor(sp.y / 30.0f));
+                float px = startX + (sgx - m_contour.minGX) * cellPx;
+                float py = startY + (sgy - m_contour.minGY) * cellPx;
+                for (int t = 0; t < 5; ++t) {
+                    float frac = (t + 0.5f) / 5.0f;
+                    float w = (1.0f - frac * 0.85f) * (cellPx - 1.f);
+                    float h = (cellPx / 5.0f) + 0.4f;
+                    auto* triBand = createSolidPanel(w, h, ccColor3B{ 255, 215, 225 }, 255);
+                    triBand->setPosition(CCPoint{ px, py - cellPx * 0.5f + frac * cellPx });
+                    m_previewCanvasContent->addChild(triBand);
+                }
             }
         } else if (m_previewTab == 1 && (g_hasGeneratedArt || g_hasReferenceImage)) {
             // ВКЛАДКА DRAWING:
