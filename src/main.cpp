@@ -1127,8 +1127,8 @@ static void parseCustomElementsFromAIJson(std::string const& innerJson, std::vec
         el.directObjectId = extractJsonIntField(item, "id", 0);
         el.rx             = std::clamp(extractJsonFloatField(item, "rx", 0.5f), -0.08f, 1.08f);
         el.ry             = std::clamp(extractJsonFloatField(item, "ry", 0.5f), -0.08f, 1.08f);
-        el.scaleX         = std::clamp(extractJsonFloatField(item, "sx", 0.45f), 0.05f, 2.5f);
-        el.scaleY         = std::clamp(extractJsonFloatField(item, "sy", 0.45f), 0.05f, 2.5f);
+        el.scaleX         = std::clamp(extractJsonFloatField(item, "sx", 0.12f), 0.01f, 2.5f);
+        el.scaleY         = std::clamp(extractJsonFloatField(item, "sy", 0.12f), 0.01f, 2.5f);
         el.rot            = extractJsonFloatField(item, "rot", 0.0f);
         el.shapeType      = std::clamp(extractJsonIntField(item, "type", 0), 0, 12);
         el.zOrder         = std::clamp(extractJsonIntField(item, "z", 6), -15, 45);
@@ -1161,66 +1161,31 @@ static void parseCustomElementsFromAIJson(std::string const& innerJson, std::vec
     }
 }
 
-// Вычисление объективного сходства сгенерированных элементов ИИ с загруженной картинкой-референсом (0..100%)
+// Самооценка качества попиксельной детализации и точности выбранной структуры из референса (0..100%)
 static int evaluateReferenceSimilarityScore(AIDecisionResult const& res, std::string& outWeakRegions) {
     outWeakRegions.clear();
-    if (!g_hasReferenceImage || g_referenceSampleGrid.size() < static_cast<size_t>(g_referenceGridW * g_referenceGridH)) {
-        return res.selfMatchScore;
-    }
     if (res.customElements.empty()) {
-        outWeakRegions = "No elements placed yet; cover all 4x3 zones of the contour with colors matching the reference image.";
-        return 35;
+        outWeakRegions = "No pixel-by-pixel micro-elements placed; build 35..80 fine elements (sx/sy 0.02..0.30) matching ONE chosen structure.";
+        return 30;
     }
 
-    int totalZones = 12;
-    float accumScore = 0.f;
-    std::ostringstream weakOss;
-
-    for (int zy = 0; zy < 3; ++zy) {
-        for (int zx = 0; zx < 4; ++zx) {
-            float centerRX = (zx + 0.5f) / 4.0f;
-            float centerRY = (zy + 0.5f) / 3.0f;
-
-            int gx = std::clamp(static_cast<int>(centerRX * g_referenceGridW), 0, g_referenceGridW - 1);
-            int gy = std::clamp(static_cast<int>(centerRY * g_referenceGridH), 0, g_referenceGridH - 1);
-            ccColor3B refCol = g_referenceSampleGrid[gy * g_referenceGridW + gx];
-
-            float bestColorDist = 999.f;
-            bool hasCoverage = false;
-            for (auto const& el : res.customElements) {
-                float dx = el.rx - centerRX;
-                float dy = el.ry - centerRY;
-                float distSq = dx * dx + dy * dy;
-                if (distSq <= 0.14f) {
-                    hasCoverage = true;
-                    float dr = static_cast<float>(el.color.r) - static_cast<float>(refCol.r);
-                    float dg = static_cast<float>(el.color.g) - static_cast<float>(refCol.g);
-                    float db = static_cast<float>(el.color.b) - static_cast<float>(refCol.b);
-                    float cDist = std::sqrt(dr * dr + dg * dg + db * db) / 441.67f;
-                    if (cDist < bestColorDist) bestColorDist = cDist;
-                }
-            }
-
-            if (!hasCoverage) {
-                float dr = static_cast<float>(res.fillRGB.r) - static_cast<float>(refCol.r);
-                float dg = static_cast<float>(res.fillRGB.g) - static_cast<float>(refCol.g);
-                float db = static_cast<float>(res.fillRGB.b) - static_cast<float>(refCol.b);
-                bestColorDist = (std::min)(1.0f, std::sqrt(dr * dr + dg * dg + db * db) / 441.67f + 0.25f);
-                weakOss << fmt::format("Zone(rx={:.2f},ry={:.2f}) needs detail RGB({},{},{}); ",
-                    centerRX, centerRY, refCol.r, refCol.g, refCol.b);
-            } else if (bestColorDist > 0.28f) {
-                weakOss << fmt::format("Zone(rx={:.2f},ry={:.2f}) color mismatch, target RGB({},{},{}); ",
-                    centerRX, centerRY, refCol.r, refCol.g, refCol.b);
-            }
-
-            float zoneScore = std::clamp(1.0f - bestColorDist * 0.85f, 0.20f, 1.0f);
-            accumScore += zoneScore;
+    int microPixelCount = 0;
+    for (auto const& el : res.customElements) {
+        if (el.scaleX <= 0.35f || el.scaleY <= 0.35f) {
+            microPixelCount++;
         }
     }
 
-    outWeakRegions = weakOss.str();
-    int computedScore = static_cast<int>(std::lround((accumScore / totalZones) * 100.0f));
-    return std::clamp((computedScore + res.selfMatchScore) / 2, 10, 100);
+    int score = res.selfMatchScore;
+    if (res.customElements.size() < 24) {
+        score = (std::min)(score, 78);
+        outWeakRegions += fmt::format("Too few elements ({}); add 35..80 pixel-by-pixel micro-textures! ", res.customElements.size());
+    }
+    if (microPixelCount < 10) {
+        score = (std::min)(score, 75);
+        outWeakRegions += fmt::format("Only {} micro-elements <= 0.35 scale; use tiny pixel scales (0.02..0.28) for fine textures! ", microPixelCount);
+    }
+    return std::clamp(score, 10, 100);
 }
 
 // Одиночный вызов реальной нейросети (с поддержкой Multimodal Vision для референс-картинок!)
@@ -1439,32 +1404,34 @@ static AIDecisionResult queryRealNeuralNetwork(
         }
     }
 
-    std::string refSummary = buildReferenceGridSummaryForPrompt();
+    std::string refInfo = g_hasReferenceImage
+        ? fmt::format("REFERENCE IMAGE ATTACHED ({}). Inspect ALL structures and the fine micro-textures inside each structure. PICK ONLY ONE SINGLE STRUCTURE from the reference (ignore background, sky, UI, and all other structures!), name it in \"style_name\", and recreate ONLY that ONE structure's style, colors, opacities, and fine micro-textures pixel-by-pixel!", g_referenceFileName)
+        : "No reference image attached. Invent a brand-new, non-repeating artistic style with pixel-by-pixel micro-textures.";
 
     std::string systemRule = fmt::format(
-        "You are Art Agent, an autonomous Geometry Dash 2.2 Level Editor AI artist. "
+        "You are Art Agent, an autonomous Geometry Dash 2.2 Level Editor AI pixel & decor artist. "
         "STRICT RULES: "
         "1. Always communicate in the user's language (if Russian, write in Russian translit with Latin letters so GD bitmap font shows every character). "
-        "2. NO PREMADE 3D BLOCKS OR TEMPLATES: Never use premade 3D blocks unless explicitly asked 'only_3d'. You MUST build 100% custom procedural art from scratch by choosing real Editor object IDs, colors, opacities (15..255), blending, and layers (including internal sub-layers inside blocks!). "
-        "3. NEVER REPEAT PAST STYLES: Previously generated styles in this session: [{}]. When no reference or fixed style is given, invent a completely NEW, original artistic theme, color harmony, and geometry composition every single time! "
-        "4. FULL COLOR, OPACITY & LAYER MASTERY: Control both Base Color (r,g,b,op,blend) and Detail Color (dr,dg,db,dop,dblend), Editor Layer offset 'el' (0=base fill, 1=deep inner block layer, 2=mid inner art layer, 3=upper detail layer, 4=crisp micro-shading, 5=top atmospheric glow), Z-Layer 'zl' (-3=B4, -1=B3, 1=B2, 3=B1, 5=T1, 7=T2, 9=T3), and 'z' (-15..45). "
-        "5. AVAILABLE REAL GD EDITOR OBJECT IDs you can freely place in \"id\": "
-        "211 (solid square canvas/pixel/stripe), 1888 (soft gradient glow), {} (circle dot), {} (hollow ring), {} (triangle shard), {} (thin line), {} (arc), {} (parallel lines), {} (diagonal shine), {} (chevron), {} (cross), {} (corner bracket), {} (arch), {} (brick texture), 406/407/408 (organic spikes/foliage). "
-        "6. Selected contour: {} blocks ({}x{} units). Object limit: {}. Mode: {}. Variant #{}. "
-        "7. Reference image status: {} "
+        "2. NO PREMADE 3D BLOCKS OR TEMPLATES: Never use premade 3D blocks unless explicitly asked 'only_3d'. Build 100% custom art from scratch by choosing Editor object IDs, colors, opacities (15..255), blending, and layers (including internal sub-layers inside blocks!). "
+        "3. ONE STRUCTURE FROM REFERENCE + FINE TEXTURES: When a reference image is provided, look closely at the small/fine micro-textures inside the structures, choose ONE single structure from the reference (NEVER mix multiple structures from the reference together!), and build the entire part strictly in that ONE structure's style and micro-textures. "
+        "4. PIXEL-BY-PIXEL DETAILING (NO 0.5 SCALE LIMIT!): You MUST work pixel-by-pixel! Scales sx and sy go all the way down to 0.01 (e.g. 0.02, 0.04, 0.07, 0.12, 0.18, 0.28). Actively place tiny pixel elements (sx/sy 0.02..0.32) for cracks, bevels, gradients, micro-shading, highlights, and fine textures — never limit yourself to >= 0.5! "
+        "5. NEVER REPEAT PAST STYLES: Previously generated styles: [{}]. When no reference is given, invent a completely NEW theme and pixel composition every time. "
+        "6. LAYERS & COLORS: Control Base Color (r,g,b,op,blend) and Detail Color (dr,dg,db,dop,dblend), Editor Layer offset 'el' (0=base fill, 1=deep inner block, 2=mid inner micro-texture, 3=upper detail, 4=crisp pixel highlight, 5=top glow), Z-Layer 'zl' (-3=B4, -1=B3, 1=B2, 3=B1, 5=T1, 7=T2, 9=T3), and 'z' (-15..45). "
+        "7. REAL GD OBJECT IDs for \"id\": 211 (pixel/square/stripe), 1888 (soft glow), {} (dot), {} (ring), {} (triangle), {} (thin line), {} (arc), {} (parallel lines), {} (diag shine), {} (chevron), {} (cross), {} (corner), {} (arch), {} (brick), 406/407/408 (foliage). "
+        "8. Contour: {} blocks ({}x{} units). Limit: {}. Mode: {}. Variant #{}. {} "
         "Respond ONLY with a single valid JSON object (no markdown fences): "
         "{{"
         "\"action\": \"chat\" | \"build\" | \"only_3d\" | \"only_neon\" | \"only_fill\" | \"undo\", "
         "\"reply\": \"natural response to the player\", "
-        "\"style_name\": \"unique name of this artistic style\", "
-        "\"plan\": \"short summary of layers, colors, and objects chosen\", "
+        "\"style_name\": \"name of the ONE chosen structure/style\", "
+        "\"plan\": \"short summary of the chosen structure, micro-textures, layers, and pixel scales\", "
         "\"match_score\": 0..100, "
-        "\"critique\": \"honest self-evaluation of how closely the elements match the reference or prompt\", "
+        "\"critique\": \"honest self-evaluation of micro-textures and pixel accuracy\", "
         "\"fill_rgb\": [r,g,b], \"mid_rgb\": [r,g,b], \"main_rgb\": [r,g,b], \"outline_rgb\": [r,g,b], \"glow_rgb\": [r,g,b], "
-        "\"want_neon\": true/false, \"count\": 60..400, "
-        "\"elements\": [{{\"id\":211,\"rx\":0.0..1.0,\"ry\":0.0..1.0,\"sx\":0.08..1.6,\"sy\":0.08..1.6,\"rot\":0..360,\"r\":0..255,\"g\":0..255,\"b\":0..255,\"op\":20..255,\"blend\":false,\"dr\":0..255,\"dg\":0..255,\"db\":0..255,\"dop\":20..255,\"dblend\":false,\"el\":0..5,\"zl\":-3..9,\"z\":-10..40}}]"
+        "\"want_neon\": true/false, \"count\": 80..600, "
+        "\"elements\": [{{\"id\":211,\"rx\":0.0..1.0,\"ry\":0.0..1.0,\"sx\":0.01..1.6,\"sy\":0.01..1.6,\"rot\":0..360,\"r\":0..255,\"g\":0..255,\"b\":0..255,\"op\":15..255,\"blend\":false,\"dr\":0..255,\"dg\":0..255,\"db\":0..255,\"dop\":15..255,\"dblend\":false,\"el\":0..5,\"zl\":-3..9,\"z\":-15..45}}]"
         "}}. "
-        "IMPORTANT: When \"action\" is \"build\", generate 24 to 42 rich, layered \"elements\" spanning both internal block layers (el=0,1,2, zl=-3,-1,1) and surface/highlight layers (el=3,4,5, zl=3,5,7) so the part looks hand-crafted and matches the reference or theme.",
+        "IMPORTANT: When \"action\" is \"build\", output 36 to 75 pixel-by-pixel \"elements\" with many fine micro-elements (sx/sy 0.02..0.30) across internal block layers (el=0..5, zl=-3..9) so the micro-textures look crisp and authentic.",
         forbiddenThemes,
         cat.idCircleDot, cat.idCircleRing, cat.idSmallTriangle, cat.idThinLineLong,
         cat.idArcThin, cat.idParallelLines, cat.idDiagShine1, cat.idChevron,
@@ -1475,7 +1442,7 @@ static AIDecisionResult queryRealNeuralNetwork(
         objectLimit,
         overhangAllowed ? "Overhang" : "Inside",
         variantNum,
-        refSummary
+        refInfo
     );
 
     AIDecisionResult bestRes;
@@ -2340,16 +2307,9 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
             bool leftOpen   = (contour.occupiedCells.count({ gx - 1, gy }) == 0);
             bool rightOpen  = (contour.occupiedCells.count({ gx + 1, gy }) == 0);
 
-            // Определяем локальный цвет блока (из референса в этой точке или из градиента палитры ИИ)
+            // Локальный цвет блока берется строго из палитры ОДНОЙ выбранной ИИ структуры (без смешивания всего скриншота!)
             ccColor3B cellBaseCol = lerpColor(ai.fillRGB, ai.midRGB, normY * 0.65f + normX * 0.35f);
             ccColor3B cellInnerCol = lerpColor(ai.midRGB, ai.mainRGB, normY);
-            if (g_hasReferenceImage && g_referenceSampleGrid.size() >= static_cast<size_t>(g_referenceGridW * g_referenceGridH)) {
-                int rgx = std::clamp(static_cast<int>(normX * g_referenceGridW), 0, g_referenceGridW - 1);
-                int rgy = std::clamp(static_cast<int>(normY * g_referenceGridH), 0, g_referenceGridH - 1);
-                ccColor3B refC = g_referenceSampleGrid[rgy * g_referenceGridW + rgx];
-                cellBaseCol = lerpColor(ai.fillRGB, refC, 0.78f);
-                cellInnerCol = refC;
-            }
 
             // Слой 0 (Внутреннее дно блока, Z-Layer B4 = -3, EditorLayer +0)
             addSpec(
@@ -2367,26 +2327,8 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                 static_cast<GLubyte>(115 + ((gx + gy) % 3) * 25), -1, 1, cellInnerCol, false
             );
 
-            // Если есть референс — добавляем 4 внутренних суб-пикселя (2x2 внутри блока 30x30) на слое B2 (zl=1, el=2)
-            // для сверхточной передачи градиентов и текстуры референса!
-            if (g_hasReferenceImage && g_referenceSampleGrid.size() >= static_cast<size_t>(g_referenceGridW * g_referenceGridH)) {
-                for (int sy = 0; sy < 2; ++sy) {
-                    for (int sx = 0; sx < 2; ++sx) {
-                        float subX = cx + (sx == 0 ? -7.5f : 7.5f);
-                        float subY = cy + (sy == 0 ? -7.5f : 7.5f);
-                        float sNormX = std::clamp((subX - originX) / spanW, 0.0f, 1.0f);
-                        float sNormY = std::clamp((subY - originY) / spanH, 0.0f, 1.0f);
-                        int sgx = std::clamp(static_cast<int>(sNormX * g_referenceGridW), 0, g_referenceGridW - 1);
-                        int sgy = std::clamp(static_cast<int>(sNormY * g_referenceGridH), 0, g_referenceGridH - 1);
-                        ccColor3B subCol = g_referenceSampleGrid[sgy * g_referenceGridW + sgx];
-                        addSpec(
-                            result, 211, subX, subY, 0.50f, 0.50f, 0.f,
-                            LayerRole::InnerDetail, ColorSlot::CustomRGB, 4, 0, false,
-                            185, 1, 2, subCol, false
-                        );
-                    }
-                }
-            } else {
+            // Мелкие внутренние микро-текстуры (масштаб < 0.35, без ограничения 0.5!)
+            {
                 // Без референса: уникальная внутренняя микро-слоистость (каждый раз новая!)
                 int innerShapeId = cat.idCircleRing;
                 switch ((gx + gy + uniqueSubLayerPattern) % 5) {
@@ -2452,21 +2394,15 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
             worldY = bestCell.second * 30.f + 15.f + std::clamp(worldY - (bestCell.second * 30.f + 15.f), -11.f, 11.f);
         }
 
-        // Если есть референс, подмешиваем точный цвет референса в этой координате, чтобы попадание было идеальным
         ccColor3B finalBaseCol = el.color;
-        if (g_hasReferenceImage && g_referenceSampleGrid.size() >= static_cast<size_t>(g_referenceGridW * g_referenceGridH)) {
-            int rgx = std::clamp(static_cast<int>(std::clamp(el.rx, 0.f, 1.f) * g_referenceGridW), 0, g_referenceGridW - 1);
-            int rgy = std::clamp(static_cast<int>(std::clamp(el.ry, 0.f, 1.f) * g_referenceGridH), 0, g_referenceGridH - 1);
-            ccColor3B refCol = g_referenceSampleGrid[rgy * g_referenceGridW + rgx];
-            finalBaseCol = lerpColor(el.color, refCol, 0.45f);
-        }
 
         GeneratedObjectSpec cs;
         cs.objectId               = resolveAIElementObjectID(el, cat, true /* строго без 3D-блоков! */);
         cs.x                      = std::clamp(worldX, originX - (allowOverhang ? 14.f : -2.f), originX + spanW + (allowOverhang ? 14.f : -2.f));
         cs.y                      = std::clamp(worldY, originY - (allowOverhang ? 14.f : -2.f), originY + spanH + (allowOverhang ? 14.f : -2.f));
-        cs.scaleX                 = std::clamp(el.scaleX, 0.06f, 1.65f);
-        cs.scaleY                 = std::clamp(el.scaleY, 0.06f, 1.65f);
+        // Попиксельная свобода масштаба: от 0.01 (тончайший пиксель!) до 2.50 — ограничение 0.5 полностью снято
+        cs.scaleX                 = std::clamp(el.scaleX, 0.01f, 2.50f);
+        cs.scaleY                 = std::clamp(el.scaleY, 0.01f, 2.50f);
         cs.rotation               = el.rot;
         cs.layerRole              = LayerRole::InnerDetail;
         cs.editorLayerOffset      = std::clamp(el.editorLayerOff, 0, 5);
@@ -3552,13 +3488,13 @@ protected:
             size_t shownCount = 0;
             for (auto const& s : g_lastPreviewSpecs) {
                 if (s.layerRole == LayerRole::Fill) continue;
-                if (++shownCount > 55) break;
+                if (++shownCount > 240) break;
 
                 float px = -totalW * 0.5f + (s.x - worldMinX) * scaleRatio;
                 float py = -totalH * 0.5f + (s.y - worldMinY) * scaleRatio;
 
-                float w = std::clamp(s.scaleX * cellPx * 0.65f, 2.5f, cellPx * 1.1f);
-                float h = std::clamp(s.scaleY * cellPx * 0.65f, 2.5f, cellPx * 1.1f);
+                float w = std::clamp(s.scaleX * cellPx * 0.85f, 0.8f, cellPx * 1.4f);
+                float h = std::clamp(s.scaleY * cellPx * 0.85f, 0.8f, cellPx * 1.4f);
                 ccColor3B col = (s.colorSlot == ColorSlot::CustomRGB)
                     ? s.customColor
                     : g_lastPreviewPalette.slotColors[std::clamp(static_cast<int>(s.colorSlot), 0, 5)];
