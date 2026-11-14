@@ -175,6 +175,9 @@ struct AIDecisionResult {
     ccColor3B gradTopRGB{ 75, 115, 185 };
     ccColor3B gradBotRGB{ 18, 22, 34 };
     bool hasGradient = false;
+    bool wantRealisticPBR = false; // Включается ТОЛЬКО по запросу (или с референсом), отключается если просят "не делай реалистик/пбр"!
+    bool wantBricks = false;       // Сборка кирпичной кладки из кубиков 211
+    bool wantWindows = false;      // Сборка реалистичных окон из кубиков 211 (рама, стекла, переплет, блики)
     bool wantNeon = true;
     int suggestedCount = 140;
     std::vector<AICustomDrawElement> customElements;
@@ -755,24 +758,32 @@ static void loadAndVerifySavedApiFromDisk() {
 // Парсер JSON-ответа от реальной ИИ-нейросети
 // ============================================================================
 static std::string extractGeminiFinalTextPart(std::string const& rawResp) {
-    // В Gemini 4 (Argon / Carbon / Hydrogen) сначала может идти блок {"thought":true,"text":"..."},
-    // а финальный JSON лежит в следующем блоке {"text":"{...}"}. Ищем последний не-thought "text"!
-    std::string bestText;
+    std::string bestJsonPart;
+    std::string lastNonEmptyPart;
     size_t searchPos = 0;
-    while (true) {
+
+    while (searchPos < rawResp.size()) {
         size_t pos = rawResp.find("\"text\"", searchPos);
         if (pos == std::string::npos) break;
         size_t colon = rawResp.find(':', pos + 6);
         if (colon == std::string::npos) break;
-        size_t qStart = rawResp.find('\"', colon + 1);
-        if (qStart == std::string::npos) break;
-        size_t cur = qStart + 1;
+
+        size_t valPos = colon + 1;
+        while (valPos < rawResp.size() && (rawResp[valPos] == ' ' || rawResp[valPos] == '\t' || rawResp[valPos] == '\r' || rawResp[valPos] == '\n')) {
+            ++valPos;
+        }
+        if (valPos >= rawResp.size() || rawResp[valPos] != '\"') {
+            searchPos = valPos + 1;
+            continue;
+        }
+
+        size_t cur = valPos + 1;
         std::string val;
         while (cur < rawResp.size()) {
             char c = rawResp[cur++];
             if (c == '\\' && cur < rawResp.size()) {
                 char esc = rawResp[cur++];
-                if (esc == 'n') val.push_back(' ');
+                if (esc == 'n' || esc == 'r' || esc == 't') val.push_back(' ');
                 else if (esc == '\"') val.push_back('\"');
                 else if (esc == '\\') val.push_back('\\');
                 else val.push_back(esc);
@@ -782,18 +793,17 @@ static std::string extractGeminiFinalTextPart(std::string const& rawResp) {
                 val.push_back(c);
             }
         }
-        // Проверяем, не помечен ли этот кусок как "thought": true рядом
-        size_t winStart = (pos > 40) ? (pos - 40) : 0;
-        std::string ctx = rawResp.substr(winStart, pos - winStart);
-        bool isThought = (ctx.find("\"thought\"") != std::string::npos && ctx.find("true") != std::string::npos);
-        if (!isThought && !val.empty()) {
-            bestText = val;
-        } else if (bestText.empty() && !val.empty()) {
-            bestText = val;
+
+        if (!val.empty()) {
+            lastNonEmptyPart = val;
+            if (val.find("\"action\"") != std::string::npos || val.find("\"fill_rgb\"") != std::string::npos || val.find('{') != std::string::npos) {
+                bestJsonPart = val;
+            }
         }
         searchPos = cur;
     }
-    return bestText;
+
+    return !bestJsonPart.empty() ? bestJsonPart : lastNonEmptyPart;
 }
 
 // Извлекает последнее непустое строковое значение поля key (корректно пропуская "content": null!)
@@ -1393,6 +1403,16 @@ static int evaluateReferenceSimilarityScore(AIDecisionResult const& res, std::st
     return std::clamp(score, 10, 100);
 }
 
+// Смешивание двух RGB-цветов
+static ccColor3B lerpColor(ccColor3B a, ccColor3B b, float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    return ccColor3B{
+        static_cast<GLubyte>(std::lround(a.r + (b.r - a.r) * t)),
+        static_cast<GLubyte>(std::lround(a.g + (b.g - a.g) * t)),
+        static_cast<GLubyte>(std::lround(a.b + (b.b - a.b) * t))
+    };
+}
+
 // Одиночный вызов реальной нейросети (с поддержкой Multimodal Vision для референс-картинок!)
 static bool executeSingleNeuralNetPass(
     std::string const& systemRule,
@@ -1535,81 +1555,145 @@ static bool executeSingleNeuralNetPass(
         assistantContent = extractOpenAICompatibleContent(rawResp);
     }
 
-    // Помощник: проверяет, просит ли игрок построить/сделать декор, и подбирает реалистичную палитру по ключевым словам
-    auto applySmartBuildFallbackIfRequested = [&](std::string const& promptStr) {
-        std::string lp = promptStr;
-        for (char& ch : lp) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    // Строгое определение запрошенного игроком цвета и флагов (PBR/реалистик, кирпичи, окна, градиент)
+    std::string lp = userTurnPrompt;
+    for (char& ch : lp) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
 
+    auto detectUserColorOverride = [&](ccColor3B& fillC, ccColor3B& midC, ccColor3B& mainC, ccColor3B& outlC, ccColor3B& glowC) -> bool {
+        if (lp.find("krasn") != std::string::npos || lp.find("red") != std::string::npos || lp.find("bordov") != std::string::npos) {
+            fillC = ccColor3B{ 46, 10, 14 }; midC = ccColor3B{ 125, 22, 30 }; mainC = ccColor3B{ 220, 42, 54 }; outlC = ccColor3B{ 255, 185, 190 }; glowC = ccColor3B{ 255, 48, 64 };
+            return true;
+        }
+        if (lp.find("sin") != std::string::npos || lp.find("blue") != std::string::npos) {
+            fillC = ccColor3B{ 10, 20, 52 }; midC = ccColor3B{ 26, 62, 145 }; mainC = ccColor3B{ 52, 122, 245 }; outlC = ccColor3B{ 185, 220, 255 }; glowC = ccColor3B{ 65, 145, 255 };
+            return true;
+        }
+        if (lp.find("golub") != std::string::npos || lp.find("cyan") != std::string::npos || lp.find("biryuz") != std::string::npos || lp.find("ice") != std::string::npos || lp.find("led") != std::string::npos) {
+            fillC = ccColor3B{ 10, 38, 48 }; midC = ccColor3B{ 24, 108, 132 }; mainC = ccColor3B{ 58, 205, 238 }; outlC = ccColor3B{ 205, 250, 255 }; glowC = ccColor3B{ 75, 235, 255 };
+            return true;
+        }
+        if (lp.find("zelen") != std::string::npos || lp.find("green") != std::string::npos || lp.find("izumrud") != std::string::npos || lp.find("laym") != std::string::npos) {
+            fillC = ccColor3B{ 12, 42, 20 }; midC = ccColor3B{ 28, 112, 52 }; mainC = ccColor3B{ 58, 210, 92 }; outlC = ccColor3B{ 190, 255, 205 }; glowC = ccColor3B{ 65, 245, 110 };
+            return true;
+        }
+        if (lp.find("fiolet") != std::string::npos || lp.find("purp") != std::string::npos || lp.find("violet") != std::string::npos || lp.find("siren") != std::string::npos) {
+            fillC = ccColor3B{ 32, 12, 52 }; midC = ccColor3B{ 88, 34, 142 }; mainC = ccColor3B{ 162, 68, 245 }; outlC = ccColor3B{ 228, 195, 255 }; glowC = ccColor3B{ 185, 85, 255 };
+            return true;
+        }
+        if (lp.find("rozov") != std::string::npos || lp.find("pink") != std::string::npos || lp.find("magent") != std::string::npos) {
+            fillC = ccColor3B{ 48, 12, 34 }; midC = ccColor3B{ 138, 32, 92 }; mainC = ccColor3B{ 242, 68, 162 }; outlC = ccColor3B{ 255, 200, 230 }; glowC = ccColor3B{ 255, 82, 178 };
+            return true;
+        }
+        if (lp.find("zhelt") != std::string::npos || lp.find("yellow") != std::string::npos || lp.find("zolot") != std::string::npos || lp.find("gold") != std::string::npos) {
+            fillC = ccColor3B{ 48, 38, 10 }; midC = ccColor3B{ 142, 112, 22 }; mainC = ccColor3B{ 245, 202, 42 }; outlC = ccColor3B{ 255, 245, 190 }; glowC = ccColor3B{ 255, 215, 55 };
+            return true;
+        }
+        if (lp.find("oranzh") != std::string::npos || lp.find("orange") != std::string::npos || lp.find("yantar") != std::string::npos) {
+            fillC = ccColor3B{ 52, 24, 8 }; midC = ccColor3B{ 152, 68, 18 }; mainC = ccColor3B{ 248, 128, 32 }; outlC = ccColor3B{ 255, 215, 175 }; glowC = ccColor3B{ 255, 140, 42 };
+            return true;
+        }
+        if (lp.find("bel") != std::string::npos || lp.find("white") != std::string::npos || lp.find("svetl") != std::string::npos) {
+            fillC = ccColor3B{ 145, 152, 165 }; midC = ccColor3B{ 195, 202, 215 }; mainC = ccColor3B{ 238, 242, 250 }; outlC = ccColor3B{ 255, 255, 255 }; glowC = ccColor3B{ 225, 238, 255 };
+            return true;
+        }
+        if (lp.find("chern") != std::string::npos || lp.find("black") != std::string::npos || lp.find("temn") != std::string::npos || lp.find("dark") != std::string::npos) {
+            fillC = ccColor3B{ 8, 9, 12 }; midC = ccColor3B{ 22, 25, 32 }; mainC = ccColor3B{ 48, 54, 68 }; outlC = ccColor3B{ 165, 175, 195 }; glowC = ccColor3B{ 95, 115, 155 };
+            return true;
+        }
+        if (lp.find("korichn") != std::string::npos || lp.find("brown") != std::string::npos || lp.find("derev") != std::string::npos || lp.find("wood") != std::string::npos) {
+            fillC = ccColor3B{ 38, 22, 12 }; midC = ccColor3B{ 92, 54, 28 }; mainC = ccColor3B{ 148, 92, 48 }; outlC = ccColor3B{ 215, 175, 135 }; glowC = ccColor3B{ 195, 128, 68 };
+            return true;
+        }
+        if (lp.find("seruy") != std::string::npos || lp.find("seriy") != std::string::npos || lp.find("seroe") != std::string::npos ||
+            lp.find("sera") != std::string::npos || lp.find("grey") != std::string::npos || lp.find("gray") != std::string::npos) {
+            fillC = ccColor3B{ 36, 39, 44 }; midC = ccColor3B{ 82, 88, 98 }; mainC = ccColor3B{ 138, 146, 158 }; outlC = ccColor3B{ 205, 212, 224 }; glowC = ccColor3B{ 155, 175, 205 };
+            return true;
+        }
+        return false;
+    };
+
+    auto applyUserDirectivesAndFallbacks = [&](bool forceBuildIfRequested) {
         bool isGreetingOnly = (lp == "privet" || lp == "hi" || lp == "hello" || lp == "zdarova" || lp == "kak dela");
-        if (isGreetingOnly) return;
 
-        bool wantsBuild =
+        bool wantsBuild = !isGreetingOnly && (
             lp.find("sdelay") != std::string::npos || lp.find("postroy") != std::string::npos ||
             lp.find("narisuy") != std::string::npos || lp.find("ukras") != std::string::npos ||
             lp.find("dekor") != std::string::npos || lp.find("stenu") != std::string::npos ||
             lp.find("strukt") != std::string::npos || lp.find("kirpich") != std::string::npos ||
             lp.find("kamen") != std::string::npos || lp.find("neon") != std::string::npos ||
             lp.find("glow") != std::string::npos || lp.find("ship") != std::string::npos ||
-            lp.find("spike") != std::string::npos || lp.find("build") != std::string::npos ||
+            lp.find("spike") != std::string::npos || lp.find("okn") != std::string::npos ||
+            lp.find("window") != std::string::npos || lp.find("dom") != std::string::npos ||
+            lp.find("zdani") != std::string::npos || lp.find("build") != std::string::npos ||
             lp.find("create") != std::string::npos || lp.find("draw") != std::string::npos ||
             lp.find("recreate") != std::string::npos || lp.find("invent") != std::string::npos ||
-            lp.find("refine") != std::string::npos || g_hasReferenceImage;
+            lp.find("refine") != std::string::npos || g_hasReferenceImage
+        );
 
-        if (!wantsBuild) return;
-
-        outRes.taskMode = AITaskMode::FullDecor;
-        outRes.selfMatchScore = 96;
-
-        // Подбираем точную реалистичную цветовую гамму под материалы из запроса игрока!
-        if (lp.find("seruy") != std::string::npos || lp.find("seriy") != std::string::npos ||
-            lp.find("grey") != std::string::npos || lp.find("gray") != std::string::npos ||
-            lp.find("kamen") != std::string::npos || lp.find("stone") != std::string::npos) {
-            outRes.fillRGB    = ccColor3B{ 36, 39, 44 };
-            outRes.midRGB     = ccColor3B{ 78, 84, 94 };
-            outRes.mainRGB    = ccColor3B{ 132, 140, 152 };
-            outRes.outlineRGB = ccColor3B{ 195, 204, 216 };
-            outRes.glowRGB    = ccColor3B{ 140, 175, 220 };
-        } else if (lp.find("kirpich") != std::string::npos || lp.find("brick") != std::string::npos) {
-            outRes.fillRGB    = ccColor3B{ 52, 26, 22 };
-            outRes.midRGB     = ccColor3B{ 118, 52, 42 };
-            outRes.mainRGB    = ccColor3B{ 168, 78, 62 };
-            outRes.outlineRGB = ccColor3B{ 215, 165, 145 };
-            outRes.glowRGB    = ccColor3B{ 235, 110, 75 };
-        } else if (lp.find("zel") != std::string::npos || lp.find("green") != std::string::npos ||
-                   lp.find("tree") != std::string::npos || lp.find("les") != std::string::npos) {
-            outRes.fillRGB    = ccColor3B{ 18, 38, 26 };
-            outRes.midRGB     = ccColor3B{ 42, 92, 58 };
-            outRes.mainRGB    = ccColor3B{ 88, 178, 108 };
-            outRes.outlineRGB = ccColor3B{ 185, 245, 198 };
-            outRes.glowRGB    = ccColor3B{ 75, 245, 135 };
-        } else if (lp.find("krasn") != std::string::npos || lp.find("red") != std::string::npos ||
-                   lp.find("hell") != std::string::npos || lp.find("ad") != std::string::npos) {
-            outRes.fillRGB    = ccColor3B{ 42, 12, 16 };
-            outRes.midRGB     = ccColor3B{ 112, 24, 32 };
-            outRes.mainRGB    = ccColor3B{ 198, 46, 58 };
-            outRes.outlineRGB = ccColor3B{ 255, 175, 182 };
-            outRes.glowRGB    = ccColor3B{ 255, 55, 75 };
-        } else {
-            outRes.fillRGB    = ccColor3B{ 28, 34, 48 };
-            outRes.midRGB     = ccColor3B{ 68, 86, 122 };
-            outRes.mainRGB    = ccColor3B{ 125, 165, 225 };
-            outRes.outlineRGB = ccColor3B{ 215, 235, 255 };
-            outRes.glowRGB    = ccColor3B{ 95, 185, 255 };
+        if (forceBuildIfRequested && wantsBuild && outRes.taskMode == AITaskMode::ChatOnly) {
+            outRes.taskMode = AITaskMode::FullDecor;
+            outRes.selfMatchScore = 96;
         }
 
-        outRes.hasGradient = (lp.find("grad") != std::string::npos);
-        outRes.gradTopRGB  = outRes.mainRGB;
-        outRes.gradBotRGB  = outRes.fillRGB;
-        outRes.wantNeon    = true;
-        if (outRes.replyText.empty() || outRes.replyText == "AI response received.") {
-            outRes.replyText = "Postroil realistichnuyu teksturu po vashemu zaprosu!";
+        // Проверяем запрет на PBR/реалистик ("bez pbr", "ne delay pbr", "bez real", "prostoy", "minimal")
+        bool forbidPBR = (lp.find("bez pbr") != std::string::npos || lp.find("ne delay pbr") != std::string::npos ||
+                          lp.find("no pbr") != std::string::npos || lp.find("bez real") != std::string::npos ||
+                          lp.find("ne delay real") != std::string::npos || lp.find("ne nado pbr") != std::string::npos ||
+                          lp.find("ne nado real") != std::string::npos || lp.find("uberi pbr") != std::string::npos ||
+                          lp.find("prost") != std::string::npos || lp.find("minimal") != std::string::npos);
+
+        bool askPBR = (lp.find("pbr") != std::string::npos || lp.find("realist") != std::string::npos ||
+                       lp.find("detal") != std::string::npos || g_hasReferenceImage);
+
+        if (forbidPBR) {
+            outRes.wantRealisticPBR = false;
+        } else if (askPBR) {
+            outRes.wantRealisticPBR = true;
+        }
+
+        // Проверяем запрос на кирпичи и реалистичные окна из кубиков
+        if (lp.find("kirpich") != std::string::npos || lp.find("brick") != std::string::npos || lp.find("kladk") != std::string::npos) {
+            outRes.wantBricks = true;
+        }
+        if (lp.find("okn") != std::string::npos || lp.find("okon") != std::string::npos ||
+            lp.find("window") != std::string::npos || lp.find("dom") != std::string::npos ||
+            lp.find("zdani") != std::string::npos || lp.find("fasad") != std::string::npos) {
+            outRes.wantWindows = true;
+        }
+        if (lp.find("grad") != std::string::npos) {
+            outRes.hasGradient = true;
+        }
+
+        // СТРОГОЕ ПРИНУЖДЕНИЕ ЦВЕТА ИГРОКА: если игрок назвал цвет в запросе,
+        // перезаписываем палитру ИИ на точный запрошенный цвет, чтобы он никогда не ставил чужой цвет!
+        ccColor3B uFill, uMid, uMain, uOutl, glowC;
+        if (detectUserColorOverride(uFill, uMid, uMain, uOutl, glowC)) {
+            outRes.fillRGB    = uFill;
+            outRes.midRGB     = uMid;
+            outRes.mainRGB    = uMain;
+            outRes.outlineRGB = uOutl;
+            outRes.glowRGB    = glowC;
+            outRes.gradTopRGB = uMain;
+            outRes.gradBotRGB = uFill;
+            outRes.hasCustomPalette = true;
+
+            for (auto& el : outRes.customElements) {
+                float lum = (el.color.r * 0.299f + el.color.g * 0.587f + el.color.b * 0.114f) / 255.0f;
+                if (lum < 0.35f) {
+                    el.color = lerpColor(uFill, uMid, lum / 0.35f);
+                } else if (lum < 0.72f) {
+                    el.color = lerpColor(uMid, uMain, (lum - 0.35f) / 0.37f);
+                } else {
+                    el.color = lerpColor(uMain, uOutl, (lum - 0.72f) / 0.28f);
+                }
+            }
         }
     };
 
     outRes.httpSuccess = true;
     if (assistantContent.empty()) {
-        outRes.replyText = "Postroil realistichnuyu strukturu po vashemu zaprosu!";
-        applySmartBuildFallbackIfRequested(userTurnPrompt);
+        outRes.replyText = "Postroil strukturu tochno po vashemu zaprosu!";
+        applyUserDirectivesAndFallbacks(true);
         return true;
     }
 
@@ -1618,7 +1702,7 @@ static bool executeSingleNeuralNetPass(
         size_t jsonEnd = assistantContent.rfind('}');
         std::string innerJson = (jsonEnd != std::string::npos && jsonEnd > jsonStart)
             ? assistantContent.substr(jsonStart, jsonEnd - jsonStart + 1)
-            : (assistantContent.substr(jsonStart) + "]}"); // Восстанавливаем обрезанный JSON!
+            : (assistantContent.substr(jsonStart) + "]}");
 
         std::string actionStr = extractJsonStringField(innerJson, "action");
         outRes.replyText      = extractJsonStringField(innerJson, "reply");
@@ -1643,7 +1727,10 @@ static bool executeSingleNeuralNetPass(
         bool c7 = extractJsonRGBArray(innerJson, "grad_bot",    outRes.gradBotRGB);
         if (!c6) outRes.gradTopRGB = outRes.mainRGB;
         if (!c7) outRes.gradBotRGB = outRes.fillRGB;
-        outRes.hasGradient = extractJsonBoolField(innerJson, "want_gradient", false);
+        outRes.hasGradient      = extractJsonBoolField(innerJson, "want_gradient", false);
+        outRes.wantRealisticPBR = extractJsonBoolField(innerJson, "want_pbr", false);
+        outRes.wantBricks       = extractJsonBoolField(innerJson, "want_bricks", false);
+        outRes.wantWindows      = extractJsonBoolField(innerJson, "want_windows", false);
         outRes.hasCustomPalette = (c1 || c2 || c3 || c4 || c5 || c6 || c7);
 
         outRes.wantNeon       = extractJsonBoolField(innerJson, "want_neon", true);
@@ -1652,18 +1739,14 @@ static bool executeSingleNeuralNetPass(
         outRes.customElements.clear();
         parseCustomElementsFromAIJson(innerJson, outRes.customElements);
 
-        // Если ИИ прислал элементы или палитру, или игрок явно просил построить — гарантируем режим постройки!
-        if (outRes.taskMode == AITaskMode::ChatOnly) {
-            if (!outRes.customElements.empty() || outRes.hasCustomPalette) {
-                outRes.taskMode = AITaskMode::FullDecor;
-            } else {
-                applySmartBuildFallbackIfRequested(userTurnPrompt);
-            }
+        if (outRes.taskMode == AITaskMode::ChatOnly && (!outRes.customElements.empty() || outRes.hasCustomPalette)) {
+            outRes.taskMode = AITaskMode::FullDecor;
         }
+        applyUserDirectivesAndFallbacks(true);
     } else {
         outRes.taskMode = AITaskMode::ChatOnly;
         outRes.replyText = assistantContent;
-        applySmartBuildFallbackIfRequested(userTurnPrompt);
+        applyUserDirectivesAndFallbacks(true);
     }
     return true;
 }
@@ -2221,8 +2304,10 @@ static std::vector<IslandBounds> splitIntoIslands(std::set<std::pair<int, int>> 
             isl.minGY = (std::min)(isl.minGY, cy);
             isl.maxGY = (std::max)(isl.maxGY, cy);
 
-            for (int dx = -2; dx <= 2; ++dx) {
-                for (int dy = -2; dy <= 2; ++dy) {
+            // Строго непосредственные соседи (-1..1), чтобы два парта с узким проходом в 1 клетку
+            // НИКОГДА не сливались в один остров и пустота между ними не застраивалась!
+            for (int dx = -1; dx <= 1; ++dx) {
+                for (int dy = -1; dy <= 1; ++dy) {
                     if (dx == 0 && dy == 0) continue;
                     std::pair<int, int> nb{ cx + dx, cy + dy };
                     if (allCells.count(nb) && !visited.count(nb)) {
@@ -2237,55 +2322,70 @@ static std::vector<IslandBounds> splitIntoIslands(std::set<std::pair<int, int>> 
     return islands;
 }
 
-// Полное 100% заполнение выделенной структуры (включая замкнутые контуры, домики с открытым низом, арки и колонны!)
+// Точное заполнение ТОЛЬКО реально замкнутых контуров каждого отдельного острова (через внешний flood-fill),
+// чтобы узкие проходы между партами, выемки и коридоры НИКОГДА не считались внутренностью парта!
 static void fillAllStructureInteriorsCompletely(std::set<std::pair<int, int>>& occupied) {
-    if (occupied.size() < 3) return;
+    if (occupied.size() < 4) return;
 
     auto islands = splitIntoIslands(occupied);
     for (auto const& isl : islands) {
-        if (isl.cells.size() < 3) continue;
+        if (isl.cells.size() < 4) continue;
+        int w = isl.maxGX - isl.minGX + 1;
+        int h = isl.maxGY - isl.minGY + 1;
+        if (w <= 2 || h <= 2 || w > 48 || h > 48) continue;
 
-        std::set<std::pair<int, int>> filled = isl.cells;
-
-        // 1. Горизонтальное заполнение между левой и правой стенками на каждой высоте Y
-        for (int gy = isl.minGY; gy <= isl.maxGY; ++gy) {
-            int leftX = 999999;
-            int rightX = -999999;
+        // Если это домик/столб, стоящий прямо на полу уровня (minGY <= 1), временно замыкаем пол только под его стенками
+        std::set<std::pair<int, int>> boundary = isl.cells;
+        if (isl.minGY <= 1) {
+            int leftBottomX = 999999;
+            int rightBottomX = -999999;
             for (auto const& [x, y] : isl.cells) {
-                if (y == gy) {
-                    leftX  = (std::min)(leftX, x);
-                    rightX = (std::max)(rightX, x);
+                if (y <= isl.minGY + 1) {
+                    leftBottomX  = (std::min)(leftBottomX, x);
+                    rightBottomX = (std::max)(rightBottomX, x);
                 }
             }
-            if (leftX < rightX && (rightX - leftX) <= 32) {
-                for (int gx = leftX; gx <= rightX; ++gx) {
-                    filled.insert({ gx, gy });
+            if (leftBottomX < rightBottomX && (rightBottomX - leftBottomX) <= 16) {
+                for (int gx = leftBottomX; gx <= rightBottomX; ++gx) {
+                    boundary.insert({ gx, isl.minGY });
                 }
             }
         }
 
-        // 2. Вертикальное заполнение от крыши/верха до низа контура (чтобы домики и столбы заполнялись на 100%!)
-        if ((isl.maxGX - isl.minGX) <= 32 && (isl.maxGY - isl.minGY) <= 32) {
+        int padMinX = isl.minGX - 1;
+        int padMaxX = isl.maxGX + 1;
+        int padMinY = isl.minGY - 1;
+        int padMaxY = isl.maxGY + 1;
+
+        std::set<std::pair<int, int>> outsideVisited;
+        std::queue<std::pair<int, int>> q;
+        std::pair<int, int> start{ padMinX, padMinY };
+        outsideVisited.insert(start);
+        q.push(start);
+
+        while (!q.empty()) {
+            auto [cx, cy] = q.front();
+            q.pop();
+            const int dx[4] = { 1, -1, 0, 0 };
+            const int dy[4] = { 0, 0, 1, -1 };
+            for (int k = 0; k < 4; ++k) {
+                int nx = cx + dx[k];
+                int ny = cy + dy[k];
+                if (nx < padMinX || nx > padMaxX || ny < padMinY || ny > padMaxY) continue;
+                std::pair<int, int> np{ nx, ny };
+                if (boundary.count(np) > 0 || outsideVisited.count(np) > 0) continue;
+                outsideVisited.insert(np);
+                q.push(np);
+            }
+        }
+
+        for (int gy = isl.minGY; gy <= isl.maxGY; ++gy) {
             for (int gx = isl.minGX; gx <= isl.maxGX; ++gx) {
-                int topY = -999999;
-                int botY = 999999;
-                for (auto const& [x, y] : filled) {
-                    if (x == gx) {
-                        topY = (std::max)(topY, y);
-                        botY = (std::min)(botY, y);
-                    }
-                }
-                if (topY >= isl.minGY) {
-                    int fillBottom = (isl.minGY <= 3) ? isl.minGY : botY;
-                    for (int gy = fillBottom; gy <= topY; ++gy) {
-                        filled.insert({ gx, gy });
-                    }
+                std::pair<int, int> cell{ gx, gy };
+                if (outsideVisited.count(cell) == 0) {
+                    occupied.insert(cell);
                 }
             }
-        }
-
-        for (auto const& c : filled) {
-            occupied.insert(c);
         }
     }
 }
@@ -2491,55 +2591,23 @@ static bool isPremade3DOrForbiddenTemplateID(int id, EditorTabCatalog const& cat
     return false;
 }
 
-static int resolveAIElementObjectID(AICustomDrawElement const& el, EditorTabCatalog const& cat, bool forbid3DBlocks) {
-    if (el.directObjectId > 0) {
-        // НИКАКОГО кругового неона 1888! Если ИИ запросил 1888, заменяем на ОДНОСТОРОННИЙ неон idGlowEdgeSmall
-        if (el.directObjectId == 1888) {
-            return cat.idGlowEdgeSmall;
-        }
-        if (forbid3DBlocks && isPremade3DOrForbiddenTemplateID(el.directObjectId, cat)) {
-            return 211;
-        }
-        return el.directObjectId;
+// Никаких готовых наклонных текстур! ИИ собирает весь декор, кирпичи, окна и PBR исключительно из чистых кубиков 211
+// (плюс односторонний неон idGlowEdgeSmall только для световой обводки)
+static int resolveAIElementObjectID(AICustomDrawElement const& el, EditorTabCatalog const& cat, bool /*forbid3DBlocks*/) {
+    if (el.directObjectId == cat.idGlowEdgeSmall || el.directObjectId == cat.idGlowBeam || el.shapeType == 3) {
+        return cat.idGlowEdgeSmall;
     }
-    switch (el.shapeType) {
-        case 0: return 211;
-        case 1: return cat.idCircleDot;
-        case 2: return cat.idSmallTriangle;
-        case 3: return cat.idGlowEdgeSmall; // Только односторонний неон!
-        case 4: return cat.idThinLineLong;
-        case 5: return cat.idCircleRing;
-        case 6: return cat.idArcThin;
-        case 7: return cat.idParallelLines;
-        case 8: return cat.idDiagShine1;
-        case 9: return cat.idChevron;
-        case 10: return cat.idSmallCross;
-        case 11: return cat.idBracketCorner;
-        case 12: return cat.idBracketArch;
-        default: return 211;
-    }
+    return 211;
 }
 
-// Смешивание двух RGB-цветов
-static ccColor3B lerpColor(ccColor3B a, ccColor3B b, float t) {
-    t = std::clamp(t, 0.0f, 1.0f);
-    return ccColor3B{
-        static_cast<GLubyte>(std::lround(a.r + (b.r - a.r) * t)),
-        static_cast<GLubyte>(std::lround(a.g + (b.g - a.g) * t)),
-        static_cast<GLubyte>(std::lround(a.b + (b.b - a.b) * t))
-    };
-}
-
-// Детерминированный 2D-шум (Value Noise + FBM) для реалистичной микро-зернистости камня/штукатурки/металла/дерева
 static float hash2DNoise(int x, int y, int seed = 1337) {
     uint32_t n = static_cast<uint32_t>(x * 374761393 + y * 668265263 + seed * 1442695041);
     n = (n ^ (n >> 13)) * 1274126177u;
     n = n ^ (n >> 16);
-    return static_cast<float>(n & 0xFFFFu) / 65535.0f; // 0.0 .. 1.0
+    return static_cast<float>(n & 0xFFFFu) / 65535.0f;
 }
 
 static float sampleRealisticFBM(float wx, float wy, int seed) {
-    // 2 октавы плавного шума для органических пятен выветривания, трещин и рельефа
     int ix0 = static_cast<int>(std::floor(wx * 0.22f));
     int iy0 = static_cast<int>(std::floor(wy * 0.22f));
     float n0 = hash2DNoise(ix0, iy0, seed);
@@ -2549,8 +2617,6 @@ static float sampleRealisticFBM(float wx, float wy, int seed) {
     return n0 * 0.65f + n1 * 0.35f;
 }
 
-// Вычисление реалистичного цвета пикселя (с учетом референса 96x96, направленного света сверху-слева,
-// контактных теней Ambient Occlusion у краев, межблочных швов кладки и микро-зернистости материала!)
 static ccColor3B computeRealisticTexelColor(
     float worldX,
     float worldY,
@@ -2562,8 +2628,8 @@ static ccColor3B computeRealisticTexelColor(
     bool bottomOpen,
     bool leftOpen,
     bool rightOpen,
-    float localSubU, // 0..1 внутри блока 30x30
-    float localSubV, // 0..1 внутри блока 30x30
+    float localSubU,
+    float localSubV,
     AIDecisionResult const& ai,
     int styleSeed
 ) {
@@ -2575,7 +2641,6 @@ static ccColor3B computeRealisticTexelColor(
                   g_referenceHighResGrid.size() >= static_cast<size_t>(g_refHighResW * g_refHighResH);
 
     if (hasRef) {
-        // Билинейная фильтрация из 96x96 карты референса + повышение локального микро-контраста (Unsharp Mask)
         float fx = u * (g_refHighResW - 1);
         float fy = v * (g_refHighResH - 1);
         int x0 = std::clamp(static_cast<int>(fx), 0, g_refHighResW - 1);
@@ -2592,8 +2657,7 @@ static ccColor3B computeRealisticTexelColor(
         ccColor3B topMix = lerpColor(c00, c10, tx);
         ccColor3B botMix = lerpColor(c01, c11, tx);
         baseCol = lerpColor(topMix, botMix, ty);
-    } else {
-        // Без референса: реалистичный процедурный материал (кладки/камня/металла) на базе палитры ИИ
+    } else if (ai.wantRealisticPBR) {
         float n = sampleRealisticFBM(worldX, worldY, styleSeed);
         baseCol = lerpColor(ai.fillRGB, ai.midRGB, std::clamp(n * 0.85f + v * 0.25f, 0.0f, 1.0f));
         if (n > 0.72f) {
@@ -2603,27 +2667,19 @@ static ccColor3B computeRealisticTexelColor(
             ccColor3B gradCol = lerpColor(ai.gradBotRGB, ai.gradTopRGB, v);
             baseCol = lerpColor(baseCol, gradCol, 0.55f);
         }
+    } else {
+        baseCol = ai.hasGradient ? lerpColor(ai.gradBotRGB, ai.gradTopRGB, v) : ai.fillRGB;
+        return baseCol;
     }
 
-    // 1. Направленное освещение (Directional Light сверху-слева) + Ambient Occlusion снизу-справа
     float shadeMul = 1.0f;
-    if (topOpen && localSubV > 0.72f)    shadeMul += 0.16f; // Верхняя световая фаска
-    if (leftOpen && localSubU < 0.25f)   shadeMul += 0.09f; // Левый боковой рефлекс
-    if (bottomOpen && localSubV < 0.28f) shadeMul -= 0.22f; // Глубокая тень у основания
-    if (rightOpen && localSubU > 0.75f)  shadeMul -= 0.12f; // Правая собственная тень
+    if (topOpen && localSubV > 0.74f)    shadeMul += 0.14f;
+    if (leftOpen && localSubU < 0.24f)   shadeMul += 0.08f;
+    if (bottomOpen && localSubV < 0.26f) shadeMul -= 0.20f;
+    if (rightOpen && localSubU > 0.76f)  shadeMul -= 0.10f;
 
-    // 2. Тонкие реалистичные швы кладки / микро-стыки внутри блока (Mortar / Panel Seams)
-    if (!hasRef) {
-        bool isHorizontalSeam = (std::fabs(localSubV - 0.5f) < 0.07f);
-        bool isVerticalSeam   = (std::fabs(localSubU - ((localSubV > 0.5f) ? 0.33f : 0.67f)) < 0.07f);
-        if (isHorizontalSeam || isVerticalSeam) {
-            shadeMul -= 0.14f;
-        }
-    }
-
-    // 3. Микро-зернистость поверхности (Surface Grain +/- 6%), чтобы текстура была живой, а не пластиковой
-    float grain = (hash2DNoise(static_cast<int>(worldX * 2.f), static_cast<int>(worldY * 2.f), styleSeed + 99) - 0.5f) * 0.11f;
-    shadeMul = std::clamp(shadeMul + grain, 0.45f, 1.38f);
+    float grain = (hash2DNoise(static_cast<int>(worldX * 2.f), static_cast<int>(worldY * 2.f), styleSeed + 99) - 0.5f) * 0.09f;
+    shadeMul = std::clamp(shadeMul + grain, 0.45f, 1.35f);
 
     return ccColor3B{
         static_cast<GLubyte>(std::clamp(static_cast<int>(std::lround(baseCol.r * shadeMul)), 0, 255)),
@@ -2632,17 +2688,125 @@ static ccColor3B computeRealisticTexelColor(
     };
 }
 
-// Генерация реалистичного попиксельного PBR-шипа ИЛИ неонового Glow-шипа (с любым поворотом 0/90/180/270 и масштабом!)
+// Сборка реалистичной КИРПИЧНОЙ КЛАДКИ внутри блока 30x30 исключительно из ровных кубиков 211 (со швами раствора и PBR-оттенками каждого кирпича!)
+static void appendCubeBrickworkInCell(
+    std::vector<GeneratedObjectSpec>& result,
+    float cx,
+    float cy,
+    int gx,
+    int gy,
+    AIDecisionResult const& ai,
+    int styleSeed
+) {
+    // 3 ряда кирпичей по высоте блока (каждый ряд высотой 9.0 ед. + 1.0 ед. темный шов раствора)
+    // Четные ряды: 2 целых кирпича по 13.8 ед.; Нечетные ряды (вразбежку): половинка + целый + половинка!
+    ccColor3B mortarCol = lerpColor(ai.fillRGB, ccColor3B{ 4, 5, 8 }, 0.62f);
+    addSpec(
+        result, 211, cx, cy, 0.98f, 0.98f, 0.f,
+        LayerRole::InnerDetail, ColorSlot::CustomRGB, 3, 0, false,
+        250, -1, 1, mortarCol, false
+    );
+
+    for (int row = 0; row < 3; ++row) {
+        float rowY = (cy - 10.0f) + row * 10.0f;
+        float brickHScale = 8.4f / 30.0f; // оставляем ровный горизонтальный шов
+        bool staggered = (((gy * 3 + row) % 2) != 0);
+
+        if (!staggered) {
+            for (int b = 0; b < 2; ++b) {
+                float bx = cx + (b == 0 ? -7.2f : 7.2f);
+                float brickWScale = 13.4f / 30.0f;
+                float n = hash2DNoise(gx * 7 + b, gy * 11 + row, styleSeed);
+                ccColor3B bCol = lerpColor(ai.midRGB, ai.mainRGB, n * 0.75f);
+                addSpec(
+                    result, 211, bx, rowY, brickWScale, brickHScale, 0.f,
+                    LayerRole::InnerDetail, ColorSlot::CustomRGB, 5, 0, false,
+                    255, 1, 2, bCol, false
+                );
+                // Верхний тонкий световой блик на каждом кирпичике (если включен PBR)
+                if (ai.wantRealisticPBR) {
+                    addSpec(
+                        result, 211, bx, rowY + 3.4f, brickWScale * 0.94f, 0.035f, 0.f,
+                        LayerRole::InnerDetail, ColorSlot::CustomRGB, 6, 0, false,
+                        145, 1, 2, lerpColor(bCol, ai.outlineRGB, 0.45f), false
+                    );
+                }
+            }
+        } else {
+            // Перевязка швов: левая половинка (-11.2), центральный кирпич (0.0), правая половинка (+11.2)
+            float const offsets[3] = { -11.1f, 0.0f, 11.1f };
+            float const widths[3]  = {  6.4f, 13.4f,  6.4f };
+            for (int b = 0; b < 3; ++b) {
+                float bx = cx + offsets[b];
+                float brickWScale = widths[b] / 30.0f;
+                float n = hash2DNoise(gx * 13 + b, gy * 17 + row, styleSeed + 33);
+                ccColor3B bCol = lerpColor(ai.midRGB, ai.mainRGB, n * 0.80f);
+                addSpec(
+                    result, 211, bx, rowY, brickWScale, brickHScale, 0.f,
+                    LayerRole::InnerDetail, ColorSlot::CustomRGB, 5, 0, false,
+                    255, 1, 2, bCol, false
+                );
+                if (ai.wantRealisticPBR) {
+                    addSpec(
+                        result, 211, bx, rowY + 3.4f, brickWScale * 0.92f, 0.035f, 0.f,
+                        LayerRole::InnerDetail, ColorSlot::CustomRGB, 6, 0, false,
+                        140, 1, 2, lerpColor(bCol, ai.outlineRGB, 0.45f), false
+                    );
+                }
+            }
+        }
+    }
+}
+
+// Сборка РЕАЛИСТИЧНОГО ОКНА из кубиков 211 внутри выбранных клеток структуры
+// (каменный подоконник, глубокая коробка рамы, 4 стеклянных секции с отражением неба/света и переплет!)
+static void appendCubeRealisticWindowInCell(
+    std::vector<GeneratedObjectSpec>& result,
+    float cx,
+    float cy,
+    AIDecisionResult const& ai
+) {
+    ccColor3B frameCol = lerpColor(ai.fillRGB, ccColor3B{ 10, 12, 16 }, 0.55f);
+    ccColor3B sillCol  = lerpColor(ai.midRGB, ai.outlineRGB, 0.45f);
+    ccColor3B glassDark = lerpColor(ccColor3B{ 14, 24, 38 }, ai.glowRGB, 0.28f);
+    ccColor3B glassLit  = lerpColor(ai.glowRGB, ccColor3B{ 225, 245, 255 }, 0.55f);
+
+    // 1. Внешняя каменная/металлическая ниша окна (22x24 ед.)
+    addSpec(result, 211, cx, cy, 0.74f, 0.80f, 0.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 8, 0, false, 255, 1, 2, frameCol, false);
+
+    // 2. Четыре секции стекла (2x2) с градиентом отражения и бликом
+    for (int wy = 0; wy < 2; ++wy) {
+        for (int wx = 0; wx < 2; ++wx) {
+            float gxPos = cx + (wx == 0 ? -4.6f : 4.6f);
+            float gyPos = cy + (wy == 0 ? -4.8f : 4.8f);
+            ccColor3B paneCol = (wy == 1) ? lerpColor(glassDark, glassLit, 0.45f) : glassDark;
+            addSpec(result, 211, gxPos, gyPos, 0.25f, 0.27f, 0.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 9, 0, false, 235, 3, 3, paneCol, false);
+            // Тонкий световой блик на стекле (прямой вертикальный/горизонтальный из кубика 211, без кривых наклонов!)
+            addSpec(result, 211, gxPos - 1.5f, gyPos + 1.8f, 0.08f, 0.12f, 0.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 10, 0, false, 150, 3, 3, glassLit, true);
+        }
+    }
+
+    // 3. Крестовина оконного переплета (импост + горбыльки)
+    addSpec(result, 211, cx, cy, 0.05f, 0.76f, 0.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 11, 0, false, 255, 3, 3, frameCol, false);
+    addSpec(result, 211, cx, cy, 0.70f, 0.05f, 0.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 11, 0, false, 255, 3, 3, frameCol, false);
+
+    // 4. Выступающий верхний наличник и нижний подоконник (Window Sill)
+    addSpec(result, 211, cx, cy + 12.2f, 0.82f, 0.07f, 0.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 11, 0, false, 255, 3, 3, sillCol, false);
+    addSpec(result, 211, cx, cy - 12.2f, 0.84f, 0.08f, 0.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 11, 0, false, 255, 3, 3, sillCol, false);
+}
+
+// РОВНЫЙ И ЧЕТКИЙ ГЕОМЕТРИЧЕСКИЙ ШИП (Симметричная ступенчатая пирамида из ровных кубиков + прямой односторонний Glow):
+// Никаких кривых наклонных полосок, выходящих за треугольник шипа!
 static void appendSingleRealisticOrGlowSpike(
     std::vector<GeneratedObjectSpec>& result,
     SelectedSpikeInfo const& sp,
     EditorTabCatalog const& cat,
     AIDecisionResult const& ai,
-    float originX,
-    float originY,
-    float spanW,
-    float spanH,
-    int styleSeed
+    float /*originX*/,
+    float /*originY*/,
+    float /*spanW*/,
+    float /*spanH*/,
+    int /*styleSeed*/
 ) {
     float rad = -sp.rotation * (3.14159265f / 180.0f);
     float cosA = std::cos(rad);
@@ -2659,128 +2823,74 @@ static void appendSingleRealisticOrGlowSpike(
     float spikeH = (sp.objectId == 39 || sp.objectId == 103) ? 15.0f : 30.0f;
     float baseY  = -15.0f;
 
-    // 1. ВНУТРЕННЯЯ ПОПИКСЕЛЬНАЯ СТРУКТУРА РЕАЛИСТИЧНОГО ШИПА (7 пирамидальных ярусов от основания к острию):
-    //    Строго вписывается в треугольный силуэт шипа, с освещенной левой гранью и затененной правой гранью!
-    constexpr int kTiers = 7;
-    for (int t = 0; t < kTiers; ++t) {
-        float v0 = static_cast<float>(t) / static_cast<float>(kTiers);
-        float vMid = (t + 0.5f) / static_cast<float>(kTiers);
-        float ly = baseY + vMid * spikeH;
+    // 1. Если включен PBR/реалистик — строим идеально ровную симметричную 6-ступенчатую пирамиду внутри треугольника шипа:
+    //    Левая половина каждой ступеньки — светлая грань, правая половина — теневая грань, по центру — ровный вертикальный хребет!
+    if (ai.wantRealisticPBR) {
+        constexpr int kSteps = 6;
+        for (int s = 0; s < kSteps; ++s) {
+            float vMid = (s + 0.5f) / static_cast<float>(kSteps);
+            float ly = baseY + vMid * spikeH;
+            // Строго внутри треугольника шипа (с запасом 0.85, чтобы уголки ступенек никогда не торчали наружу!)
+            float halfW = (1.0f - vMid) * 12.2f;
+            if (halfW < 1.0f) continue;
 
-        // Ширина треугольника сужается к острию (1 - vMid)
-        float halfWidthAtY = (1.0f - vMid) * 13.2f;
-        float tierHeight   = (spikeH / static_cast<float>(kTiers)) * 1.05f;
-        float syScale      = (tierHeight / 30.0f) * sp.scaleY;
+            float stepHScale = ((spikeH / static_cast<float>(kSteps)) * 0.96f) / 30.0f * sp.scaleY;
+            float quarterWScale = (halfW / 30.0f) * sp.scaleX;
 
-        // Делим ширину яруса на левую (освещенную) и правую (теневую) половины + центральный хребет
-        int colsInTier = (t < 3) ? 4 : ((t < 5) ? 2 : 1);
-        float totalTierW = halfWidthAtY * 2.0f;
-        float segW = (std::max)(1.8f, totalTierW / static_cast<float>(colsInTier));
-        float sxScale = (segW / 30.0f) * sp.scaleX;
+            auto [leftX, leftY]   = localToWorld(-halfW * 0.5f, ly);
+            auto [rightX, rightY] = localToWorld( halfW * 0.5f, ly);
 
-        for (int c = 0; c < colsInTier; ++c) {
-            float uLocal = (colsInTier > 1) ? (static_cast<float>(c) / static_cast<float>(colsInTier - 1)) : 0.5f; // 0 = левая грань, 1 = правая грань
-            float lx = -halfWidthAtY + (c + 0.5f) * segW;
-            auto [wx, wy] = localToWorld(lx, ly);
+            ccColor3B litCol  = lerpColor(ai.midRGB, ai.mainRGB, 0.35f + vMid * 0.55f);
+            ccColor3B darkCol = lerpColor(ai.fillRGB, ai.midRGB, vMid * 0.65f);
 
-            ccColor3B texCol = computeRealisticTexelColor(
-                wx, wy, originX, originY, spanW, spanH,
-                (t == kTiers - 1), (t == 0), (c == 0), (c == colsInTier - 1),
-                uLocal, vMid, ai, styleSeed + t * 31 + c * 17
-            );
-
-            // Усиливаем реалистичный граненый контраст лезвия шипа (левая грань светлее, правая — темнее, у базы — AO тень)
-            float facetMul = (uLocal < 0.5f) ? 1.18f : 0.78f;
-            if (v0 < 0.22f) facetMul *= 0.76f; // Темный пьедестал у основания шипа
-            if (t == kTiers - 1) facetMul *= 1.28f; // Острый сверкающий кончик шипа
-
-            ccColor3B finalFacetCol{
-                static_cast<GLubyte>(std::clamp(static_cast<int>(std::lround(texCol.r * facetMul)), 0, 255)),
-                static_cast<GLubyte>(std::clamp(static_cast<int>(std::lround(texCol.g * facetMul)), 0, 255)),
-                static_cast<GLubyte>(std::clamp(static_cast<int>(std::lround(texCol.b * facetMul)), 0, 255))
-            };
-
-            addSpec(
-                result, 211, wx, wy, sxScale, syScale, sp.rotation,
-                LayerRole::InnerDetail, ColorSlot::CustomRGB, 6 + t, 0, false,
-                245, 1, 2, finalFacetCol, false
-            );
+            addSpec(result, 211, leftX,  leftY,  quarterWScale, stepHScale, sp.rotation, LayerRole::InnerDetail, ColorSlot::CustomRGB, 6 + s, 0, false, 240, 1, 2, litCol, false);
+            addSpec(result, 211, rightX, rightY, quarterWScale, stepHScale, sp.rotation, LayerRole::InnerDetail, ColorSlot::CustomRGB, 6 + s, 0, false, 240, 1, 2, darkCol, false);
         }
     }
 
-    // 2. ЦЕНТРАЛЬНЫЙ СВЕТОРАЗДЕЛ (ГРАНЬ ЛЕЗВИЯ) И МИКРО-ФАСКИ РЕАЛИСТИЧНОГО ШИПА:
+    // 2. Ровный центральный световой стержень и четкая подставка у основания шипа (все строго под углом sp.rotation, без кривизны!)
     {
-        auto [ridgeX, ridgeY] = localToWorld(-0.8f, baseY + spikeH * 0.45f);
-        ccColor3B ridgeCol = lerpColor(ai.mainRGB, ccColor3B{ 255, 255, 255 }, 0.45f);
+        auto [coreX, coreY] = localToWorld(0.f, baseY + spikeH * 0.42f);
         addSpec(
-            result, 211, ridgeX, ridgeY, 0.045f * sp.scaleX, (spikeH / 30.0f) * 0.76f * sp.scaleY, sp.rotation,
+            result, 211, coreX, coreY, 0.05f * sp.scaleX, (spikeH / 30.0f) * 0.72f * sp.scaleY, sp.rotation,
             LayerRole::InnerDetail, ColorSlot::CustomRGB, 14, 0, false,
-            190, 3, 3, ridgeCol, true
+            210, 3, 3, lerpColor(ai.mainRGB, ai.outlineRGB, 0.5f), true
         );
 
-        // Левая и правая наклонные режущие кромки (схождения под углом ~26.5 градусов к вершине)
-        float edgeAngleDeg = (spikeH > 20.f) ? 26.5f : 45.0f;
-        auto [leftEdgeX, leftEdgeY]   = localToWorld(-6.8f, baseY + spikeH * 0.48f);
-        auto [rightEdgeX, rightEdgeY] = localToWorld( 6.8f, baseY + spikeH * 0.48f);
-
+        auto [baseX, baseYWorld] = localToWorld(0.f, baseY + 1.8f);
         addSpec(
-            result, 211, leftEdgeX, leftEdgeY, 0.048f * sp.scaleX, (spikeH / 30.0f) * 0.96f * sp.scaleY,
-            sp.rotation + edgeAngleDeg,
+            result, 211, baseX, baseYWorld, 0.92f * sp.scaleX, 0.10f * sp.scaleY, sp.rotation,
             LayerRole::Outline3D, ColorSlot::CustomRGB, 15, 0, false,
-            240, 3, 3, ai.outlineRGB, false
-        );
-        addSpec(
-            result, 211, rightEdgeX, rightEdgeY, 0.048f * sp.scaleX, (spikeH / 30.0f) * 0.96f * sp.scaleY,
-            sp.rotation - edgeAngleDeg,
-            LayerRole::Outline3D, ColorSlot::CustomRGB, 15, 0, false,
-            215, 3, 3, lerpColor(ai.outlineRGB, ai.midRGB, 0.35f), false
-        );
-
-        // Темная контактная тень (Ambient Occlusion + пьедестал) в основании шипа
-        auto [baseDarkX, baseDarkY] = localToWorld(0.f, baseY + 1.8f);
-        addSpec(
-            result, 211, baseDarkX, baseDarkY, 0.94f * sp.scaleX, 0.11f * sp.scaleY, sp.rotation,
-            LayerRole::Outline3D, ColorSlot::CustomRGB, 14, 0, false,
-            225, 3, 3, ccColor3B{ 4, 5, 8 }, false
+            230, 3, 3, ccColor3B{ 4, 5, 8 }, false
         );
     }
 
-    // 3. РЕЖИМ ШИПОВ GLOW (ОДНОСТОРОННИЙ НЕОН ПО НАКЛОННЫМ РЕБРАМ, ТЕМНЫЙ НИЗ И СВЕЧЕНИЕ ОСТРИЯ):
+    // 3. ШИПЫ GLOW (ровный односторонний неон у основания + пирамидальное внутреннее свечение с прозрачностью 65-75% и Blending=true!)
     if (ai.wantNeon || ai.taskMode == AITaskMode::OnlyNeon) {
-        float edgeAngleDeg = (spikeH > 20.f) ? 26.5f : 45.0f;
-        auto [glowLeftX, glowLeftY]   = localToWorld(-5.2f, baseY + spikeH * 0.46f);
-        auto [glowRightX, glowRightY] = localToWorld( 5.2f, baseY + spikeH * 0.46f);
-        auto [glowBaseX, glowBaseY]   = localToWorld( 0.0f, baseY + 3.8f);
-        auto [glowTipX, glowTipY]     = localToWorld( 0.0f, baseY + spikeH - 3.5f);
+        auto [glowBaseUpX, glowBaseUpY] = localToWorld(0.f, baseY + 6.5f);
+        auto [glowDarkX, glowDarkY]     = localToWorld(0.f, baseY + 3.2f);
+        auto [glowMidX, glowMidY]       = localToWorld(0.f, baseY + spikeH * 0.42f);
 
-        // Левое и правое наклонные ребра: ОДНОСТОРОННИЙ неон с прозрачностью 65-75% (170..190) и Blending = true!
+        // Односторонний цветной неон от основания вверх внутрь шипа (прозрачность ~70% = 180, Blending = true)
         addSpec(
-            result, cat.idGlowEdgeSmall, glowLeftX, glowLeftY,
-            0.88f * sp.scaleX, 0.38f * sp.scaleY, sp.rotation + 90.f + edgeAngleDeg,
-            LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 18, 0, false,
-            185, 5, 4, ai.glowRGB, true
-        );
-        addSpec(
-            result, cat.idGlowEdgeSmall, glowRightX, glowRightY,
-            0.88f * sp.scaleX, 0.38f * sp.scaleY, sp.rotation - 90.f - edgeAngleDeg,
-            LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 18, 0, false,
-            172, 5, 4, ai.glowRGB, true
-        );
-
-        // Светящийся акцент на самом острие шипа (Blending = true, прозрачность 70% = 180)
-        addSpec(
-            result, cat.idSmallTriangle, glowTipX, glowTipY,
-            0.28f * sp.scaleX, 0.34f * sp.scaleY, sp.rotation,
-            LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 19, 0, false,
-            180, 7, 5, lerpColor(ai.glowRGB, ccColor3B{ 255, 255, 255 }, 0.5f), true
-        );
-
-        // Нижняя грань шипа: ТЕМНЫЙ (черный) односторонний неон для глубокого контраста основания!
-        addSpec(
-            result, cat.idGlowEdgeSmall, glowBaseX, glowBaseY,
-            0.96f * sp.scaleX, 0.44f * sp.scaleY, sp.rotation,
+            result, cat.idGlowEdgeSmall, glowBaseUpX, glowBaseUpY,
+            0.90f * sp.scaleX, 0.45f * sp.scaleY, sp.rotation,
             LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 17, 0, false,
-            195, 5, 4, ccColor3B{ 0, 0, 0 }, false
+            180, 5, 4, ai.glowRGB, true
+        );
+        // Внутренний узкий неон ближе к вершине шипа (прозрачность ~65% = 168, Blending = true)
+        addSpec(
+            result, cat.idGlowEdgeSmall, glowMidX, glowMidY,
+            0.46f * sp.scaleX, 0.38f * sp.scaleY, sp.rotation,
+            LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 18, 0, false,
+            168, 5, 4, ai.glowRGB, true
+        );
+        // Темный черный односторонний неон у самого низа шипа
+        addSpec(
+            result, cat.idGlowEdgeSmall, glowDarkX, glowDarkY,
+            0.94f * sp.scaleX, 0.36f * sp.scaleY, sp.rotation,
+            LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 19, 0, false,
+            190, 5, 4, ccColor3B{ 0, 0, 0 }, false
         );
     }
 }
@@ -2797,7 +2907,6 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
 
     auto islands = splitIntoIslands(contour.occupiedCells);
 
-    // Режим Only3D вызывается ТОЛЬКО если пользователь сам явно попросил "сделай только 3д"
     if (ai.taskMode == AITaskMode::Only3D) {
         for (auto const& isl : islands) {
             for (auto const& [gx, gy] : isl.cells) {
@@ -2840,7 +2949,6 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                 bool leftOpen   = (contour.occupiedCells.count({ gx - 1, gy }) == 0);
                 bool rightOpen  = (contour.occupiedCells.count({ gx + 1, gy }) == 0);
 
-                // ТОЛЬКО односторонний неон (idGlowEdgeSmall) с прозрачностью 60-80% (175..195/255) и Blending=true!
                 if (topOpen) {
                     addSpec(result, cat.idGlowEdgeSmall, cx, cy + 10.5f, 1.00f, 0.48f, 180.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 0, false, 185, 5, 4, ai.glowRGB, true);
                     if (allowOverhang) {
@@ -2854,7 +2962,6 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                     addSpec(result, cat.idGlowEdgeSmall, cx + 10.5f, cy, 1.00f, 0.46f, 270.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 0, false, 175, 5, 4, ai.glowRGB, true);
                 }
                 if (bottomOpen) {
-                    // Снизу — темный (черный) односторонний неон с прозрачностью ~75% (190/255)
                     addSpec(result, cat.idGlowEdgeSmall, cx, cy - 10.5f, 1.00f, 0.48f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 17, 0, false, 190, 5, 4, ccColor3B{ 0, 0, 0 }, false);
                 }
             }
@@ -2882,26 +2989,19 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         return result;
     }
 
-    // ========================================================================
-    // ГЛАВНЫЙ РЕЖИМ ИИ (FullDecor):
-    // 1) СТРОГО БЕЗ ГОТОВЫХ 3D-БЛОКОВ И ШАБЛОНОВ!
-    // 2) Многослойная работа ВНУТРИ каждого блока (B4..T3, слои редактора +0..+5),
-    //    плавные переходы цвета, прозрачность (opacity) и блендинг.
-    // 3) Если прикреплена картинка-референс — каждый блок и внутренний подслой
-    //    окрашивается в точные цвета референса в этой координате + поверх ставятся
-    //    выбранные самим ИИ объекты из редактора!
-    // ========================================================================
-    // Полностью снимаем искусственный зажим ai.suggestedCount: используем весь доступный maxObjectLimit,
-    // чтобы попиксельный арт и референс рисовались максимально детально и качественно!
     int effectiveCap = (std::max)(60, maxObjectLimit);
 
     float spanW = static_cast<float>((std::max)(1, contour.maxGX - contour.minGX + 1)) * 30.f;
     float spanH = static_cast<float>((std::max)(1, contour.maxGY - contour.minGY + 1)) * 30.f;
     float originX = contour.minGX * 30.f;
     float originY = contour.minGY * 30.f;
+    int styleSeed = static_cast<int>(ai.fillRGB.r * 73 + ai.mainRGB.g * 151 + g_variantIndex * 997);
 
     (void)rng;
     for (auto const& isl : islands) {
+        int islCols = isl.maxGX - isl.minGX + 1;
+        int islRows = isl.maxGY - isl.minGY + 1;
+
         for (auto const& [gx, gy] : isl.cells) {
             float cx = gx * 30.f + 15.f;
             float cy = gy * 30.f + 15.f;
@@ -2911,41 +3011,31 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
             bool leftOpen   = (contour.occupiedCells.count({ gx - 1, gy }) == 0);
             bool rightOpen  = (contour.occupiedCells.count({ gx + 1, gy }) == 0);
 
+            // 1. Базовая заливка клетки (с градиентом только по просьбе!)
             if (ai.hasGradient) {
                 float normYMid = std::clamp((cy - originY) / spanH, 0.0f, 1.0f);
                 ccColor3B baseCol = lerpColor(ai.gradBotRGB, ai.gradTopRGB, normYMid);
-                addSpec(
-                    result, 211, cx, cy, 1.00f, 1.00f, 0.f,
-                    LayerRole::Fill, ColorSlot::CustomRGB, 1, 0, false,
-                    255, -3, 0, baseCol, false
-                );
+                addSpec(result, 211, cx, cy, 1.00f, 1.00f, 0.f, LayerRole::Fill, ColorSlot::CustomRGB, 1, 0, false, 255, -3, 0, baseCol, false);
                 for (int band = 0; band < 4; ++band) {
                     float bandFrac = (band + 0.5f) / 4.0f;
                     float bandY = (cy - 15.f) + bandFrac * 30.f;
                     float globalT = std::clamp((bandY - originY) / spanH, 0.0f, 1.0f);
                     ccColor3B bandCol = lerpColor(ai.gradBotRGB, ai.gradTopRGB, globalT);
-                    addSpec(
-                        result, 211, cx, bandY, 1.00f, 0.27f, 0.f,
-                        LayerRole::InnerDetail, ColorSlot::CustomRGB, 2 + band, 0, false,
-                        220, -1, 1, bandCol, false
-                    );
+                    addSpec(result, 211, cx, bandY, 1.00f, 0.27f, 0.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 2 + band, 0, false, 220, -1, 1, bandCol, false);
                 }
             } else {
-                addSpec(
-                    result, 211, cx, cy, 1.00f, 1.00f, 0.f,
-                    LayerRole::Fill, ColorSlot::CustomRGB, 1, 0, false,
-                    255, -3, 0, ai.fillRGB, false
-                );
+                addSpec(result, 211, cx, cy, 1.00f, 1.00f, 0.f, LayerRole::Fill, ColorSlot::CustomRGB, 1, 0, false, 255, -3, 0, ai.fillRGB, false);
             }
 
-            // РЕАЛИСТИЧНАЯ АДАПТИВНАЯ 6x6 МИКРО-ТЕКСТУРА ВНУТРИ КАЖДОГО БЛОКА СТРУКТУРЫ:
-            // Разбиваем каждый блок 30x30 на 6x6 = 36 текселей (по 5x5 ед., масштаб 0.168f)
-            // с PBR-освещением, контактными тенями AO и автоматическим объединением схожих соседних текселей!
-            {
+            // 2. СБОРКА КИРПИЧЕЙ ИЗ КУБИКОВ 211 (если попросили кирпичную стену/структуру!)
+            if (ai.wantBricks) {
+                appendCubeBrickworkInCell(result, cx, cy, gx, gy, ai, styleSeed);
+            }
+            // 3. ПОПИКСЕЛЬНЫЙ PBR ИЗ КУБИКОВ 211 (ТОЛЬКО если есть референс ИЛИ игрок попросил реалистик/PBR!)
+            else if (ai.wantRealisticPBR || g_hasReferenceImage) {
                 constexpr int kSubDiv = 6;
-                float stepPx = 30.0f / static_cast<float>(kSubDiv); // 5.0 ед.
-                float baseScaleY = 1.02f / static_cast<float>(kSubDiv); // ~0.17f
-                int styleSeed = static_cast<int>(ai.fillRGB.r * 73 + ai.mainRGB.g * 151 + g_variantIndex * 997);
+                float stepPx = 30.0f / static_cast<float>(kSubDiv);
+                float baseScaleY = 1.02f / static_cast<float>(kSubDiv);
 
                 for (int sy = 0; sy < kSubDiv; ++sy) {
                     float pyWorld = (cy - 15.f) + (sy + 0.5f) * stepPx;
@@ -2961,7 +3051,6 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                             localU, localV, ai, styleSeed
                         );
 
-                        // Объединяем соседние пиксели в строке, если их цвет почти идентичен (экономит объекты без потери четкости!)
                         int runLen = 1;
                         while (sx + runLen < kSubDiv) {
                             float pxNext = (cx - 15.f) + (sx + runLen + 0.5f) * stepPx;
@@ -2988,33 +3077,31 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                         sx += runLen;
                     }
                 }
+            }
 
-                // Реалистичный микро-блик (Specular Rim Highlight) на верхней освещенной фаске и глубокая тень (AO) внизу
-                if (topOpen) {
-                    addSpec(
-                        result, 211, cx, cy + 13.4f, 0.96f, 0.045f, 0.f,
-                        LayerRole::InnerDetail, ColorSlot::CustomRGB, 10, 0, false,
-                        165, 1, 2, lerpColor(ai.mainRGB, ccColor3B{ 255, 255, 255 }, 0.55f), true
-                    );
+            // 4. СБОРКА РЕАЛИСТИЧНЫХ ОКОН ИЗ КУБИКОВ 211 (если попросили окна/дом/здание/фасад!)
+            if (ai.wantWindows) {
+                int localCol = gx - isl.minGX;
+                int localRow = gy - isl.minGY;
+                bool isWindowCell = false;
+                if (islCols >= 3 && islRows >= 3) {
+                    isWindowCell = (localCol > 0 && localCol < islCols - 1 && localRow > 0 && localRow < islRows - 1 &&
+                                   (localCol % 2 == 1) && (localRow % 2 == 1));
+                } else {
+                    isWindowCell = (localCol == islCols / 2 && localRow == islRows / 2);
                 }
-                if (bottomOpen) {
-                    addSpec(
-                        result, 211, cx, cy - 13.2f, 0.98f, 0.08f, 0.f,
-                        LayerRole::InnerDetail, ColorSlot::CustomRGB, 9, 0, false,
-                        185, 1, 2, ccColor3B{ 4, 5, 8 }, false
-                    );
+                if (isWindowCell) {
+                    appendCubeRealisticWindowInCell(result, cx, cy, ai);
                 }
             }
 
-            // Единый аккуратный контур границы структуры
+            // 5. Аккуратный ровный контур границы структуры
             if (topOpen)    addSpec(result, 211, cx, cy + 14.3f, 1.00f, 0.055f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 240, 3, 3, ai.outlineRGB, false);
             if (leftOpen)   addSpec(result, 211, cx - 14.3f, cy, 0.055f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 220, 3, 3, ai.outlineRGB, false);
             if (rightOpen)  addSpec(result, 211, cx + 14.3f, cy, 0.055f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 220, 3, 3, ai.outlineRGB, false);
             if (bottomOpen && gy > 0) addSpec(result, 211, cx, cy - 14.3f, 1.00f, 0.055f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 200, 3, 3, ai.outlineRGB, false);
 
-            // ТОЛЬКО ОДНОСТОРОННИЙ НЕОН ПО КРАЯМ (НИКАКОГО КРУГОВОГО НЕОНА 1888!):
-            // Прозрачность 60-80% (165..195 из 255) и обязательный Blending = true для цветного неона,
-            // а снизу — темный (черный) односторонний неон!
+            // 6. ТОЛЬКО ОДНОСТОРОННИЙ НЕОН ПО КРАЯМ (60-80% прозрачность + Blending, снизу черный)
             if (ai.wantNeon) {
                 if (topOpen) {
                     addSpec(result, cat.idGlowEdgeSmall, cx, cy + 10.5f, 1.00f, 0.46f, 180.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 0, false, 185, 5, 4, ai.glowRGB, true);
@@ -3029,43 +3116,27 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                     addSpec(result, cat.idGlowEdgeSmall, cx + 10.5f, cy, 1.00f, 0.44f, 270.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 0, false, 175, 5, 4, ai.glowRGB, true);
                 }
                 if (bottomOpen) {
-                    // Темный черный односторонний неон для низа структуры (прозрачность ~75% = 190)
                     addSpec(result, cat.idGlowEdgeSmall, cx, cy - 10.5f, 1.00f, 0.46f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 17, 0, false, 190, 5, 4, ccColor3B{ 0, 0, 0 }, false);
                 }
             }
         }
     }
 
-    // 2. Размещаем попиксельные элементы ИИ без любых ограничений минимального/максимального масштаба!
+    // 7. Размещаем кастомные кубики 211 от ИИ — СТРОГО выровненные по сетке (rot кратно 90 градусам, никаких случайных наклонных текстур!)
     for (auto const& el : ai.customElements) {
         float worldX = originX + el.rx * spanW;
         float worldY = originY + el.ry * spanH;
         int cellGX = static_cast<int>(std::floor(worldX / 30.f));
         int cellGY = static_cast<int>(std::floor(worldY / 30.f));
 
-        if (contour.occupiedCells.count({ cellGX, cellGY }) == 0 && !contour.occupiedCells.empty()) {
-            float bestDistSq = 1e18f;
-            std::pair<int, int> bestCell = *contour.occupiedCells.begin();
-            for (auto const& c : contour.occupiedCells) {
-                float ccx = c.first * 30.f + 15.f;
-                float ccy = c.second * 30.f + 15.f;
-                float d2 = (ccx - worldX) * (ccx - worldX) + (ccy - worldY) * (ccy - worldY);
-                if (d2 < bestDistSq) {
-                    bestDistSq = d2;
-                    bestCell = c;
-                }
-            }
-            float ccx = bestCell.first * 30.f + 15.f;
-            float ccy = bestCell.second * 30.f + 15.f;
-            float margin = allowOverhang ? 13.5f : 10.5f;
-            worldX = ccx + std::clamp(worldX - ccx, -margin, margin);
-            worldY = ccy + std::clamp(worldY - ccy, -margin, margin);
+        // Если точка попала в узкий зазор между партами (не внутри занятой клетки) — пропускаем ее, чтобы пустота между партами оставалась чистой!
+        if (contour.occupiedCells.count({ cellGX, cellGY }) == 0) {
+            continue;
         }
 
-        int resolvedId = resolveAIElementObjectID(el, cat, true /* строго без 3D-блоков и без кругового 1888! */);
+        int resolvedId = resolveAIElementObjectID(el, cat, true);
         GLubyte finalOp = el.opacity;
         bool finalBlend = el.blending;
-        // Если ИИ ставит односторонний неон — гарантируем прозрачность 60-80% (155..205) и Blending = true!
         if (resolvedId == cat.idGlowEdgeSmall || resolvedId == cat.idGlowBeam) {
             finalOp = static_cast<GLubyte>(std::clamp(static_cast<int>(el.opacity), 153, 204));
             if (el.color.r > 20 || el.color.g > 20 || el.color.b > 20) {
@@ -3073,14 +3144,16 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
             }
         }
 
+        // Выравниваем угол кратно 90 градусам (0, 90, 180, 270), чтобы не было кривых наклонных объектов!
+        float snappedRot = std::round(el.rot / 90.0f) * 90.0f;
+
         GeneratedObjectSpec cs;
         cs.objectId               = resolvedId;
         cs.x                      = worldX;
         cs.y                      = worldY;
-        // Полная свобода масштаба для попиксельного арта (от 0.005f до 4.0f без зажимов!)
-        cs.scaleX                 = std::clamp(el.scaleX, 0.005f, 4.0f);
-        cs.scaleY                 = std::clamp(el.scaleY, 0.005f, 4.0f);
-        cs.rotation               = el.rot;
+        cs.scaleX                 = std::clamp(el.scaleX, 0.005f, 0.95f);
+        cs.scaleY                 = std::clamp(el.scaleY, 0.005f, 0.95f);
+        cs.rotation               = snappedRot;
         cs.layerRole              = LayerRole::InnerDetail;
         cs.editorLayerOffset      = std::clamp(el.editorLayerOff, 0, 5);
         cs.zLayerCode             = el.zLayerCode;
@@ -3099,14 +3172,9 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         result.push_back(cs);
     }
 
-    // 3. ДЕКОРИРОВАНИЕ РЕАЛИСТИЧНЫХ ШИПОВ И ШИПОВ GLOW:
-    //    - Декорируем все выделенные игроком шипы (contour.spikes)
-    //    - Если игрок попросил шипы в промпте ("ship", "spike"), а выделил только блоки —
-    //      автоматически добавляем реалистичные/Glow шипы на открытых верхних клетках структуры!
+    // 8. ДЕКОРИРОВАНИЕ ВЫДЕЛЕННЫХ ШИПОВ (ровные пирамидальные грани + односторонний Glow)
     {
-        int spikeSeed = static_cast<int>(ai.fillRGB.r * 73 + ai.mainRGB.g * 151 + g_variantIndex * 997);
         std::vector<SelectedSpikeInfo> spikesToDecorate = contour.spikes;
-
         std::string lowerPrompt = g_lastBuildPrompt;
         for (char& c : lowerPrompt) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         bool promptMentionsSpikes = (lowerPrompt.find("ship") != std::string::npos ||
@@ -3132,7 +3200,7 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         for (auto const& sp : spikesToDecorate) {
             appendSingleRealisticOrGlowSpike(
                 result, sp, cat, ai,
-                originX, originY, spanW, spanH, spikeSeed
+                originX, originY, spanW, spanH, styleSeed
             );
         }
     }
