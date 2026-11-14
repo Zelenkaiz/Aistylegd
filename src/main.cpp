@@ -90,7 +90,8 @@ struct LockedObjectState {
 };
 
 struct ContourAnalysis {
-    std::set<std::pair<int, int>> occupiedCells;
+    std::set<std::pair<int, int>> rawCells;      // Только исходный каркас выделенной структуры
+    std::set<std::pair<int, int>> occupiedCells; // Полностью заполненная структура (каркас + внутренность)
     std::vector<SelectedSpikeInfo> spikes;
     std::vector<GameObject*> solidObjects;
     std::vector<LockedObjectState> lockedStates;
@@ -185,9 +186,13 @@ static std::string g_referenceFilePath;
 static std::string g_referenceFileName;
 static std::string g_referenceMimeType = "image/png";
 static std::string g_referenceBase64;
-static std::vector<ccColor3B> g_referenceSampleGrid; // Сетка цветов референса 12x8 для превью и самопроверки
+static std::vector<ccColor3B> g_referenceSampleGrid; // Сетка цветов референса 12x8
 static int g_referenceGridW = 12;
 static int g_referenceGridH = 8;
+static std::vector<ccColor3B> g_referenceHighResGrid; // Высокоточная попиксельная карта 48x48 выбранной структуры из референса!
+static int g_refHighResW = 48;
+static int g_refHighResH = 48;
+static bool g_showFilledInShapeTab = false; // Кнопка переключения "Каркас / Заполнение" во вкладке Shape
 static std::vector<std::string> g_pastGeneratedThemes; // Список всех прошлых декоров (запрет повторов!)
 static int g_lastSelfScore = 0;
 static int g_lastRefinementPasses = 1;
@@ -200,7 +205,9 @@ static std::string g_lastBuildPrompt;
 static std::vector<Ref<GameObject>> g_lastPlacedObjects;
 static std::vector<GeneratedObjectSpec> g_lastPreviewSpecs;
 static StylePalette g_lastPreviewPalette;
+static AITaskMode g_lastPreviewTaskMode = AITaskMode::FullDecor;
 static bool g_hasGeneratedArt = false;
+static bool g_hasPendingDrawingApproval = false; // ИИ нарисовал в Drawing и ждет согласия (Keep/In GD) или переделки!
 
 struct ChatTurnRecord {
     std::string role;
@@ -976,8 +983,9 @@ static bool loadReferenceImageFromPath(std::string const& filePath, std::string&
         g_referenceFileName = g_referenceFileName.substr(0, 17) + "...";
     }
 
-    // Снимаем реальную карту цветов 12x8 из картинки через CCImage для точного превью и оценки сходства
+    // Снимаем попиксельную карту 48x48 ОДНОЙ структуры из референса (автоматически отсекая однородный фон по краям!)
     g_referenceSampleGrid.assign(g_referenceGridW * g_referenceGridH, ccColor3B{ 120, 140, 180 });
+    g_referenceHighResGrid.assign(g_refHighResW * g_refHighResH, ccColor3B{ 120, 140, 180 });
     CCImage img;
     if (img.initWithImageData(bytes.data(), static_cast<int>(bytes.size()))) {
         unsigned char* raw = img.getData();
@@ -986,16 +994,53 @@ static bool loadReferenceImageFromPath(std::string const& filePath, std::string&
         bool hasAlpha = img.hasAlpha();
         int bpp = hasAlpha ? 4 : 3;
         if (raw && w > 0 && h > 0) {
+            // Определяем цвет фона по углам изображения, чтобы выделить ОДНУ главную структуру с мелкими текстурами
+            ccColor3B bgCol{ raw[0], raw[1], raw[2] };
+            int cropX0 = 0, cropX1 = w - 1;
+            int cropY0 = 0, cropY1 = h - 1;
+
+            int minX = w, maxX = 0, minY = h, maxY = 0;
+            int fgCount = 0;
+            for (int y = 0; y < h; y += (std::max)(1, h / 120)) {
+                for (int x = 0; x < w; x += (std::max)(1, w / 120)) {
+                    size_t idx = static_cast<size_t>((y * w + x) * bpp);
+                    int dr = std::abs(static_cast<int>(raw[idx + 0]) - static_cast<int>(bgCol.r));
+                    int dg = std::abs(static_cast<int>(raw[idx + 1]) - static_cast<int>(bgCol.g));
+                    int db = std::abs(static_cast<int>(raw[idx + 2]) - static_cast<int>(bgCol.b));
+                    bool notBg = (dr + dg + db > 42) && (!hasAlpha || raw[idx + 3] > 30);
+                    if (notBg) {
+                        minX = (std::min)(minX, x);
+                        maxX = (std::max)(maxX, x);
+                        minY = (std::min)(minY, y);
+                        maxY = (std::max)(maxY, y);
+                        fgCount++;
+                    }
+                }
+            }
+            if (fgCount > 20 && (maxX - minX) >= w / 8 && (maxY - minY) >= h / 8) {
+                cropX0 = minX;
+                cropX1 = maxX;
+                cropY0 = minY;
+                cropY1 = maxY;
+            }
+            int cw = (std::max)(1, cropX1 - cropX0 + 1);
+            int ch = (std::max)(1, cropY1 - cropY0 + 1);
+
             for (int gy = 0; gy < g_referenceGridH; ++gy) {
                 for (int gx = 0; gx < g_referenceGridW; ++gx) {
-                    int px = std::clamp((gx * w + w / 2) / g_referenceGridW, 0, w - 1);
-                    int py = std::clamp(((g_referenceGridH - 1 - gy) * h + h / 2) / g_referenceGridH, 0, h - 1);
+                    int px = std::clamp(cropX0 + (gx * cw + cw / 2) / g_referenceGridW, 0, w - 1);
+                    int py = std::clamp(cropY0 + ((g_referenceGridH - 1 - gy) * ch + ch / 2) / g_referenceGridH, 0, h - 1);
                     size_t idx = static_cast<size_t>((py * w + px) * bpp);
-                    g_referenceSampleGrid[gy * g_referenceGridW + gx] = ccColor3B{
-                        raw[idx + 0],
-                        raw[idx + 1],
-                        raw[idx + 2]
-                    };
+                    g_referenceSampleGrid[gy * g_referenceGridW + gx] = ccColor3B{ raw[idx + 0], raw[idx + 1], raw[idx + 2] };
+                }
+            }
+
+            for (int gy = 0; gy < g_refHighResH; ++gy) {
+                for (int gx = 0; gx < g_refHighResW; ++gx) {
+                    int px = std::clamp(cropX0 + (gx * cw + cw / 2) / g_refHighResW, 0, w - 1);
+                    int py = std::clamp(cropY0 + ((g_refHighResH - 1 - gy) * ch + ch / 2) / g_refHighResH, 0, h - 1);
+                    size_t idx = static_cast<size_t>((py * w + px) * bpp);
+                    g_referenceHighResGrid[gy * g_refHighResW + gx] = ccColor3B{ raw[idx + 0], raw[idx + 1], raw[idx + 2] };
                 }
             }
         }
@@ -1057,6 +1102,7 @@ static bool tryLoadReferenceImageFromClipboard(std::string& outStatus) {
             g_referenceFileName = "Clipboard Image";
             g_referenceSampleGrid.assign(g_referenceGridW * g_referenceGridH, ccColor3B{ 120, 140, 180 });
             CCImage img;
+            g_referenceHighResGrid.assign(g_refHighResW * g_refHighResH, ccColor3B{ 120, 140, 180 });
             if (img.initWithImageData(bmpBytes.data(), static_cast<int>(bmpBytes.size()))) {
                 unsigned char* raw = img.getData();
                 int w = img.getWidth();
@@ -1069,6 +1115,16 @@ static bool tryLoadReferenceImageFromClipboard(std::string& outStatus) {
                             int py = std::clamp(((g_referenceGridH - 1 - gy) * h + h / 2) / g_referenceGridH, 0, h - 1);
                             size_t idx = static_cast<size_t>((py * w + px) * bpp);
                             g_referenceSampleGrid[gy * g_referenceGridW + gx] = ccColor3B{
+                                raw[idx + 0], raw[idx + 1], raw[idx + 2]
+                            };
+                        }
+                    }
+                    for (int gy = 0; gy < g_refHighResH; ++gy) {
+                        for (int gx = 0; gx < g_refHighResW; ++gx) {
+                            int px = std::clamp((gx * w + w / 2) / g_refHighResW, 0, w - 1);
+                            int py = std::clamp(((g_refHighResH - 1 - gy) * h + h / 2) / g_refHighResH, 0, h - 1);
+                            size_t idx = static_cast<size_t>((py * w + px) * bpp);
+                            g_referenceHighResGrid[gy * g_refHighResW + gx] = ccColor3B{
                                 raw[idx + 0], raw[idx + 1], raw[idx + 2]
                             };
                         }
@@ -1537,7 +1593,7 @@ static AIDecisionResult queryRealNeuralNetwork(
         "3. ONE STRUCTURE FROM REFERENCE + FINE TEXTURES: When a reference image is provided, look closely at the small/fine micro-textures inside the structures, choose ONE single structure from the reference (NEVER mix multiple structures from the reference together!), and build the entire part strictly in that ONE structure's style and micro-textures. "
         "4. PIXEL-BY-PIXEL DETAILING (NO 0.5 SCALE LIMIT!): Work pixel-by-pixel! Scales sx and sy go all the way down to 0.01 (0.02..0.32) for fine micro-textures, bevels, cracks, and pixel art. Stay STRICTLY inside the selected contour cells! "
         "5. GRADIENT ONLY WHEN REQUESTED: Set \"want_gradient\": true ONLY if the user explicitly asks for a gradient (otherwise set \"want_gradient\": false). "
-        "6. NEON RULES: Use round glow (1888) ONLY as a large, low-opacity (25..55), additive-blended ambient backlight on low Z-layers (zl=-3,-1,1 / B4,B3,B2). Use one-sided directional glow ({}) as an outline along top/left/right edges with blending=true, and use DARK/BLACK one-sided glow (0,0,0, blend=false) for the bottom edge! "
+        "6. NEON RULES (STRICTLY ONE-SIDED NEON ONLY, NO ROUND GLOW!): NEVER use round glow (1888). Whenever neon or glow is requested or present in the structure, use ONLY one-sided directional glow (id={}) along the edges with opacity 60%..80% (op: 155..204) and blend: true for top/left/right, and dark black one-sided glow (0,0,0, op: 185, blend: false) for the bottom edge! "
         "7. NEVER REPEAT PAST STYLES: Previously generated styles: [{}]. When no reference is given, invent a completely NEW theme and pixel composition every time. "
         "8. LAYERS & COLORS: Base Color (r,g,b,op,blend), Detail Color (dr,dg,db,dop,dblend), Editor Layer 'el' (0..5), Z-Layer 'zl' (-3=B4, -1=B3, 1=B2, 3=B1, 5=T1, 7=T2, 9=T3), 'z' (-15..45). "
         "9. REAL GD OBJECT IDs: 211 (pixel/square), 1888 (round ambient glow), {} (one-sided edge glow), {} (dot), {} (ring), {} (triangle), {} (thin line), {} (arc), {} (parallel lines), {} (diag shine), {} (chevron), {} (cross), {} (corner), {} (arch), {} (brick), 406/407/408 (foliage). "
@@ -1887,14 +1943,18 @@ static void findRealGlowObjectsInTab(std::vector<int> const& tabIDs, EditorTabCa
         }
     }
     if (idx1888 >= 0) {
+        // В редакторе GD страница со свечением начинается со слота 0 = 1888 (круглый шар),
+        // а слот +1 или +4 на этой же странице — прямой ОДНОСТОРОННИЙ неон (градиентная полоса)!
         int pageStart = (idx1888 / 12) * 12;
-        if (pageStart + 4 < static_cast<int>(tabIDs.size()) && tabIDs[pageStart + 4] > 0) {
+        if (pageStart + 1 < static_cast<int>(tabIDs.size()) && tabIDs[pageStart + 1] > 0 && tabIDs[pageStart + 1] != 1888) {
+            cat.idGlowBeam = tabIDs[pageStart + 1];
+            cat.idGlowEdgeSmall = tabIDs[pageStart + 1];
+        }
+        if (pageStart + 4 < static_cast<int>(tabIDs.size()) && tabIDs[pageStart + 4] > 0 && tabIDs[pageStart + 4] != 1888) {
             cat.idGlowEdgeSmall = tabIDs[pageStart + 4];
         }
-        if (pageStart + 1 < static_cast<int>(tabIDs.size()) && tabIDs[pageStart + 1] > 0) {
-            cat.idGlowBeam = tabIDs[pageStart + 1];
-        }
-    } else if (cat.idGradLine != 211) {
+    }
+    if (cat.idGlowEdgeSmall == 1888 && cat.idGradLine != 211 && cat.idGradLine != 1888) {
         cat.idGlowEdgeSmall = cat.idGradLine;
     }
 }
@@ -1917,6 +1977,9 @@ static EditorTabCatalog loadEditorTabCatalog(EditorUIType* ui) {
             if (!bar) continue;
 
             std::vector<int> ids = extractBarObjectIDs(bar);
+            // Ищем страницу с 1888 во ВСЕХ вкладках редактора, чтобы на 100% найти односторонний неон!
+            findRealGlowObjectsInTab(ids, cat);
+
             if (b == 4 && ids.size() >= 24) {
                 best3DBar = ids;
             }
@@ -2055,52 +2118,55 @@ static std::vector<IslandBounds> splitIntoIslands(std::set<std::pair<int, int>> 
     return islands;
 }
 
-// Заливаем ТОЛЬКО полностью замкнутые внутренние полости внутри сложной структуры (flood-fill снаружи),
-// чтобы сложные П-образные, ступенчатые и невыпуклые формы НИКОГДА не выходили за свои реальные пределы!
+// Полное 100% заполнение выделенной структуры (включая замкнутые контуры, домики с открытым низом, арки и колонны!)
 static void fillAllStructureInteriorsCompletely(std::set<std::pair<int, int>>& occupied) {
-    if (occupied.size() < 8) return;
+    if (occupied.size() < 3) return;
 
     auto islands = splitIntoIslands(occupied);
     for (auto const& isl : islands) {
-        if (isl.cells.size() < 8) continue;
-        int w = isl.maxGX - isl.minGX + 1;
-        int h = isl.maxGY - isl.minGY + 1;
-        if (w <= 2 || h <= 2 || w > 40 || h > 40) continue;
+        if (isl.cells.size() < 3) continue;
 
-        int padMinX = isl.minGX - 1;
-        int padMaxX = isl.maxGX + 1;
-        int padMinY = isl.minGY - 1;
-        int padMaxY = isl.maxGY + 1;
+        std::set<std::pair<int, int>> filled = isl.cells;
 
-        std::set<std::pair<int, int>> outsideVisited;
-        std::queue<std::pair<int, int>> q;
-        std::pair<int, int> start{ padMinX, padMinY };
-        outsideVisited.insert(start);
-        q.push(start);
-
-        while (!q.empty()) {
-            auto [cx, cy] = q.front();
-            q.pop();
-            const int dx[4] = { 1, -1, 0, 0 };
-            const int dy[4] = { 0, 0, 1, -1 };
-            for (int k = 0; k < 4; ++k) {
-                int nx = cx + dx[k];
-                int ny = cy + dy[k];
-                if (nx < padMinX || nx > padMaxX || ny < padMinY || ny > padMaxY) continue;
-                std::pair<int, int> np{ nx, ny };
-                if (isl.cells.count(np) > 0 || outsideVisited.count(np) > 0) continue;
-                outsideVisited.insert(np);
-                q.push(np);
+        // 1. Горизонтальное заполнение между левой и правой стенками на каждой высоте Y
+        for (int gy = isl.minGY; gy <= isl.maxGY; ++gy) {
+            int leftX = 999999;
+            int rightX = -999999;
+            for (auto const& [x, y] : isl.cells) {
+                if (y == gy) {
+                    leftX  = (std::min)(leftX, x);
+                    rightX = (std::max)(rightX, x);
+                }
+            }
+            if (leftX < rightX && (rightX - leftX) <= 32) {
+                for (int gx = leftX; gx <= rightX; ++gx) {
+                    filled.insert({ gx, gy });
+                }
             }
         }
 
-        for (int gy = isl.minGY; gy <= isl.maxGY; ++gy) {
+        // 2. Вертикальное заполнение от крыши/верха до низа контура (чтобы домики и столбы заполнялись на 100%!)
+        if ((isl.maxGX - isl.minGX) <= 32 && (isl.maxGY - isl.minGY) <= 32) {
             for (int gx = isl.minGX; gx <= isl.maxGX; ++gx) {
-                std::pair<int, int> cell{ gx, gy };
-                if (isl.cells.count(cell) == 0 && outsideVisited.count(cell) == 0) {
-                    occupied.insert(cell);
+                int topY = -999999;
+                int botY = 999999;
+                for (auto const& [x, y] : filled) {
+                    if (x == gx) {
+                        topY = (std::max)(topY, y);
+                        botY = (std::min)(botY, y);
+                    }
+                }
+                if (topY >= isl.minGY) {
+                    int fillBottom = (isl.minGY <= 3) ? isl.minGY : botY;
+                    for (int gy = fillBottom; gy <= topY; ++gy) {
+                        filled.insert({ gx, gy });
+                    }
                 }
             }
+        }
+
+        for (auto const& c : filled) {
+            occupied.insert(c);
         }
     }
 }
@@ -2163,6 +2229,7 @@ static ContourAnalysis analyzeSelectedContour(EditorUIType* ui) {
             } else {
                 int gx = static_cast<int>(std::floor(pos.x / 30.0f));
                 int gy = static_cast<int>(std::floor(pos.y / 30.0f));
+                info.rawCells.insert({ gx, gy });
                 info.occupiedCells.insert({ gx, gy });
                 info.solidObjects.push_back(obj);
             }
@@ -2184,6 +2251,7 @@ static ContourAnalysis analyzeSelectedContour(EditorUIType* ui) {
 
         for (int dx = 0; dx < 3; ++dx) {
             for (int dy = 0; dy < 3; ++dy) {
+                info.rawCells.insert({ baseGX + dx, baseGY + dy });
                 info.occupiedCells.insert({ baseGX + dx, baseGY + dy });
             }
         }
@@ -2285,6 +2353,10 @@ static bool isPremade3DOrForbiddenTemplateID(int id, EditorTabCatalog const& cat
 
 static int resolveAIElementObjectID(AICustomDrawElement const& el, EditorTabCatalog const& cat, bool forbid3DBlocks) {
     if (el.directObjectId > 0) {
+        // НИКАКОГО кругового неона 1888! Если ИИ запросил 1888, заменяем на ОДНОСТОРОННИЙ неон idGlowEdgeSmall
+        if (el.directObjectId == 1888) {
+            return cat.idGlowEdgeSmall;
+        }
         if (forbid3DBlocks && isPremade3DOrForbiddenTemplateID(el.directObjectId, cat)) {
             return 211;
         }
@@ -2294,7 +2366,7 @@ static int resolveAIElementObjectID(AICustomDrawElement const& el, EditorTabCata
         case 0: return 211;
         case 1: return cat.idCircleDot;
         case 2: return cat.idSmallTriangle;
-        case 3: return 1888;
+        case 3: return cat.idGlowEdgeSmall; // Только односторонний неон!
         case 4: return cat.idThinLineLong;
         case 5: return cat.idCircleRing;
         case 6: return cat.idArcThin;
@@ -2368,23 +2440,27 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
             for (auto const& [gx, gy] : isl.cells) {
                 float cx = gx * 30.f + 15.f;
                 float cy = gy * 30.f + 15.f;
-                bool topOpen   = (contour.occupiedCells.count({ gx, gy + 1 }) == 0);
-                bool leftOpen  = (contour.occupiedCells.count({ gx - 1, gy }) == 0);
-                bool rightOpen = (contour.occupiedCells.count({ gx + 1, gy }) == 0);
+                bool topOpen    = (contour.occupiedCells.count({ gx, gy + 1 }) == 0);
+                bool bottomOpen = (contour.occupiedCells.count({ gx, gy - 1 }) == 0);
+                bool leftOpen   = (contour.occupiedCells.count({ gx - 1, gy }) == 0);
+                bool rightOpen  = (contour.occupiedCells.count({ gx + 1, gy }) == 0);
 
+                // ТОЛЬКО односторонний неон (idGlowEdgeSmall) с прозрачностью 60-80% (175..195/255) и Blending=true!
                 if (topOpen) {
+                    addSpec(result, cat.idGlowEdgeSmall, cx, cy + 10.5f, 1.00f, 0.48f, 180.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 0, false, 185, 5, 4, ai.glowRGB, true);
                     if (allowOverhang) {
-                        addSpec(result, cat.idGlowEdgeSmall, cx - 7.5f, cy + 18.0f, 0.50f, 0.45f, 0.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 0, true, 140, 7, 5);
-                        addSpec(result, cat.idGlowEdgeSmall, cx + 7.5f, cy + 18.0f, 0.50f, 0.45f, 0.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 14, 0, true, 140, 7, 5);
+                        addSpec(result, cat.idGlowEdgeSmall, cx, cy + 18.0f, 1.00f, 0.45f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 17, 0, true, 165, 7, 5, ai.glowRGB, true);
                     }
-                    addSpec(result, cat.idGlowEdgeSmall, cx - 7.5f, cy + 11.5f, 0.50f, 0.40f, 180.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 0, false, 115, 5, 4);
-                    addSpec(result, cat.idGlowEdgeSmall, cx + 7.5f, cy + 11.5f, 0.50f, 0.40f, 180.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 0, false, 115, 5, 4);
                 }
                 if (leftOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx - 11.5f, cy, 0.50f, 0.40f, 90.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 0, false, 110, 5, 4);
+                    addSpec(result, cat.idGlowEdgeSmall, cx - 10.5f, cy, 1.00f, 0.46f, 90.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 0, false, 175, 5, 4, ai.glowRGB, true);
                 }
                 if (rightOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx + 11.5f, cy, 0.50f, 0.40f, 270.f, LayerRole::NeonAndGrass, ColorSlot::AdditiveGlow, 13, 0, false, 110, 5, 4);
+                    addSpec(result, cat.idGlowEdgeSmall, cx + 10.5f, cy, 1.00f, 0.46f, 270.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 0, false, 175, 5, 4, ai.glowRGB, true);
+                }
+                if (bottomOpen) {
+                    // Снизу — темный (черный) односторонний неон с прозрачностью ~75% (190/255)
+                    addSpec(result, cat.idGlowEdgeSmall, cx, cy - 10.5f, 1.00f, 0.48f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 17, 0, false, 190, 5, 4, ccColor3B{ 0, 0, 0 }, false);
                 }
             }
         }
@@ -2411,33 +2487,17 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
     //    окрашивается в точные цвета референса в этой координате + поверх ставятся
     //    выбранные самим ИИ объекты из редактора!
     // ========================================================================
-    int effectiveCap = (std::min)(maxObjectLimit, (std::max)(60, ai.suggestedCount));
+    // Полностью снимаем искусственный зажим ai.suggestedCount: используем весь доступный maxObjectLimit,
+    // чтобы попиксельный арт и референс рисовались максимально детально и качественно!
+    int effectiveCap = (std::max)(60, maxObjectLimit);
 
     float spanW = static_cast<float>((std::max)(1, contour.maxGX - contour.minGX + 1)) * 30.f;
     float spanH = static_cast<float>((std::max)(1, contour.maxGY - contour.minGY + 1)) * 30.f;
     float originX = contour.minGX * 30.f;
     float originY = contour.minGY * 30.f;
 
-    // 1. ЕДИНАЯ СТИЛИСТИКА ДЛЯ ВСЕХ БЛОКОВ СТРУКТУРЫ:
-    //    - Градиент добавляется ТОЛЬКО если пользователь попросил его (ai.hasGradient == true)!
-    //    - Круглый неон (1888) ставится ОДИН раз как большое заднее свечение структуры на низком слое (B3 = -1) с низкой прозрачностью!
-    //    - Односторонний неон (idGlowEdgeSmall) служит обводкой с blending=true (сверху/слева/справа) и темным черным неоном снизу!
     (void)rng;
     for (auto const& isl : islands) {
-        if (ai.wantNeon && !isl.cells.empty()) {
-            float islCenterX = ((isl.minGX + isl.maxGX + 1) * 0.5f) * 30.f;
-            float islCenterY = ((isl.minGY + isl.maxGY + 1) * 0.5f) * 30.f;
-            float islW = static_cast<float>(isl.maxGX - isl.minGX + 1);
-            float islH = static_cast<float>(isl.maxGY - isl.minGY + 1);
-            float bigGlowSX = std::clamp(islW * 0.85f, 1.4f, 6.5f);
-            float bigGlowSY = std::clamp(islH * 0.85f, 1.4f, 6.5f);
-            addSpec(
-                result, 1888, islCenterX, islCenterY, bigGlowSX, bigGlowSY, 0.f,
-                LayerRole::Fill, ColorSlot::CustomRGB, 0, 1, false,
-                38, -1, 0, ai.glowRGB, true
-            );
-        }
-
         for (auto const& [gx, gy] : isl.cells) {
             float cx = gx * 30.f + 15.f;
             float cy = gy * 30.f + 15.f;
@@ -2474,30 +2534,62 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                 );
             }
 
+            // ПОПИКСЕЛЬНАЯ ДЕТАЛИЗАЦИЯ РЕФЕРЕНСА ВНУТРИ КАЖДОГО БЛОКА СТРУКТУРЫ:
+            // Если загружен референс — разбиваем каждый блок 30x30 на сетку 4x4 (16 пикселей по 7.5x7.5 ед., масштаб 0.25f)
+            // и окрашиваем каждый пиксель в точный цвет выбранной структуры из 48x48 карты референса!
+            if (g_hasReferenceImage && g_referenceHighResGrid.size() >= static_cast<size_t>(g_refHighResW * g_refHighResH)) {
+                constexpr int kSubDiv = 4;
+                float stepPx = 30.0f / static_cast<float>(kSubDiv);
+                float subScale = 1.02f / static_cast<float>(kSubDiv); // ~0.255f
+                for (int sy = 0; sy < kSubDiv; ++sy) {
+                    for (int sx = 0; sx < kSubDiv; ++sx) {
+                        float pxWorld = (cx - 15.f) + (sx + 0.5f) * stepPx;
+                        float pyWorld = (cy - 15.f) + (sy + 0.5f) * stepPx;
+                        float u = std::clamp((pxWorld - originX) / spanW, 0.0f, 0.999f);
+                        float v = std::clamp((pyWorld - originY) / spanH, 0.0f, 0.999f);
+                        int hgx = std::clamp(static_cast<int>(u * g_refHighResW), 0, g_refHighResW - 1);
+                        int hgy = std::clamp(static_cast<int>(v * g_refHighResH), 0, g_refHighResH - 1);
+                        ccColor3B pixCol = g_referenceHighResGrid[hgy * g_refHighResW + hgx];
+                        addSpec(
+                            result, 211, pxWorld, pyWorld, subScale, subScale, 0.f,
+                            LayerRole::InnerDetail, ColorSlot::CustomRGB, 4, 0, false,
+                            245, -1, 1, pixCol, false
+                        );
+                    }
+                }
+            }
+
+            // Единый аккуратный контур границы структуры
             if (topOpen)    addSpec(result, 211, cx, cy + 14.3f, 1.00f, 0.055f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 240, 3, 3, ai.outlineRGB, false);
             if (leftOpen)   addSpec(result, 211, cx - 14.3f, cy, 0.055f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 220, 3, 3, ai.outlineRGB, false);
             if (rightOpen)  addSpec(result, 211, cx + 14.3f, cy, 0.055f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 220, 3, 3, ai.outlineRGB, false);
             if (bottomOpen && gy > 0) addSpec(result, 211, cx, cy - 14.3f, 1.00f, 0.055f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 200, 3, 3, ai.outlineRGB, false);
 
+            // ТОЛЬКО ОДНОСТОРОННИЙ НЕОН ПО КРАЯМ (НИКАКОГО КРУГОВОГО НЕОНА 1888!):
+            // Прозрачность 60-80% (165..195 из 255) и обязательный Blending = true для цветного неона,
+            // а снизу — темный (черный) односторонний неон!
             if (ai.wantNeon) {
                 if (topOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx, cy + 10.5f, 0.96f, 0.42f, 180.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 1, false, 115, 5, 4, ai.glowRGB, true);
+                    addSpec(result, cat.idGlowEdgeSmall, cx, cy + 10.5f, 1.00f, 0.46f, 180.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 0, false, 185, 5, 4, ai.glowRGB, true);
+                    if (allowOverhang) {
+                        addSpec(result, cat.idGlowEdgeSmall, cx, cy + 17.5f, 1.00f, 0.42f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 17, 0, true, 160, 7, 5, ai.glowRGB, true);
+                    }
                 }
                 if (leftOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx - 10.5f, cy, 0.96f, 0.40f, 90.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 1, false, 105, 5, 4, ai.glowRGB, true);
+                    addSpec(result, cat.idGlowEdgeSmall, cx - 10.5f, cy, 1.00f, 0.44f, 90.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 0, false, 175, 5, 4, ai.glowRGB, true);
                 }
                 if (rightOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx + 10.5f, cy, 0.96f, 0.40f, 270.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 1, false, 105, 5, 4, ai.glowRGB, true);
+                    addSpec(result, cat.idGlowEdgeSmall, cx + 10.5f, cy, 1.00f, 0.44f, 270.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 0, false, 175, 5, 4, ai.glowRGB, true);
                 }
                 if (bottomOpen) {
-                    // Темный черный односторонний неон для нижней грани структуры
-                    addSpec(result, cat.idGlowEdgeSmall, cx, cy - 10.5f, 0.96f, 0.44f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 17, 1, false, 195, 5, 4, ccColor3B{ 0, 0, 0 }, false);
+                    // Темный черный односторонний неон для низа структуры (прозрачность ~75% = 190)
+                    addSpec(result, cat.idGlowEdgeSmall, cx, cy - 10.5f, 1.00f, 0.46f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 17, 0, false, 190, 5, 4, ccColor3B{ 0, 0, 0 }, false);
                 }
             }
         }
     }
 
-    // 2. Размещаем объекты, которые ИИ выбрал сам — СТРОГО В ПРЕДЕЛАХ выделенных клеток сложной структуры!
+    // 2. Размещаем попиксельные элементы ИИ без любых ограничений минимального/максимального масштаба!
     for (auto const& el : ai.customElements) {
         float worldX = originX + el.rx * spanW;
         float worldY = originY + el.ry * spanH;
@@ -2523,14 +2615,24 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
             worldY = ccy + std::clamp(worldY - ccy, -margin, margin);
         }
 
-        float maxElemScale = (el.directObjectId == 1888) ? 2.50f : 0.92f;
+        int resolvedId = resolveAIElementObjectID(el, cat, true /* строго без 3D-блоков и без кругового 1888! */);
+        GLubyte finalOp = el.opacity;
+        bool finalBlend = el.blending;
+        // Если ИИ ставит односторонний неон — гарантируем прозрачность 60-80% (155..205) и Blending = true!
+        if (resolvedId == cat.idGlowEdgeSmall || resolvedId == cat.idGlowBeam) {
+            finalOp = static_cast<GLubyte>(std::clamp(static_cast<int>(el.opacity), 153, 204));
+            if (el.color.r > 20 || el.color.g > 20 || el.color.b > 20) {
+                finalBlend = true;
+            }
+        }
 
         GeneratedObjectSpec cs;
-        cs.objectId               = resolveAIElementObjectID(el, cat, true /* строго без 3D-блоков! */);
+        cs.objectId               = resolvedId;
         cs.x                      = worldX;
         cs.y                      = worldY;
-        cs.scaleX                 = std::clamp(el.scaleX, 0.01f, maxElemScale);
-        cs.scaleY                 = std::clamp(el.scaleY, 0.01f, maxElemScale);
+        // Полная свобода масштаба для попиксельного арта (от 0.005f до 4.0f без зажимов!)
+        cs.scaleX                 = std::clamp(el.scaleX, 0.005f, 4.0f);
+        cs.scaleY                 = std::clamp(el.scaleY, 0.005f, 4.0f);
         cs.rotation               = el.rot;
         cs.layerRole              = LayerRole::InnerDetail;
         cs.editorLayerOffset      = std::clamp(el.editorLayerOff, 0, 5);
@@ -2538,8 +2640,8 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         cs.zOrder                 = el.zOrder;
         cs.colorSlot              = ColorSlot::CustomRGB;
         cs.customColor            = el.color;
-        cs.customOpacity          = el.opacity;
-        cs.customBlending         = el.blending;
+        cs.customOpacity          = finalOp;
+        cs.customBlending         = finalBlend;
         cs.hasSeparateDetailColor = el.hasDetailColor;
         cs.detailColor            = el.detailColor;
         cs.detailOpacity          = el.detailOpacity;
@@ -2852,6 +2954,8 @@ protected:
     CCLayerColor* m_tabShapeBg = nullptr;
     CCLayerColor* m_tabDrawingBg = nullptr;
     CCLayerColor* m_tabInGDBg = nullptr;
+    CCMenuItemSpriteExtra* m_shapeFillToggleBtn = nullptr;
+    CCLabelBMFont* m_shapeFillToggleLbl = nullptr;
     CCNode* m_previewCanvasContent = nullptr;
     CCLabelBMFont* m_previewSubInfoLabel = nullptr;
     CCLabelBMFont* m_limitValueLabel = nullptr;
@@ -3389,6 +3493,28 @@ protected:
         m_previewCanvasContent->setPosition(CCPoint{ rightX, center.y + 10.f });
         m_mainLayer->addChild(m_previewCanvasContent);
 
+        // Кнопка во вкладке Shape: переключает показ "Только каркас" <-> "100% Заполнение структуры"
+        auto* fillBtnBg = createSolidPanel(78.f, 15.f, ccColor3B{ 26, 38, 68 }, 240);
+        auto* fillBtnBorder = createSolidPanel(80.f, 17.f, ccColor3B{ 95, 195, 255 }, 255);
+        fillBtnBorder->setPosition(CCPoint{ 39.f, 7.5f });
+        fillBtnBorder->setZOrder(-1);
+        fillBtnBg->addChild(fillBtnBorder);
+
+        m_shapeFillToggleLbl = CCLabelBMFont::create(
+            g_showFilledInShapeTab ? "Mode: Filled" : "Show Fill",
+            "chatFont.fnt"
+        );
+        m_shapeFillToggleLbl->setScale(0.36f);
+        m_shapeFillToggleLbl->setColor(ccColor3B{ 235, 248, 255 });
+        m_shapeFillToggleLbl->setPosition(CCPoint{ 39.f, 7.5f });
+        fillBtnBg->addChild(m_shapeFillToggleLbl);
+
+        m_shapeFillToggleBtn = CCMenuItemSpriteExtra::create(
+            fillBtnBg, this, menu_selector(AIDecorPopup::onToggleShapeFillPreview)
+        );
+        m_shapeFillToggleBtn->setPosition(CCPoint{ rightX + 68.f, center.y + 64.f });
+        m_buttonMenu->addChild(m_shapeFillToggleBtn);
+
         std::string dimText = fmt::format(
             "{} x {} units  |  {} blocks",
             m_contour.widthUnits(), m_contour.heightUnits(), m_contour.cellCount()
@@ -3553,6 +3679,123 @@ protected:
         m_chatScrollLayer->scrollWheel(42.f, 0.f);
     }
 
+    void onToggleShapeFillPreview(CCObject*) {
+        g_showFilledInShapeTab = !g_showFilledInShapeTab;
+        if (m_shapeFillToggleLbl) {
+            m_shapeFillToggleLbl->setString(g_showFilledInShapeTab ? "Mode: Filled" : "Show Fill");
+        }
+        refreshRightPanelTabsAndCanvas();
+    }
+
+    // Создает идеальный попиксельный CCSprite для вкладки Drawing, обрезанный строго по силуэту структуры!
+    CCSprite* createPixelArtDrawingPreviewSprite(float targetW, float targetH) {
+        int cols = (std::max)(1, m_contour.maxGX - m_contour.minGX + 1);
+        int rows = (std::max)(1, m_contour.maxGY - m_contour.minGY + 1);
+        int SubPx = 12; // 12x12 пикселей на каждую клетку блока для высокой четкости в Drawing!
+        int texW = std::clamp(cols * SubPx, 24, 384);
+        int texH = std::clamp(rows * SubPx, 24, 384);
+
+        std::vector<uint8_t> rgba(static_cast<size_t>(texW * texH * 4), 0);
+
+        float worldMinX = m_contour.minGX * 30.f;
+        float worldMinY = m_contour.minGY * 30.f;
+        float worldSpanW = cols * 30.f;
+        float worldSpanH = rows * 30.f;
+
+        bool hasRefGrid = g_hasReferenceImage &&
+                          g_referenceHighResGrid.size() >= static_cast<size_t>(g_refHighResW * g_refHighResH);
+
+        ccColor3B baseFill = g_hasGeneratedArt
+            ? g_lastPreviewPalette.slotColors[static_cast<int>(ColorSlot::DarkFill)]
+            : ccColor3B{ 38, 44, 58 };
+        ccColor3B midFill = g_hasGeneratedArt
+            ? g_lastPreviewPalette.slotColors[static_cast<int>(ColorSlot::MidTone)]
+            : ccColor3B{ 82, 96, 124 };
+
+        // 1. Попиксельно заполняем каждую клетку структуры (текстурой референса 48x48 или стилем ИИ)
+        for (int py = 0; py < texH; ++py) {
+            float v = 1.0f - (py + 0.5f) / static_cast<float>(texH); // 0 = низ, 1 = верх
+            int gy = m_contour.minGY + std::clamp(static_cast<int>(v * rows), 0, rows - 1);
+
+            for (int px = 0; px < texW; ++px) {
+                float u = (px + 0.5f) / static_cast<float>(texW);
+                int gx = m_contour.minGX + std::clamp(static_cast<int>(u * cols), 0, cols - 1);
+
+                // Рисуем строго внутри заполненного силуэта структуры!
+                if (m_contour.occupiedCells.count({ gx, gy }) == 0) continue;
+
+                ccColor3B pixCol = baseFill;
+                if (hasRefGrid) {
+                    int hgx = std::clamp(static_cast<int>(u * g_refHighResW), 0, g_refHighResW - 1);
+                    int hgy = std::clamp(static_cast<int>(v * g_refHighResH), 0, g_refHighResH - 1);
+                    pixCol = g_referenceHighResGrid[hgy * g_refHighResW + hgx];
+                } else {
+                    float checker = (((px / 3) + (py / 3)) % 2 == 0) ? 0.25f : 0.65f;
+                    pixCol = lerpColor(baseFill, midFill, checker * 0.5f + v * 0.5f);
+                }
+
+                size_t idx = static_cast<size_t>((py * texW + px) * 4);
+                rgba[idx + 0] = pixCol.r;
+                rgba[idx + 1] = pixCol.g;
+                rgba[idx + 2] = pixCol.b;
+                rgba[idx + 3] = 255;
+            }
+        }
+
+        // 2. Поверх накладываем все микро-пиксельные детали, сгенерированные ИИ
+        for (auto const& s : g_lastPreviewSpecs) {
+            if (s.layerRole == LayerRole::Fill) continue;
+            float u = (s.x - worldMinX) / worldSpanW;
+            float v = (s.y - worldMinY) / worldSpanH;
+            int centerPx = static_cast<int>(u * texW);
+            int centerPy = static_cast<int>((1.0f - v) * texH);
+            int halfW = (std::max)(1, static_cast<int>(s.scaleX * (texW / static_cast<float>(cols)) * 0.5f));
+            int halfH = (std::max)(1, static_cast<int>(s.scaleY * (texH / static_cast<float>(rows)) * 0.5f));
+
+            ccColor3B col = (s.colorSlot == ColorSlot::CustomRGB)
+                ? s.customColor
+                : g_lastPreviewPalette.slotColors[std::clamp(static_cast<int>(s.colorSlot), 0, 5)];
+            float alpha = (s.customOpacity / 255.0f) * 0.85f;
+
+            for (int dy = -halfH; dy <= halfH; ++dy) {
+                int py = centerPy + dy;
+                if (py < 0 || py >= texH) continue;
+                for (int dx = -halfW; dx <= halfW; ++dx) {
+                    int px = centerPx + dx;
+                    if (px < 0 || px >= texW) continue;
+                    size_t idx = static_cast<size_t>((py * texW + px) * 4);
+                    if (rgba[idx + 3] == 0) continue; // не выходим за силуэт структуры!
+                    rgba[idx + 0] = static_cast<uint8_t>(std::clamp(static_cast<int>(rgba[idx + 0] * (1.f - alpha) + col.r * alpha), 0, 255));
+                    rgba[idx + 1] = static_cast<uint8_t>(std::clamp(static_cast<int>(rgba[idx + 1] * (1.f - alpha) + col.g * alpha), 0, 255));
+                    rgba[idx + 2] = static_cast<uint8_t>(std::clamp(static_cast<int>(rgba[idx + 2] * (1.f - alpha) + col.b * alpha), 0, 255));
+                }
+            }
+        }
+
+        auto* tex = new CCTexture2D();
+        if (tex && tex->initWithData(
+                rgba.data(),
+                kCCTexture2DPixelFormat_RGBA8888,
+                texW,
+                texH,
+                CCSize{ static_cast<float>(texW), static_cast<float>(texH) }
+            )) {
+            tex->autorelease();
+            auto* spr = CCSprite::createWithTexture(tex);
+            if (spr) {
+                CCSize ptsSize = spr->getContentSize();
+                float curW = (ptsSize.width > 0.01f) ? ptsSize.width : static_cast<float>(texW);
+                float curH = (ptsSize.height > 0.01f) ? ptsSize.height : static_cast<float>(texH);
+                spr->setScaleX(targetW / curW);
+                spr->setScaleY(targetH / curH);
+                return spr;
+            }
+        } else {
+            CC_SAFE_DELETE(tex);
+        }
+        return nullptr;
+    }
+
     void refreshRightPanelTabsAndCanvas() {
         if (m_tabShapeBg)   m_tabShapeBg->setColor((m_previewTab == 0) ? ccColor3B{ 225, 52, 86 } : ccColor3B{ 28, 20, 24 });
         if (m_tabDrawingBg) m_tabDrawingBg->setColor((m_previewTab == 1) ? ccColor3B{ 225, 52, 86 } : ccColor3B{ 28, 20, 24 });
@@ -3560,6 +3803,14 @@ protected:
 
         if (m_insideTabBg)   m_insideTabBg->setColor(!g_overhangAllowed ? ccColor3B{ 225, 52, 86 } : ccColor3B{ 28, 20, 24 });
         if (m_overhangTabBg) m_overhangTabBg->setColor(g_overhangAllowed  ? ccColor3B{ 225, 52, 86 } : ccColor3B{ 28, 20, 24 });
+
+        // Кнопка "Show Fill / Mode: Filled" видна во вкладке Shape
+        if (m_shapeFillToggleBtn) {
+            m_shapeFillToggleBtn->setVisible(m_previewTab == 0);
+        }
+        if (m_shapeFillToggleLbl) {
+            m_shapeFillToggleLbl->setString(g_showFilledInShapeTab ? "Mode: Filled" : "Show Fill");
+        }
 
         if (!m_previewCanvasContent) return;
 
@@ -3572,22 +3823,42 @@ protected:
         int cols = (std::max)(1, m_contour.maxGX - m_contour.minGX + 1);
         int rows = (std::max)(1, m_contour.maxGY - m_contour.minGY + 1);
         float cellPx = (std::min)(136.f / cols, 88.f / rows);
-        cellPx = std::clamp(cellPx, 8.f, 26.f);
+        cellPx = std::clamp(cellPx, 6.f, 26.f);
 
         float totalW = cols * cellPx;
         float totalH = rows * cellPx;
         float startX = -totalW * 0.5f + cellPx * 0.5f;
         float startY = -totalH * 0.5f + cellPx * 0.5f;
 
-        if (m_previewTab == 0 || !g_hasGeneratedArt) {
-            for (auto const& [gx, gy] : m_contour.occupiedCells) {
+        if (m_previewTab == 0) {
+            // ВКЛАДКА SHAPE:
+            // По умолчанию показывает ТОЛЬКО исходный каркас (rawCells),
+            // а при нажатии кнопки "Show Fill" показывает полное 100% заполнение (occupiedCells)!
+            auto const& cellsToShow = g_showFilledInShapeTab
+                ? m_contour.occupiedCells
+                : (m_contour.rawCells.empty() ? m_contour.occupiedCells : m_contour.rawCells);
+
+            for (auto const& [gx, gy] : cellsToShow) {
                 float px = startX + (gx - m_contour.minGX) * cellPx;
                 float py = startY + (gy - m_contour.minGY) * cellPx;
-                auto* blockSpr = createSolidPanel(cellPx + 0.5f, cellPx + 0.5f, ccColor3B{ 245, 248, 255 }, 255);
+                bool isOriginalFrame = (m_contour.rawCells.count({ gx, gy }) > 0);
+                ccColor3B cellCol = (!g_showFilledInShapeTab || isOriginalFrame)
+                    ? ccColor3B{ 245, 248, 255 }
+                    : ccColor3B{ 155, 215, 255 };
+                auto* blockSpr = createSolidPanel(cellPx - 0.6f, cellPx - 0.6f, cellCol, 255);
                 blockSpr->setPosition(CCPoint{ px, py });
                 m_previewCanvasContent->addChild(blockSpr);
             }
+        } else if (m_previewTab == 1 && (g_hasGeneratedArt || g_hasReferenceImage)) {
+            // ВКЛАДКА DRAWING:
+            // Показывает ИДЕАЛЬНЫЙ ПОПИКСЕЛЬНЫЙ РИСУНОК (1024x1024 стиль) внутри силуэта структуры!
+            if (auto* artSpr = createPixelArtDrawingPreviewSprite(totalW, totalH)) {
+                artSpr->setPosition(CCPoint{ 0.f, 0.f });
+                m_previewCanvasContent->addChild(artSpr);
+            }
         } else {
+            // ВКЛАДКА IN GD:
+            // Показывает все сгенерированные объекты редактора и односторонний неон по краям
             for (auto const& [gx, gy] : m_contour.occupiedCells) {
                 float px = startX + (gx - m_contour.minGX) * cellPx;
                 float py = startY + (gy - m_contour.minGY) * cellPx;
@@ -3599,14 +3870,6 @@ protected:
                 );
                 fillSpr->setPosition(CCPoint{ px, py });
                 m_previewCanvasContent->addChild(fillSpr);
-
-                auto* texSpr = createSolidPanel(
-                    cellPx * 0.72f, cellPx * 0.72f,
-                    g_lastPreviewPalette.slotColors[static_cast<int>(ColorSlot::MidTone)],
-                    255
-                );
-                texSpr->setPosition(CCPoint{ px, py });
-                m_previewCanvasContent->addChild(texSpr);
             }
 
             float worldMinX = m_contour.minGX * 30.f;
@@ -3616,18 +3879,18 @@ protected:
             size_t shownCount = 0;
             for (auto const& s : g_lastPreviewSpecs) {
                 if (s.layerRole == LayerRole::Fill) continue;
-                if (++shownCount > 240) break;
+                if (++shownCount > 500) break;
 
                 float px = -totalW * 0.5f + (s.x - worldMinX) * scaleRatio;
                 float py = -totalH * 0.5f + (s.y - worldMinY) * scaleRatio;
 
-                float w = std::clamp(s.scaleX * cellPx * 0.85f, 0.8f, cellPx * 1.4f);
-                float h = std::clamp(s.scaleY * cellPx * 0.85f, 0.8f, cellPx * 1.4f);
+                float w = std::clamp(s.scaleX * cellPx, 0.6f, cellPx * 1.4f);
+                float h = std::clamp(s.scaleY * cellPx, 0.6f, cellPx * 1.4f);
                 ccColor3B col = (s.colorSlot == ColorSlot::CustomRGB)
                     ? s.customColor
                     : g_lastPreviewPalette.slotColors[std::clamp(static_cast<int>(s.colorSlot), 0, 5)];
 
-                auto* detSpr = createSolidPanel(w, h, col, 255);
+                auto* detSpr = createSolidPanel(w, h, col, s.customOpacity);
                 detSpr->setRotation(s.rotation);
                 detSpr->setPosition(CCPoint{ px, py });
                 m_previewCanvasContent->addChild(detSpr);
@@ -3761,7 +4024,14 @@ protected:
 
     void onTabShape(CCObject*)   { m_previewTab = 0; refreshRightPanelTabsAndCanvas(); }
     void onTabDrawing(CCObject*) { m_previewTab = 1; refreshRightPanelTabsAndCanvas(); }
-    void onTabInGD(CCObject*)    { m_previewTab = 2; refreshRightPanelTabsAndCanvas(); }
+    void onTabInGD(CCObject*) {
+        if (g_hasPendingDrawingApproval && g_hasGeneratedArt) {
+            approveAndPlaceCurrentDrawingInGD(false);
+            return;
+        }
+        m_previewTab = 2;
+        refreshRightPanelTabsAndCanvas();
+    }
 
     void onLimitDec(CCObject*) {
         g_objectLimit = (std::max)(50, g_objectLimit - 1000);
@@ -3803,6 +4073,7 @@ protected:
         g_referenceFileName.clear();
         g_referenceBase64.clear();
         g_referenceSampleGrid.clear();
+        g_referenceHighResGrid.clear();
         g_chatHistory.push_back({ "assistant", "Reference cleared. Next builds will invent 100% brand-new non-repeating styles!" });
         if (m_stepPlanLabel) m_stepPlanLabel->setString("Ref: cleared");
         rebuildChatScrollFeed();
@@ -3839,6 +4110,10 @@ protected:
     }
 
     void onKeepClicked(CCObject*) {
+        if (g_hasPendingDrawingApproval && g_hasGeneratedArt) {
+            approveAndPlaceCurrentDrawingInGD(true);
+            return;
+        }
         this->onClose(nullptr);
     }
 
@@ -3868,10 +4143,89 @@ protected:
         }).detach();
     }
 
+    static bool isUserApprovalMessage(std::string const& raw) {
+        std::string s = raw;
+        for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        s = trimWhitespace(s);
+        return (s == "da" || s == "ok" || s == "yes" || s == "go" || s == "stav" ||
+                s == "postav" || s == "soglasen" || s == "keep" || s == "norm" ||
+                s == "horosho" || s == "krasivo" || s == "idealno" || s == "+");
+    }
+
+    static bool isUserRedoMessage(std::string const& raw) {
+        std::string s = raw;
+        for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return (s.find("peredel") != std::string::npos ||
+                s.find("zanovo") != std::string::npos ||
+                s.find("drugoy") != std::string::npos ||
+                s.find("redo") != std::string::npos ||
+                s.find("change") != std::string::npos ||
+                s.find("isprav") != std::string::npos ||
+                s == "net" || s == "no" || s == "-");
+    }
+
+    void approveAndPlaceCurrentDrawingInGD(bool closePopupAfter) {
+        if (!g_hasGeneratedArt || g_lastPreviewSpecs.empty()) {
+            if (closePopupAfter) this->onClose(nullptr);
+            return;
+        }
+
+        SpawnSummary summary = placeGeneratedArtInEditor(
+            m_editorUI,
+            m_contour,
+            g_lastPreviewSpecs,
+            g_lastPreviewPalette,
+            g_lastPreviewTaskMode
+        );
+        g_hasPendingDrawingApproval = false;
+        m_previewTab = 2; // Переключаем на вкладку In GD
+        refreshRightPanelTabsAndCanvas();
+
+        if (m_stepPlaceLabel) {
+            std::string plStr = fmt::format("Placed: {} (L{})", summary.createdCount, summary.firstLayer);
+            m_stepPlaceLabel->setString(plStr.c_str());
+        }
+        if (m_previewSubInfoLabel) {
+            std::string subStr = fmt::format(
+                "Placed in GD! {} objects on Layers L{}..L{}",
+                summary.createdCount, summary.firstLayer, summary.firstLayer + 5
+            );
+            m_previewSubInfoLabel->setString(subStr.c_str());
+        }
+
+        g_chatHistory.push_back({
+            "assistant",
+            fmt::format("Approved! Placed {} objects into the level (Layers L{}..L{}).", summary.createdCount, summary.firstLayer, summary.firstLayer + 5)
+        });
+        rebuildChatScrollFeed();
+
+        if (closePopupAfter) {
+            this->onClose(nullptr);
+        }
+    }
+
     void onSendToNeuralNet(CCObject*) {
         restoreLockedContourPositions();
 
         std::string promptText = trimWhitespace(m_inputBuffer);
+
+        // Если в Drawing уже готов рисунок и игрок написал в чат "да / ок / согласен / ставь" — сразу ставим в уровень!
+        if (g_hasPendingDrawingApproval && !promptText.empty() && isUserApprovalMessage(promptText)) {
+            m_inputBuffer.clear();
+            refreshInputLabel();
+            g_chatHistory.push_back({ "user", promptText });
+            approveAndPlaceCurrentDrawingInGD(false);
+            return;
+        }
+
+        // Если игрок написал "переделай / нет / заново" — усиливаем запрос на переделку!
+        if (g_hasPendingDrawingApproval && !promptText.empty() && isUserRedoMessage(promptText)) {
+            g_variantIndex++;
+            promptText = fmt::format(
+                "User rejected previous Drawing ({}). Redo and improve the pixel-by-pixel art from scratch (Variant #{}): {}",
+                promptText, g_variantIndex, g_lastBuildPrompt.empty() ? "make a better design" : g_lastBuildPrompt
+            );
+        }
         if (promptText.empty()) {
             if (g_hasReferenceImage) {
                 promptText = "Recreate the attached reference image on the selected contour with maximum accuracy";
@@ -3977,30 +4331,35 @@ protected:
             rng
         );
 
-        SpawnSummary summary = placeGeneratedArtInEditor(m_editorUI, m_contour, specs, palette, ai.taskMode);
-
+        // ИИ СНАЧАЛА показывает готовую попиксельную работу во вкладке Drawing (БЕЗ спавна в уровень!),
+        // чтобы игрок сам оценил результат и либо согласился (Keep / In GD / 'da'), либо сказал переделать!
         g_lastPreviewSpecs = specs;
         g_lastPreviewPalette = palette;
+        g_lastPreviewTaskMode = ai.taskMode;
         g_hasGeneratedArt = true;
-        m_previewTab = 1;
+        g_hasPendingDrawingApproval = true;
+        m_previewTab = 1; // Открываем вкладку Drawing
         refreshRightPanelTabsAndCanvas();
+
+        if (!g_chatHistory.empty() && g_chatHistory.back().role == "assistant") {
+            g_chatHistory.back().content += " -> Check 'Drawing'! Click 'Keep' (or write 'da') to place in GD, or 'Another variant' (or write 'peredelay') to redo!";
+            rebuildChatScrollFeed();
+        }
 
         if (m_stepPlanLabel) {
             std::string pStr = fmt::format("Match: {}%", ai.selfMatchScore);
             m_stepPlanLabel->setString(pStr.c_str());
         }
         if (m_stepDrawingLabel) {
-            std::string dStr = fmt::format("Pass: {}x", ai.refinementPasses);
-            m_stepDrawingLabel->setString(dStr.c_str());
+            m_stepDrawingLabel->setString("Draw: ready!");
         }
         if (m_stepPlaceLabel) {
-            std::string plStr = fmt::format("Obj: {} (L{})", summary.createdCount, summary.firstLayer);
-            m_stepPlaceLabel->setString(plStr.c_str());
+            m_stepPlaceLabel->setString("Wait approve");
         }
         if (m_previewSubInfoLabel) {
             std::string subStr = fmt::format(
-                "Match {}% ({} pass) | {} objs | Layers L{}..L{}",
-                ai.selfMatchScore, ai.refinementPasses, summary.createdCount, summary.firstLayer, summary.firstLayer + 5
+                "1024x1024 px | Match {}% | Click 'Keep' to place {} objs or 'Another variant' to redo",
+                ai.selfMatchScore, specs.size()
             );
             m_previewSubInfoLabel->setString(subStr.c_str());
         }
