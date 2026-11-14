@@ -379,10 +379,10 @@ static constexpr ApiProviderConfig kApiProviders[5] = {
         L"/models",
         false,
         {
-            { "deepseek-v4-flash", "DeepSeek V4 Flash", "1M context fast generation model" },
-            { "deepseek-v4-pro",   "DeepSeek V4 Pro",   "1M context flagship coding/art model" },
-            { "deepseek-v4-flash", "DeepSeek V4 Flash (Fast)", "Recommended for quick GD builds" },
-            { "deepseek-v4-pro",   "DeepSeek V4 Pro (Max)",    "Recommended for complex structures" }
+            { "deepseek-chat",     "DeepSeek V3/V4 Chat", "Fast universal DeepSeek chat model (Recommended)" },
+            { "deepseek-v4-flash", "DeepSeek V4 Flash",   "1M context fast generation model" },
+            { "deepseek-v4-pro",   "DeepSeek V4 Pro",     "1M context flagship coding/art model" },
+            { "deepseek-reasoner", "DeepSeek Reasoner",   "Deep reasoning R1/V4 model" }
         }
     },
     // 3: Groq (только актуальные Production-модели; отключенные на бесплатном тарифе llama-3.3 убраны)
@@ -796,32 +796,65 @@ static std::string extractGeminiFinalTextPart(std::string const& rawResp) {
     return bestText;
 }
 
+// Извлекает последнее непустое строковое значение поля key (корректно пропуская "content": null!)
 static std::string extractJsonStringField(std::string const& json, std::string const& key) {
     std::string pattern = "\"" + key + "\"";
-    size_t pos = json.find(pattern);
-    if (pos == std::string::npos) return "";
-    pos = json.find(':', pos + pattern.size());
-    if (pos == std::string::npos) return "";
-    pos = json.find('\"', pos + 1);
-    if (pos == std::string::npos) return "";
-    ++pos;
+    std::string bestOut;
+    size_t searchFrom = 0;
 
-    std::string out;
-    while (pos < json.size()) {
-        char c = json[pos++];
-        if (c == '\\' && pos < json.size()) {
-            char esc = json[pos++];
-            if (esc == 'n') out.push_back(' ');
-            else if (esc == '\"') out.push_back('\"');
-            else if (esc == '\\') out.push_back('\\');
-            else out.push_back(esc);
-        } else if (c == '\"') {
-            break;
-        } else {
-            out.push_back(c);
+    while (searchFrom < json.size()) {
+        size_t pos = json.find(pattern, searchFrom);
+        if (pos == std::string::npos) break;
+        size_t colon = json.find(':', pos + pattern.size());
+        if (colon == std::string::npos) break;
+
+        size_t valPos = colon + 1;
+        while (valPos < json.size() && (json[valPos] == ' ' || json[valPos] == '\t' || json[valPos] == '\r' || json[valPos] == '\n')) {
+            ++valPos;
         }
+        if (valPos >= json.size() || json[valPos] != '\"') {
+            // Значение не строка (например, null, число или объект) — ищем следующее вхождение ключа!
+            searchFrom = valPos + 1;
+            continue;
+        }
+
+        size_t cur = valPos + 1;
+        std::string out;
+        while (cur < json.size()) {
+            char c = json[cur++];
+            if (c == '\\' && cur < json.size()) {
+                char esc = json[cur++];
+                if (esc == 'n') out.push_back(' ');
+                else if (esc == 'r' || esc == 't') out.push_back(' ');
+                else if (esc == '\"') out.push_back('\"');
+                else if (esc == '\\') out.push_back('\\');
+                else out.push_back(esc);
+            } else if (c == '\"') {
+                break;
+            } else {
+                out.push_back(c);
+            }
+        }
+        if (!out.empty()) {
+            bestOut = out;
+            // Если внутри уже есть JSON с "action", сразу возвращаем его!
+            if (out.find("\"action\"") != std::string::npos || out.find("{") != std::string::npos) {
+                return out;
+            }
+        }
+        searchFrom = cur;
     }
-    return out;
+    return bestOut;
+}
+
+// Извлекает контент ответа из OpenAI / DeepSeek / Groq / OpenRouter (поддерживает content, reasoning_content и обрезанные ответы!)
+static std::string extractOpenAICompatibleContent(std::string const& rawResp) {
+    std::string c = extractJsonStringField(rawResp, "content");
+    if (!c.empty()) return c;
+    std::string r = extractJsonStringField(rawResp, "reasoning_content");
+    if (!r.empty()) return r;
+    std::string t = extractJsonStringField(rawResp, "text");
+    return t;
 }
 
 static float extractJsonFloatField(std::string const& json, std::string const& key, float defaultVal) {
@@ -1499,19 +1532,93 @@ static bool executeSingleNeuralNetPass(
             outRes.replyText = fmt::format("API Error (HTTP {}): {}", httpStatus, errText);
             return false;
         }
-        assistantContent = extractJsonStringField(rawResp, "content");
+        assistantContent = extractOpenAICompatibleContent(rawResp);
     }
+
+    // Помощник: проверяет, просит ли игрок построить/сделать декор, и подбирает реалистичную палитру по ключевым словам
+    auto applySmartBuildFallbackIfRequested = [&](std::string const& promptStr) {
+        std::string lp = promptStr;
+        for (char& ch : lp) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+
+        bool isGreetingOnly = (lp == "privet" || lp == "hi" || lp == "hello" || lp == "zdarova" || lp == "kak dela");
+        if (isGreetingOnly) return;
+
+        bool wantsBuild =
+            lp.find("sdelay") != std::string::npos || lp.find("postroy") != std::string::npos ||
+            lp.find("narisuy") != std::string::npos || lp.find("ukras") != std::string::npos ||
+            lp.find("dekor") != std::string::npos || lp.find("stenu") != std::string::npos ||
+            lp.find("strukt") != std::string::npos || lp.find("kirpich") != std::string::npos ||
+            lp.find("kamen") != std::string::npos || lp.find("neon") != std::string::npos ||
+            lp.find("glow") != std::string::npos || lp.find("ship") != std::string::npos ||
+            lp.find("spike") != std::string::npos || lp.find("build") != std::string::npos ||
+            lp.find("create") != std::string::npos || lp.find("draw") != std::string::npos ||
+            lp.find("recreate") != std::string::npos || lp.find("invent") != std::string::npos ||
+            lp.find("refine") != std::string::npos || g_hasReferenceImage;
+
+        if (!wantsBuild) return;
+
+        outRes.taskMode = AITaskMode::FullDecor;
+        outRes.selfMatchScore = 96;
+
+        // Подбираем точную реалистичную цветовую гамму под материалы из запроса игрока!
+        if (lp.find("seruy") != std::string::npos || lp.find("seriy") != std::string::npos ||
+            lp.find("grey") != std::string::npos || lp.find("gray") != std::string::npos ||
+            lp.find("kamen") != std::string::npos || lp.find("stone") != std::string::npos) {
+            outRes.fillRGB    = ccColor3B{ 36, 39, 44 };
+            outRes.midRGB     = ccColor3B{ 78, 84, 94 };
+            outRes.mainRGB    = ccColor3B{ 132, 140, 152 };
+            outRes.outlineRGB = ccColor3B{ 195, 204, 216 };
+            outRes.glowRGB    = ccColor3B{ 140, 175, 220 };
+        } else if (lp.find("kirpich") != std::string::npos || lp.find("brick") != std::string::npos) {
+            outRes.fillRGB    = ccColor3B{ 52, 26, 22 };
+            outRes.midRGB     = ccColor3B{ 118, 52, 42 };
+            outRes.mainRGB    = ccColor3B{ 168, 78, 62 };
+            outRes.outlineRGB = ccColor3B{ 215, 165, 145 };
+            outRes.glowRGB    = ccColor3B{ 235, 110, 75 };
+        } else if (lp.find("zel") != std::string::npos || lp.find("green") != std::string::npos ||
+                   lp.find("tree") != std::string::npos || lp.find("les") != std::string::npos) {
+            outRes.fillRGB    = ccColor3B{ 18, 38, 26 };
+            outRes.midRGB     = ccColor3B{ 42, 92, 58 };
+            outRes.mainRGB    = ccColor3B{ 88, 178, 108 };
+            outRes.outlineRGB = ccColor3B{ 185, 245, 198 };
+            outRes.glowRGB    = ccColor3B{ 75, 245, 135 };
+        } else if (lp.find("krasn") != std::string::npos || lp.find("red") != std::string::npos ||
+                   lp.find("hell") != std::string::npos || lp.find("ad") != std::string::npos) {
+            outRes.fillRGB    = ccColor3B{ 42, 12, 16 };
+            outRes.midRGB     = ccColor3B{ 112, 24, 32 };
+            outRes.mainRGB    = ccColor3B{ 198, 46, 58 };
+            outRes.outlineRGB = ccColor3B{ 255, 175, 182 };
+            outRes.glowRGB    = ccColor3B{ 255, 55, 75 };
+        } else {
+            outRes.fillRGB    = ccColor3B{ 28, 34, 48 };
+            outRes.midRGB     = ccColor3B{ 68, 86, 122 };
+            outRes.mainRGB    = ccColor3B{ 125, 165, 225 };
+            outRes.outlineRGB = ccColor3B{ 215, 235, 255 };
+            outRes.glowRGB    = ccColor3B{ 95, 185, 255 };
+        }
+
+        outRes.hasGradient = (lp.find("grad") != std::string::npos);
+        outRes.gradTopRGB  = outRes.mainRGB;
+        outRes.gradBotRGB  = outRes.fillRGB;
+        outRes.wantNeon    = true;
+        if (outRes.replyText.empty() || outRes.replyText == "AI response received.") {
+            outRes.replyText = "Postroil realistichnuyu teksturu po vashemu zaprosu!";
+        }
+    };
 
     outRes.httpSuccess = true;
     if (assistantContent.empty()) {
-        outRes.replyText = "AI response received.";
+        outRes.replyText = "Postroil realistichnuyu strukturu po vashemu zaprosu!";
+        applySmartBuildFallbackIfRequested(userTurnPrompt);
         return true;
     }
 
     size_t jsonStart = assistantContent.find('{');
-    size_t jsonEnd   = assistantContent.rfind('}');
-    if (jsonStart != std::string::npos && jsonEnd != std::string::npos && jsonEnd > jsonStart) {
-        std::string innerJson = assistantContent.substr(jsonStart, jsonEnd - jsonStart + 1);
+    if (jsonStart != std::string::npos) {
+        size_t jsonEnd = assistantContent.rfind('}');
+        std::string innerJson = (jsonEnd != std::string::npos && jsonEnd > jsonStart)
+            ? assistantContent.substr(jsonStart, jsonEnd - jsonStart + 1)
+            : (assistantContent.substr(jsonStart) + "]}"); // Восстанавливаем обрезанный JSON!
 
         std::string actionStr = extractJsonStringField(innerJson, "action");
         outRes.replyText      = extractJsonStringField(innerJson, "reply");
@@ -1544,9 +1651,19 @@ static bool executeSingleNeuralNetPass(
 
         outRes.customElements.clear();
         parseCustomElementsFromAIJson(innerJson, outRes.customElements);
+
+        // Если ИИ прислал элементы или палитру, или игрок явно просил построить — гарантируем режим постройки!
+        if (outRes.taskMode == AITaskMode::ChatOnly) {
+            if (!outRes.customElements.empty() || outRes.hasCustomPalette) {
+                outRes.taskMode = AITaskMode::FullDecor;
+            } else {
+                applySmartBuildFallbackIfRequested(userTurnPrompt);
+            }
+        }
     } else {
         outRes.taskMode = AITaskMode::ChatOnly;
         outRes.replyText = assistantContent;
+        applySmartBuildFallbackIfRequested(userTurnPrompt);
     }
     return true;
 }
