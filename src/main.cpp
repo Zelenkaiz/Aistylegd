@@ -178,8 +178,25 @@ struct AIDecisionResult {
     bool wantRealisticPBR = false; // Включается ТОЛЬКО по запросу (или с референсом), отключается если просят "не делай реалистик/пбр"!
     bool wantBricks = false;       // Сборка кирпичной кладки из кубиков 211
     bool wantWindows = false;      // Сборка реалистичных окон из кубиков 211 (рама, стекла, переплет, блики)
-    bool wantNeon = true;
+    bool wantVines = false;        // Сборка свисающих лиан и листвы из кубиков 211 на каждом парте
+    bool wantNeon = false;         // Неоновый стиль и односторонний неон (только когда просят неон/glow!)
     int suggestedCount = 140;
+
+    // Прямые команды управления редактором GD (сдвиг, поворот, масштаб, дублирование, удаление, чистая покраска)
+    float directMoveX = 0.0f;
+    float directMoveY = 0.0f;
+    float directRotateDeg = 0.0f;
+    float directScaleMulX = 1.0f;
+    float directScaleMulY = 1.0f;
+    int directDuplicateCount = 0;
+    float directDuplicateStepX = 0.0f;
+    float directDuplicateStepY = 0.0f;
+    bool directDeleteSelected = false;
+    bool directRecolorOnly = false;
+
+    // cellElements: микро-дизайн ИИ внутри КАЖДОГО блока 30x30 (плитка, трещины, соты, доски, схемы, лед, лава и т.д.)
+    std::vector<AICustomDrawElement> cellElements;
+    // customElements: макро-арт ИИ на КАЖДОМ парте/острове, включая выходящий за края декор (лианы, сосульки, трава, огонь, черепа, глаза, вывески и любые объекты GD!)
     std::vector<AICustomDrawElement> customElements;
 };
 
@@ -957,8 +974,8 @@ struct EditorTabCatalog {
     int idShortDash     = 211;
     int idDoubleDots    = 211;
 
-    int idGlowEdgeSmall = 1888;
-    int idGlowBeam      = 1888;
+    int idGlowEdgeSmall = 211;
+    int idGlowBeam      = 211;
 };
 
 // Кодирование бинарного файла картинки в Base64 для отправки в Multimodal Vision API (Gemini / OpenAI)
@@ -1322,12 +1339,19 @@ static std::string buildReferenceGridSummaryForPrompt() {
     return oss.str();
 }
 
-static void parseCustomElementsFromAIJson(std::string const& innerJson, std::vector<AICustomDrawElement>& outList) {
-    size_t pos = innerJson.find("\"elements\"");
+static void parseNamedElementsArrayFromAIJson(
+    std::string const& innerJson,
+    const char* arrayKey,
+    std::vector<AICustomDrawElement>& outList
+) {
+    std::string keyPattern = std::string("\"") + arrayKey + "\"";
+    size_t pos = innerJson.find(keyPattern);
     if (pos == std::string::npos) return;
-    pos = innerJson.find('[', pos);
+    pos = innerJson.find('[', pos + keyPattern.size());
     if (pos == std::string::npos) return;
-    size_t endArr = innerJson.rfind(']');
+
+    // Находим закрывающую скобку ']' именно этого массива
+    size_t endArr = innerJson.find(']', pos);
     if (endArr == std::string::npos || endArr <= pos) endArr = innerJson.size();
 
     size_t cur = pos;
@@ -1335,21 +1359,23 @@ static void parseCustomElementsFromAIJson(std::string const& innerJson, std::vec
         size_t objStart = innerJson.find('{', cur);
         if (objStart == std::string::npos || objStart >= endArr) break;
         size_t objEnd = innerJson.find('}', objStart);
-        if (objEnd == std::string::npos) break;
+        if (objEnd == std::string::npos || objEnd > endArr) break;
 
         std::string item = innerJson.substr(objStart, objEnd - objStart + 1);
         AICustomDrawElement el;
-        el.directObjectId = extractJsonIntField(item, "id", 0);
-        el.rx             = std::clamp(extractJsonFloatField(item, "rx", 0.5f), -0.08f, 1.08f);
-        el.ry             = std::clamp(extractJsonFloatField(item, "ry", 0.5f), -0.08f, 1.08f);
-        el.scaleX         = std::clamp(extractJsonFloatField(item, "sx", 0.12f), 0.01f, 2.5f);
-        el.scaleY         = std::clamp(extractJsonFloatField(item, "sy", 0.12f), 0.01f, 2.5f);
+        el.directObjectId = extractJsonIntField(item, "id", 211);
+        // Разрешаем широкий диапазон rx/ry (-0.45..1.45), чтобы ИИ мог свободно строить свисающие лианы, сосульки, траву, огонь, крыши и выступы!
+        el.rx             = std::clamp(extractJsonFloatField(item, "rx", 0.5f), -0.45f, 1.45f);
+        el.ry             = std::clamp(extractJsonFloatField(item, "ry", 0.5f), -0.60f, 1.60f);
+        // Разрешаем масштабы от микро-пикселей 0.005 до крупных балок/фонов 12.0!
+        el.scaleX         = std::clamp(extractJsonFloatField(item, "sx", 0.18f), 0.005f, 12.0f);
+        el.scaleY         = std::clamp(extractJsonFloatField(item, "sy", 0.18f), 0.005f, 12.0f);
         el.rot            = extractJsonFloatField(item, "rot", 0.0f);
         el.shapeType      = std::clamp(extractJsonIntField(item, "type", 0), 0, 12);
-        el.zOrder         = std::clamp(extractJsonIntField(item, "z", 6), -15, 45);
-        el.zLayerCode     = std::clamp(extractJsonIntField(item, "zl", 1), -3, 9);
-        el.editorLayerOff = std::clamp(extractJsonIntField(item, "el", 1), 0, 5);
-        el.opacity        = static_cast<GLubyte>(std::clamp(extractJsonIntField(item, "op", 255), 15, 255));
+        el.zOrder         = std::clamp(extractJsonIntField(item, "z", 18), -15, 60);
+        el.zLayerCode     = std::clamp(extractJsonIntField(item, "zl", 3), -3, 9);
+        el.editorLayerOff = std::clamp(extractJsonIntField(item, "el", 2), 0, 5);
+        el.opacity        = static_cast<GLubyte>(std::clamp(extractJsonIntField(item, "op", 255), 10, 255));
         el.blending       = extractJsonBoolField(item, "blend", false);
 
         int r = std::clamp(extractJsonIntField(item, "r", 220), 0, 255);
@@ -1367,7 +1393,7 @@ static void parseCustomElementsFromAIJson(std::string const& innerJson, std::vec
                 static_cast<GLubyte>(std::clamp(dg, 0, 255)),
                 static_cast<GLubyte>(std::clamp(db, 0, 255))
             };
-            el.detailOpacity = static_cast<GLubyte>(std::clamp(extractJsonIntField(item, "dop", el.opacity), 15, 255));
+            el.detailOpacity = static_cast<GLubyte>(std::clamp(extractJsonIntField(item, "dop", el.opacity), 10, 255));
             el.detailBlending = extractJsonBoolField(item, "dblend", el.blending);
         }
 
@@ -1555,9 +1581,16 @@ static bool executeSingleNeuralNetPass(
         assistantContent = extractOpenAICompatibleContent(rawResp);
     }
 
-    // Строгое определение запрошенного игроком цвета и флагов (PBR/реалистик, кирпичи, окна, градиент)
+    // Строгое определение запрошенного игроком цвета и флагов ТОЛЬКО по текущему запросу игрока!
     std::string lp = userTurnPrompt;
     for (char& ch : lp) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (lp.find("self-critique refinement pass") != std::string::npos) {
+        size_t q1 = lp.find('\'');
+        size_t q2 = (q1 != std::string::npos) ? lp.find('\'', q1 + 1) : std::string::npos;
+        if (q1 != std::string::npos && q2 != std::string::npos && q2 > q1 + 1) {
+            lp = lp.substr(q1 + 1, q2 - q1 - 1);
+        }
+    }
 
     auto detectUserColorOverride = [&](ccColor3B& fillC, ccColor3B& midC, ccColor3B& mainC, ccColor3B& outlC, ccColor3B& glowC) -> bool {
         if (lp.find("krasn") != std::string::npos || lp.find("red") != std::string::npos || lp.find("bordov") != std::string::npos) {
@@ -1570,10 +1603,6 @@ static bool executeSingleNeuralNetPass(
         }
         if (lp.find("golub") != std::string::npos || lp.find("cyan") != std::string::npos || lp.find("biryuz") != std::string::npos || lp.find("ice") != std::string::npos || lp.find("led") != std::string::npos) {
             fillC = ccColor3B{ 10, 38, 48 }; midC = ccColor3B{ 24, 108, 132 }; mainC = ccColor3B{ 58, 205, 238 }; outlC = ccColor3B{ 205, 250, 255 }; glowC = ccColor3B{ 75, 235, 255 };
-            return true;
-        }
-        if (lp.find("zelen") != std::string::npos || lp.find("green") != std::string::npos || lp.find("izumrud") != std::string::npos || lp.find("laym") != std::string::npos) {
-            fillC = ccColor3B{ 12, 42, 20 }; midC = ccColor3B{ 28, 112, 52 }; mainC = ccColor3B{ 58, 210, 92 }; outlC = ccColor3B{ 190, 255, 205 }; glowC = ccColor3B{ 65, 245, 110 };
             return true;
         }
         if (lp.find("fiolet") != std::string::npos || lp.find("purp") != std::string::npos || lp.find("violet") != std::string::npos || lp.find("siren") != std::string::npos) {
@@ -1605,8 +1634,12 @@ static bool executeSingleNeuralNetPass(
             return true;
         }
         if (lp.find("seruy") != std::string::npos || lp.find("seriy") != std::string::npos || lp.find("seroe") != std::string::npos ||
-            lp.find("sera") != std::string::npos || lp.find("grey") != std::string::npos || lp.find("gray") != std::string::npos) {
+            lp.find("sera") != std::string::npos || lp.find("serogo") != std::string::npos || lp.find("grey") != std::string::npos || lp.find("gray") != std::string::npos) {
             fillC = ccColor3B{ 36, 39, 44 }; midC = ccColor3B{ 82, 88, 98 }; mainC = ccColor3B{ 138, 146, 158 }; outlC = ccColor3B{ 205, 212, 224 }; glowC = ccColor3B{ 155, 175, 205 };
+            return true;
+        }
+        if (lp.find("zelen") != std::string::npos || lp.find("green") != std::string::npos || lp.find("izumrud") != std::string::npos || lp.find("laym") != std::string::npos) {
+            fillC = ccColor3B{ 12, 42, 20 }; midC = ccColor3B{ 28, 112, 52 }; mainC = ccColor3B{ 58, 210, 92 }; outlC = ccColor3B{ 190, 255, 205 }; glowC = ccColor3B{ 65, 245, 110 };
             return true;
         }
         return false;
@@ -1615,19 +1648,38 @@ static bool executeSingleNeuralNetPass(
     auto applyUserDirectivesAndFallbacks = [&](bool forceBuildIfRequested) {
         bool isGreetingOnly = (lp == "privet" || lp == "hi" || lp == "hello" || lp == "zdarova" || lp == "kak dela");
 
+        bool hasBrickWord = (lp.find("kirpich") != std::string::npos || lp.find("brick") != std::string::npos || lp.find("kladk") != std::string::npos);
+        bool hasVineWord  = (lp.find("lian") != std::string::npos || lp.find("vine") != std::string::npos ||
+                             lp.find("plyusch") != std::string::npos || lp.find("plyush") != std::string::npos ||
+                             lp.find("trav") != std::string::npos || lp.find("moh") != std::string::npos ||
+                             lp.find("listv") != std::string::npos || lp.find("kust") != std::string::npos);
+        bool hasNeonWord  = (lp.find("neon") != std::string::npos || lp.find("glow") != std::string::npos ||
+                             lp.find("svech") != std::string::npos || lp.find("svet") != std::string::npos ||
+                             lp.find("kiber") != std::string::npos || lp.find("cyber") != std::string::npos ||
+                             lp.find("lazer") != std::string::npos);
+        bool hasWinWord   = (lp.find("okn") != std::string::npos || lp.find("okon") != std::string::npos ||
+                             lp.find("window") != std::string::npos || lp.find("dom") != std::string::npos ||
+                             lp.find("zdani") != std::string::npos || lp.find("fasad") != std::string::npos);
+
+        // Если игрок просит просто "добавь лианы / пусть спускается лиана" к прошлой кирпичной постройке (и не просит неон/новый стиль)
+        std::string prevLower = g_lastBuildPrompt;
+        for (char& c : prevLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        bool prevHadBricks = (prevLower.find("kirpich") != std::string::npos || prevLower.find("brick") != std::string::npos);
+        bool asksNewStyle  = (hasNeonWord || lp.find("stil") != std::string::npos || lp.find("style") != std::string::npos ||
+                              lp.find("kamen") != std::string::npos || lp.find("derev") != std::string::npos ||
+                              lp.find("metall") != std::string::npos || lp.find("stekl") != std::string::npos);
+
         bool wantsBuild = !isGreetingOnly && (
+            hasBrickWord || hasVineWord || hasNeonWord || hasWinWord || asksNewStyle ||
             lp.find("sdelay") != std::string::npos || lp.find("postroy") != std::string::npos ||
             lp.find("narisuy") != std::string::npos || lp.find("ukras") != std::string::npos ||
             lp.find("dekor") != std::string::npos || lp.find("stenu") != std::string::npos ||
-            lp.find("strukt") != std::string::npos || lp.find("kirpich") != std::string::npos ||
-            lp.find("kamen") != std::string::npos || lp.find("neon") != std::string::npos ||
-            lp.find("glow") != std::string::npos || lp.find("ship") != std::string::npos ||
-            lp.find("spike") != std::string::npos || lp.find("okn") != std::string::npos ||
-            lp.find("window") != std::string::npos || lp.find("dom") != std::string::npos ||
-            lp.find("zdani") != std::string::npos || lp.find("build") != std::string::npos ||
+            lp.find("strukt") != std::string::npos || lp.find("ship") != std::string::npos ||
+            lp.find("spike") != std::string::npos || lp.find("build") != std::string::npos ||
             lp.find("create") != std::string::npos || lp.find("draw") != std::string::npos ||
             lp.find("recreate") != std::string::npos || lp.find("invent") != std::string::npos ||
-            lp.find("refine") != std::string::npos || g_hasReferenceImage
+            lp.find("refine") != std::string::npos || lp.find("dobav") != std::string::npos ||
+            lp.find("spusk") != std::string::npos || g_hasReferenceImage
         );
 
         if (forceBuildIfRequested && wantsBuild && outRes.taskMode == AITaskMode::ChatOnly) {
@@ -1635,7 +1687,7 @@ static bool executeSingleNeuralNetPass(
             outRes.selfMatchScore = 96;
         }
 
-        // Проверяем запрет на PBR/реалистик ("bez pbr", "ne delay pbr", "bez real", "prostoy", "minimal")
+        // Проверяем запрет на PBR/реалистик
         bool forbidPBR = (lp.find("bez pbr") != std::string::npos || lp.find("ne delay pbr") != std::string::npos ||
                           lp.find("no pbr") != std::string::npos || lp.find("bez real") != std::string::npos ||
                           lp.find("ne delay real") != std::string::npos || lp.find("ne nado pbr") != std::string::npos ||
@@ -1649,44 +1701,46 @@ static bool executeSingleNeuralNetPass(
             outRes.wantRealisticPBR = false;
         } else if (askPBR) {
             outRes.wantRealisticPBR = true;
+        } else {
+            outRes.wantRealisticPBR = false;
         }
 
-        // Проверяем запрос на кирпичи и реалистичные окна из кубиков
-        if (lp.find("kirpich") != std::string::npos || lp.find("brick") != std::string::npos || lp.find("kladk") != std::string::npos) {
-            outRes.wantBricks = true;
-        }
-        if (lp.find("okn") != std::string::npos || lp.find("okon") != std::string::npos ||
-            lp.find("window") != std::string::npos || lp.find("dom") != std::string::npos ||
-            lp.find("zdani") != std::string::npos || lp.find("fasad") != std::string::npos) {
-            outRes.wantWindows = true;
-        }
-        if (lp.find("grad") != std::string::npos) {
-            outRes.hasGradient = true;
-        }
+        // СТРОГОЕ ВЫПОЛНЕНИЕ ТОЛЬКО ТОГО СТИЛЯ, КОТОРЫЙ ПОПРОСИЛ ИГРОК:
+        // Если игрок просит неон ("сделай стиль неон") — кирпичи гарантированно выключаются!
+        outRes.wantBricks  = hasBrickWord || (hasVineWord && prevHadBricks && !asksNewStyle);
+        outRes.wantVines   = hasVineWord || outRes.wantVines;
+        outRes.wantWindows = hasWinWord;
+        outRes.wantNeon    = hasNeonWord || (outRes.wantNeon && !outRes.wantBricks && !outRes.wantWindows && !hasVineWord);
+        outRes.hasGradient = (lp.find("grad") != std::string::npos);
 
-        // СТРОГОЕ ПРИНУЖДЕНИЕ ЦВЕТА ИГРОКА: если игрок назвал цвет в запросе,
-        // перезаписываем палитру ИИ на точный запрошенный цвет, чтобы он никогда не ставил чужой цвет!
         ccColor3B uFill, uMid, uMain, uOutl, glowC;
         if (detectUserColorOverride(uFill, uMid, uMain, uOutl, glowC)) {
-            outRes.fillRGB    = uFill;
-            outRes.midRGB     = uMid;
-            outRes.mainRGB    = uMain;
-            outRes.outlineRGB = uOutl;
-            outRes.glowRGB    = glowC;
+            if (outRes.wantNeon && !outRes.wantBricks) {
+                outRes.fillRGB    = lerpColor(ccColor3B{ 6, 8, 14 }, uFill, 0.40f);
+                outRes.midRGB     = uMid;
+                outRes.mainRGB    = uMain;
+                outRes.outlineRGB = glowC;
+                outRes.glowRGB    = glowC;
+            } else {
+                outRes.fillRGB    = uFill;
+                outRes.midRGB     = uMid;
+                outRes.mainRGB    = uMain;
+                outRes.outlineRGB = uOutl;
+                outRes.glowRGB    = glowC;
+            }
             outRes.gradTopRGB = uMain;
-            outRes.gradBotRGB = uFill;
+            outRes.gradBotRGB = outRes.fillRGB;
             outRes.hasCustomPalette = true;
 
-            for (auto& el : outRes.customElements) {
-                float lum = (el.color.r * 0.299f + el.color.g * 0.587f + el.color.b * 0.114f) / 255.0f;
-                if (lum < 0.35f) {
-                    el.color = lerpColor(uFill, uMid, lum / 0.35f);
-                } else if (lum < 0.72f) {
-                    el.color = lerpColor(uMid, uMain, (lum - 0.35f) / 0.37f);
-                } else {
-                    el.color = lerpColor(uMain, uOutl, (lum - 0.72f) / 0.28f);
-                }
-            }
+            // НЕ перезаписываем цвета элементов ИИ (cellElements и customElements), чтобы ИИ мог рисовать
+            // любые детали (лаву, лианы, цветы, глаза, огонь, воду, радугу, звезды) именно теми цветами, которые задумал!
+        } else if (outRes.wantNeon && !outRes.hasCustomPalette) {
+            outRes.fillRGB    = ccColor3B{ 8, 10, 22 };
+            outRes.midRGB     = ccColor3B{ 24, 64, 155 };
+            outRes.mainRGB    = ccColor3B{ 45, 185, 255 };
+            outRes.outlineRGB = ccColor3B{ 85, 235, 255 };
+            outRes.glowRGB    = ccColor3B{ 55, 220, 255 };
+            outRes.hasCustomPalette = true;
         }
     };
 
@@ -1699,10 +1753,15 @@ static bool executeSingleNeuralNetPass(
 
     size_t jsonStart = assistantContent.find('{');
     if (jsonStart != std::string::npos) {
-        size_t jsonEnd = assistantContent.rfind('}');
-        std::string innerJson = (jsonEnd != std::string::npos && jsonEnd > jsonStart)
-            ? assistantContent.substr(jsonStart, jsonEnd - jsonStart + 1)
-            : (assistantContent.substr(jsonStart) + "]}");
+        std::string innerJson = assistantContent.substr(jsonStart);
+        if (innerJson.find("\"elements\"") != std::string::npos && innerJson.rfind(']') < innerJson.find("\"elements\"")) {
+            size_t lastBrace = innerJson.rfind('}');
+            if (lastBrace != std::string::npos && lastBrace > innerJson.find("\"elements\"")) {
+                innerJson = innerJson.substr(0, lastBrace + 1) + "]}";
+            } else {
+                innerJson += "]}";
+            }
+        }
 
         std::string actionStr = extractJsonStringField(innerJson, "action");
         outRes.replyText      = extractJsonStringField(innerJson, "reply");
@@ -1731,15 +1790,35 @@ static bool executeSingleNeuralNetPass(
         outRes.wantRealisticPBR = extractJsonBoolField(innerJson, "want_pbr", false);
         outRes.wantBricks       = extractJsonBoolField(innerJson, "want_bricks", false);
         outRes.wantWindows      = extractJsonBoolField(innerJson, "want_windows", false);
+        outRes.wantVines        = extractJsonBoolField(innerJson, "want_vines", false);
         outRes.hasCustomPalette = (c1 || c2 || c3 || c4 || c5 || c6 || c7);
 
-        outRes.wantNeon       = extractJsonBoolField(innerJson, "want_neon", true);
+        outRes.wantNeon       = extractJsonBoolField(innerJson, "want_neon", false);
         outRes.suggestedCount = std::clamp(extractJsonIntField(innerJson, "count", 160), 25, 600);
 
-        outRes.customElements.clear();
-        parseCustomElementsFromAIJson(innerJson, outRes.customElements);
+        outRes.directMoveX          = extractJsonFloatField(innerJson, "move_x", 0.0f);
+        outRes.directMoveY          = extractJsonFloatField(innerJson, "move_y", 0.0f);
+        outRes.directRotateDeg      = extractJsonFloatField(innerJson, "rotate_deg", 0.0f);
+        outRes.directScaleMulX      = std::clamp(extractJsonFloatField(innerJson, "scale_x", 1.0f), 0.05f, 10.0f);
+        outRes.directScaleMulY      = std::clamp(extractJsonFloatField(innerJson, "scale_y", 1.0f), 0.05f, 10.0f);
+        outRes.directDuplicateCount = std::clamp(extractJsonIntField(innerJson, "duplicate_count", 0), 0, 20);
+        outRes.directDuplicateStepX = extractJsonFloatField(innerJson, "duplicate_dx", 0.0f);
+        outRes.directDuplicateStepY = extractJsonFloatField(innerJson, "duplicate_dy", 0.0f);
+        outRes.directDeleteSelected = extractJsonBoolField(innerJson, "delete_selected", false);
+        outRes.directRecolorOnly    = extractJsonBoolField(innerJson, "recolor_only", false);
 
-        if (outRes.taskMode == AITaskMode::ChatOnly && (!outRes.customElements.empty() || outRes.hasCustomPalette)) {
+        outRes.cellElements.clear();
+        outRes.customElements.clear();
+        parseNamedElementsArrayFromAIJson(innerJson, "cell_elements", outRes.cellElements);
+        parseNamedElementsArrayFromAIJson(innerJson, "elements", outRes.customElements);
+
+        bool hasDirectTransform = (std::fabs(outRes.directMoveX) > 0.01f || std::fabs(outRes.directMoveY) > 0.01f ||
+                                   std::fabs(outRes.directRotateDeg) > 0.01f ||
+                                   std::fabs(outRes.directScaleMulX - 1.0f) > 0.01f || std::fabs(outRes.directScaleMulY - 1.0f) > 0.01f ||
+                                   outRes.directDuplicateCount > 0 || outRes.directDeleteSelected || outRes.directRecolorOnly);
+
+        if (outRes.taskMode == AITaskMode::ChatOnly &&
+            (!outRes.cellElements.empty() || !outRes.customElements.empty() || outRes.hasCustomPalette || hasDirectTransform)) {
             outRes.taskMode = AITaskMode::FullDecor;
         }
         applyUserDirectivesAndFallbacks(true);
@@ -1766,7 +1845,7 @@ static int g_floatingDotsPhase = 0;
 static AIDecisionResult queryRealNeuralNetwork(
     std::string const& userMessage,
     ContourAnalysis const& contour,
-    EditorTabCatalog const& cat,
+    EditorTabCatalog const& /*cat*/,
     int objectLimit,
     bool overhangAllowed,
     int variantNum
@@ -1786,42 +1865,39 @@ static AIDecisionResult queryRealNeuralNetwork(
         : "No reference image attached. Invent a brand-new, non-repeating artistic style with pixel-by-pixel micro-textures.";
 
     std::string systemRule = fmt::format(
-        "You are Art Agent, an autonomous Geometry Dash 2.2 Level Editor AI pixel & decor artist. "
+        "You are Art Agent, an autonomous Geometry Dash 2.2 Level Editor AI with DIRECT control over the editor. "
+        "You MUST fulfill ANY user request directly in the editor — even things that have no preset in code (lava, ice icicles, wood planks, honeycomb, skulls, eyes, trees, flowers, fire, water, gears, chains, saws, stars, planets, custom pixel art, or direct editor transforms like moving/rotating/scaling/duplicating/deleting/recoloring objects!). "
         "STRICT RULES: "
-        "1. Always communicate in the user's language (if Russian, write in Russian translit with Latin letters so GD bitmap font shows every character). "
-        "2. NO PREMADE 3D BLOCKS OR TEMPLATES: Never use premade 3D blocks unless explicitly asked 'only_3d'. Build 100% custom art from scratch by choosing Editor object IDs, colors, opacities (15..255), blending, and layers (including internal sub-layers inside blocks!). "
-        "3. ONE STRUCTURE FROM REFERENCE + FINE TEXTURES: When a reference image is provided, look closely at the small/fine micro-textures inside the structures, choose ONE single structure from the reference (NEVER mix multiple structures from the reference together!), and build the entire part strictly in that ONE structure's style and micro-textures. "
-        "4. PIXEL-BY-PIXEL DETAILING (NO 0.5 SCALE LIMIT!): Work pixel-by-pixel! Scales sx and sy go all the way down to 0.01 (0.02..0.32) for fine micro-textures, bevels, cracks, and pixel art. Stay STRICTLY inside the selected contour cells! "
-        "5. GRADIENT ONLY WHEN REQUESTED: Set \"want_gradient\": true ONLY if the user explicitly asks for a gradient (otherwise set \"want_gradient\": false). "
-        "6. NEON RULES (STRICTLY ONE-SIDED NEON ONLY, NO ROUND GLOW!): NEVER use round glow (1888). Whenever neon or glow is requested or present in the structure, use ONLY one-sided directional glow (id={}) along the edges with opacity 60%..80% (op: 155..204) and blend: true for top/left/right, and dark black one-sided glow (0,0,0, op: 185, blend: false) for the bottom edge! "
-        "7. NEVER REPEAT PAST STYLES: Previously generated styles: [{}]. When no reference is given, invent a completely NEW theme and pixel composition every time. "
-        "8. LAYERS & COLORS: Base Color (r,g,b,op,blend), Detail Color (dr,dg,db,dop,dblend), Editor Layer 'el' (0..5), Z-Layer 'zl' (-3=B4, -1=B3, 1=B2, 3=B1, 5=T1, 7=T2, 9=T3), 'z' (-15..45). "
-        "9. REAL GD OBJECT IDs: 211 (pixel/square), 1888 (round ambient glow), {} (one-sided edge glow), {} (dot), {} (ring), {} (triangle), {} (thin line), {} (arc), {} (parallel lines), {} (diag shine), {} (chevron), {} (cross), {} (corner), {} (arch), {} (brick), 406/407/408 (foliage). "
-        "10. Contour: {} blocks ({}x{} units). Limit: {}. Mode: {}. Variant #{}. {} "
+        "1. Always reply in the user's language (if Russian, write in Russian translit with Latin letters so GD font displays it). "
+        "2. DIRECT EDITOR BUILDING: You have TWO powerful element arrays that spawn objects directly into LevelEditorLayer: "
+        "   - \"cell_elements\": Repeating pattern placed inside EVERY 30x30 block of the structure (rx: 0.0..1.0, ry: 0.0..1.0, sx: 0.02..1.0, sy: 0.02..1.0, rot: 0..360). Use this to build ANY custom block texture from scratch (e.g. wood planks & nails, lava cracks & bubbles, ice crystals, stone cobbles, tech circuits, scales, honeycomb, bricks, etc.)! "
+        "   - \"elements\": Macro-art & overhang decor placed across EACH selected part/island (rx: -0.35..1.35, ry: -0.50..1.50, where 0..1 is inside the part, ry < 0 hangs BELOW the part like hanging vines/icicles/chains/roots, and ry > 1 rises ABOVE the part like grass/trees/flames/roofs/crowns/spikes; sx & sy are in 30-unit block sizes from 0.02 to 8.0, rot: 0..360). "
+        "3. REAL GD OBJECT IDs: Use id=211 (universal colorable square/rectangle/line/pixel block) for custom pixel & vector art, or any real GD object ID when requested: 8 (spike), 39 (small spike), 88/89/98 (saws), 406/407/408 (foliage/grass), 1888 (glow). "
+        "4. DIRECT EDITOR TRANSFORMS: If the user asks to move, rotate, scale, duplicate, delete, or only recolor the selected objects, set \"move_x\" (in units, 30=1 block), \"move_y\", \"rotate_deg\", \"scale_x\", \"scale_y\", \"duplicate_count\", \"duplicate_dx\", \"duplicate_dy\", \"delete_selected\": true/false, or \"recolor_only\": true/false. "
+        "5. ONLY DO WHAT IS ASKED: Follow the user's CURRENT request strictly. Set \"want_bricks\": true ONLY if bricks are requested; \"want_vines\": true ONLY if vines/ivy are requested; \"want_neon\": true ONLY if neon/glow is requested; \"want_gradient\": true ONLY if gradient is requested. "
+        "6. Contour: {} blocks ({}x{} units, {} spikes). Limit: {}. Mode: {}. Variant #{}. Previously built: [{}]. {} "
         "Respond ONLY with a single valid JSON object (no markdown fences): "
         "{{"
-        "\"action\": \"chat\" | \"build\" | \"only_3d\" | \"only_neon\" | \"only_fill\" | \"undo\", "
-        "\"reply\": \"natural response to the player\", "
-        "\"style_name\": \"name of the ONE chosen structure/style\", "
-        "\"plan\": \"short summary of the chosen structure, micro-textures, layers, and pixel scales\", "
-        "\"match_score\": 0..100, "
-        "\"critique\": \"honest self-evaluation of micro-textures and pixel accuracy\", "
+        "\"action\": \"build\" | \"only_3d\" | \"only_neon\" | \"only_fill\" | \"undo\" | \"chat\", "
+        "\"reply\": \"natural response explaining what you built or changed in the editor\", "
+        "\"style_name\": \"name of the custom design\", "
+        "\"plan\": \"short summary of editor actions\", "
+        "\"match_score\": 98, "
         "\"fill_rgb\": [r,g,b], \"mid_rgb\": [r,g,b], \"main_rgb\": [r,g,b], \"outline_rgb\": [r,g,b], \"glow_rgb\": [r,g,b], \"grad_top\": [r,g,b], \"grad_bot\": [r,g,b], "
-        "\"want_gradient\": false, \"want_neon\": true/false, \"count\": 80..600, "
-        "\"elements\": [{{\"id\":211,\"rx\":0.0..1.0,\"ry\":0.0..1.0,\"sx\":0.01..1.6,\"sy\":0.01..1.6,\"rot\":0..360,\"r\":0..255,\"g\":0..255,\"b\":0..255,\"op\":15..255,\"blend\":false,\"dr\":0..255,\"dg\":0..255,\"db\":0..255,\"dop\":15..255,\"dblend\":false,\"el\":0..5,\"zl\":-3..9,\"z\":-15..45}}]"
+        "\"want_bricks\": false, \"want_vines\": false, \"want_windows\": false, \"want_pbr\": false, \"want_gradient\": false, \"want_neon\": false, "
+        "\"move_x\": 0, \"move_y\": 0, \"rotate_deg\": 0, \"scale_x\": 1.0, \"scale_y\": 1.0, \"duplicate_count\": 0, \"duplicate_dx\": 0, \"duplicate_dy\": 0, \"delete_selected\": false, \"recolor_only\": false, "
+        "\"cell_elements\": [{{\"id\":211,\"rx\":0.0..1.0,\"ry\":0.0..1.0,\"sx\":0.02..1.0,\"sy\":0.02..1.0,\"rot\":0..360,\"r\":0..255,\"g\":0..255,\"b\":0..255,\"op\":15..255,\"blend\":false,\"el\":1..3,\"zl\":1..5,\"z\":6..16}}], "
+        "\"elements\": [{{\"id\":211,\"rx\":-0.35..1.35,\"ry\":-0.50..1.50,\"sx\":0.02..8.0,\"sy\":0.02..8.0,\"rot\":0..360,\"r\":0..255,\"g\":0..255,\"b\":0..255,\"op\":15..255,\"blend\":false,\"el\":2..5,\"zl\":3..7,\"z\":18..35}}]"
         "}}. "
-        "IMPORTANT: When \"action\" is \"build\", output 36 to 75 pixel-by-pixel \"elements\" with many fine micro-elements (sx/sy 0.02..0.30) across internal block layers (el=0..5, zl=-3..9) so the micro-textures look crisp and authentic.",
-        cat.idGlowEdgeSmall,
-        forbiddenThemes,
-        cat.idGlowEdgeSmall, cat.idCircleDot, cat.idCircleRing, cat.idSmallTriangle, cat.idThinLineLong,
-        cat.idArcThin, cat.idParallelLines, cat.idDiagShine1, cat.idChevron,
-        cat.idSmallCross, cat.idBracketCorner, cat.idBracketArch, cat.idBrickBlock,
+        "IMPORTANT: Whenever the user asks for ANY custom style, object, or detail, populate \"cell_elements\" (8..25 elements per block) and/or \"elements\" (12..45 elements per island, using ry < 0 for hanging items and ry > 1 for top items) so it is 100% built in the editor!",
         contour.cellCount(),
         contour.widthUnits(),
         contour.heightUnits(),
+        contour.spikes.size(),
         objectLimit,
         overhangAllowed ? "Overhang" : "Inside",
         variantNum,
+        forbiddenThemes,
         refInfo
     );
 
@@ -1840,7 +1916,7 @@ static AIDecisionResult queryRealNeuralNetwork(
             int actualScore = evaluateReferenceSimilarityScore(bestRes, weakZones);
             bestRes.selfMatchScore = actualScore;
 
-            bool needsRefinement = (actualScore < 93) || (bestRes.customElements.size() < 18);
+            bool needsRefinement = (bestRes.cellElements.empty() && bestRes.customElements.empty() && !bestRes.directRecolorOnly && !bestRes.directDeleteSelected);
             if (!needsRefinement) break;
 
             std::string critiquePrompt = fmt::format(
@@ -2134,29 +2210,11 @@ static int getSlotObjectID(std::vector<int> const& barIDs, int pageZeroBased, in
     return fallbackID;
 }
 
-static void findRealGlowObjectsInTab(std::vector<int> const& tabIDs, EditorTabCatalog& cat) {
-    int idx1888 = -1;
-    for (int i = 0; i < static_cast<int>(tabIDs.size()); ++i) {
-        if (tabIDs[i] == 1888) {
-            idx1888 = i;
-            break;
-        }
-    }
-    if (idx1888 >= 0) {
-        // В редакторе GD страница со свечением начинается со слота 0 = 1888 (круглый шар),
-        // а слот +1 или +4 на этой же странице — прямой ОДНОСТОРОННИЙ неон (градиентная полоса)!
-        int pageStart = (idx1888 / 12) * 12;
-        if (pageStart + 1 < static_cast<int>(tabIDs.size()) && tabIDs[pageStart + 1] > 0 && tabIDs[pageStart + 1] != 1888) {
-            cat.idGlowBeam = tabIDs[pageStart + 1];
-            cat.idGlowEdgeSmall = tabIDs[pageStart + 1];
-        }
-        if (pageStart + 4 < static_cast<int>(tabIDs.size()) && tabIDs[pageStart + 4] > 0 && tabIDs[pageStart + 4] != 1888) {
-            cat.idGlowEdgeSmall = tabIDs[pageStart + 4];
-        }
-    }
-    if (cat.idGlowEdgeSmall == 1888 && cat.idGradLine != 211 && cat.idGradLine != 1888) {
-        cat.idGlowEdgeSmall = cat.idGradLine;
-    }
+static void findRealGlowObjectsInTab(std::vector<int> const& /*tabIDs*/, EditorTabCatalog& cat) {
+    // Никогда не берем слоты из панели редактора наугад (в GD 2.2 там лежат косые 3D-параллелограммы!).
+    // Односторонний неон строится из чистых градиентных полосок 211 с Blending=true.
+    cat.idGlowBeam = 211;
+    cat.idGlowEdgeSmall = 211;
 }
 
 template <typename EditorUIType>
@@ -2271,6 +2329,77 @@ static bool isSpikeObjectID(int id) {
            id == 177 || id == 178 || id == 179 || id == 191 || id == 205 ||
            id == 216 || id == 217 || id == 218 || id == 392 || id == 421 ||
            id == 422 || id == 458 || id == 459;
+}
+
+// Полный фильтр триггеров, орбов (сфер), батутов (падов), порталов, ускорителей, монеток, ключей, пил и уже созданного ИИ-декора:
+// Мод НИКОГДА не трогает, не перекрашивает и не застраивает взаимодействующие объекты и триггеры!
+static bool isInteractiveOrTriggerObjectID(int id) {
+    if (id <= 0) return true;
+    // Орбы (Jump Rings / Dash Orbs / Spider Orbs / Teleport Orbs / Trigger Orbs)
+    if (id == 36 || id == 84 || id == 141 || id == 1022 || id == 1330 ||
+        id == 1333 || id == 1594 || id == 1704 || id == 1751 || id == 3004 || id == 3027) {
+        return true;
+    }
+    // Пады / Батуты (Jump Pads / Spider Pads)
+    if (id == 35 || id == 67 || id == 140 || id == 1332 || id == 3005) {
+        return true;
+    }
+    // Порталы и ускорители (Portals & Speed Changers)
+    if (id == 10 || id == 11 || id == 12 || id == 13 || id == 45 || id == 46 || id == 47 ||
+        id == 99 || id == 101 || id == 111 || id == 200 || id == 201 || id == 202 || id == 203 ||
+        id == 286 || id == 287 || id == 660 || id == 745 || id == 747 || id == 749 ||
+        id == 1331 || id == 1334 || id == 1933 || id == 2902 || id == 2926) {
+        return true;
+    }
+    // Триггеры (Color, Move, Pulse, Alpha, Toggle, Spawn, Rotate, Follow, Shake, Camera, Shader, SFX, Song и др.)
+    if ((id >= 29 && id <= 34) || (id >= 55 && id <= 59) || id == 104 || id == 105 || id == 221 ||
+        id == 717 || id == 718 || id == 743 || id == 744 || id == 899 || id == 900 || id == 901 ||
+        id == 915 || id == 1006 || id == 1007 || id == 1049 || id == 1268 || id == 1346 || id == 1347 ||
+        id == 1520 || id == 1585 || id == 1595 || id == 1611 || id == 1612 || id == 1613 || id == 1616 ||
+        (id >= 1811 && id <= 1817) || (id >= 1912 && id <= 1917) || id == 1932 || id == 1934 || id == 1935 ||
+        id == 2015 || id == 2016 || id == 2062 || id == 2067 || id == 2068 ||
+        (id >= 2899 && id <= 3035) || (id >= 3600 && id <= 3660)) {
+        return true;
+    }
+    // Монетки, ключи, чекпоинты, StartPos, предметы и пилы
+    if (id == 44 || id == 88 || id == 89 || id == 98 || id == 142 || (id >= 183 && id <= 188) ||
+        (id >= 397 && id <= 399) || (id >= 675 && id <= 677) || (id >= 740 && id <= 742) ||
+        id == 1275 || id == 1329 || (id >= 1587 && id <= 1598) || id == 1614 || id == 1619 || id == 1620 ||
+        (id >= 1705 && id <= 1710) || (id >= 1734 && id <= 1736) || id == 2063) {
+        return true;
+    }
+    return false;
+}
+
+template <typename ObjT>
+static bool isInteractiveOrTriggerObject(ObjT* obj) {
+    if (!obj) return true;
+    // Пропускаем декор, который сам мод уже создал ранее, чтобы при повторном выделении не считать мелкие детали блоками
+    for (auto const& placed : g_lastPlacedObjects) {
+        if (placed.data() == obj) return true;
+    }
+    int id = readObjID(obj);
+    if (isSpikeObjectID(id)) return false;
+    if (isInteractiveOrTriggerObjectID(id)) return true;
+
+    // Проверяем динамические классы GD (EffectGameObject = все триггеры и предметы, RingObject = все орбы)
+    if (typeinfo_cast<EffectGameObject*>(obj) != nullptr) return true;
+    if (typeinfo_cast<RingObject*>(obj) != nullptr) return true;
+    if (typeinfo_cast<TeleportPortalObject*>(obj) != nullptr) return true;
+    if (typeinfo_cast<StartPosObject*>(obj) != nullptr) return true;
+
+    if constexpr (requires { obj->m_isTrigger; }) {
+        if (obj->m_isTrigger) return true;
+    }
+    if constexpr (requires { obj->m_objectType; }) {
+        int t = static_cast<int>(obj->m_objectType);
+        // В GD GameObjectType: 0 = Solid, 2 = Hazard, 7 = Decoration/Block (211), 23 = Slope.
+        // Все порталы, орбы, пады, триггеры (20=Modifier), монетки (22,30), предметы (29) имеют другие коды!
+        if (t >= 3 && t != 7 && t != 23) {
+            return true;
+        }
+    }
+    return false;
 }
 
 struct IslandBounds {
@@ -2418,6 +2547,8 @@ static ContourAnalysis analyzeSelectedContour(EditorUIType* ui) {
         bool first = true;
         for (GameObject* obj : rawObjects) {
             if (!obj) continue;
+            // НЕ трогаем триггеры, орбы, пады, порталы, пилы и взаимодействующие объекты, даже если они попали в выделение!
+            if (isInteractiveOrTriggerObject(obj)) continue;
             CCPoint pos = obj->getPosition();
             info.lockedStates.push_back(LockedObjectState{ obj, pos, obj->getRotation() });
 
@@ -2593,11 +2724,12 @@ static bool isPremade3DOrForbiddenTemplateID(int id, EditorTabCatalog const& cat
 
 // Никаких готовых наклонных текстур! ИИ собирает весь декор, кирпичи, окна и PBR исключительно из чистых кубиков 211
 // (плюс односторонний неон idGlowEdgeSmall только для световой обводки)
-static int resolveAIElementObjectID(AICustomDrawElement const& el, EditorTabCatalog const& cat, bool /*forbid3DBlocks*/) {
-    if (el.directObjectId == cat.idGlowEdgeSmall || el.directObjectId == cat.idGlowBeam || el.shapeType == 3) {
-        return cat.idGlowEdgeSmall;
+static int resolveAIElementObjectID(AICustomDrawElement const& el, EditorTabCatalog const& cat, bool forbid3DBlocks) {
+    if (el.directObjectId <= 0) return 211;
+    if (forbid3DBlocks && isPremade3DOrForbiddenTemplateID(el.directObjectId, cat)) {
+        return 211;
     }
-    return 211;
+    return el.directObjectId;
 }
 
 static float hash2DNoise(int x, int y, int seed = 1337) {
@@ -2795,104 +2927,171 @@ static void appendCubeRealisticWindowInCell(
     addSpec(result, 211, cx, cy - 12.2f, 0.84f, 0.08f, 0.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 11, 0, false, 255, 3, 3, sillCol, false);
 }
 
-// РОВНЫЙ И ЧЕТКИЙ ГЕОМЕТРИЧЕСКИЙ ШИП (Симметричная ступенчатая пирамида из ровных кубиков + прямой односторонний Glow):
-// Никаких кривых наклонных полосок, выходящих за треугольник шипа!
-static void appendSingleRealisticOrGlowSpike(
+// ОДНОСТОРОННИЙ НЕОН ПО КРАЯМ СТРУКТУРЫ (из ровных градиентных полосок 211 с Blending=true, БЕЗ косых 3D-объектов!)
+static void appendOneSidedEdgeNeon(
+    std::vector<GeneratedObjectSpec>& result,
+    float cx,
+    float cy,
+    bool topOpen,
+    bool bottomOpen,
+    bool leftOpen,
+    bool rightOpen,
+    bool allowOverhang,
+    ccColor3B glowRGB
+) {
+    // 3 плавных ступени затухания одностороннего неона (суммарно дают мягкое направленное свечение 60-80% у края!)
+    constexpr float kOffsets[3] = { 13.6f, 11.4f, 8.6f };
+    constexpr float kWidths[3]  = { 0.09f, 0.16f, 0.24f };
+    constexpr GLubyte kOps[3]   = { 195,   135,   80 };
+
+    if (topOpen) {
+        for (int i = 0; i < 3; ++i) {
+            addSpec(result, 211, cx, cy + kOffsets[i], 1.00f, kWidths[i], 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16 + i, 0, false, kOps[i], 5, 4, glowRGB, true);
+        }
+        if (allowOverhang) {
+            addSpec(result, 211, cx, cy + 16.5f, 1.00f, 0.14f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 17, 0, true, 155, 7, 5, glowRGB, true);
+        }
+    }
+    if (leftOpen) {
+        for (int i = 0; i < 3; ++i) {
+            addSpec(result, 211, cx - kOffsets[i], cy, kWidths[i], 1.00f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16 + i, 0, false, kOps[i], 5, 4, glowRGB, true);
+        }
+    }
+    if (rightOpen) {
+        for (int i = 0; i < 3; ++i) {
+            addSpec(result, 211, cx + kOffsets[i], cy, kWidths[i], 1.00f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16 + i, 0, false, kOps[i], 5, 4, glowRGB, true);
+        }
+    }
+    // Для самого низа структуры — темный (черный) односторонний неон без блендинга
+    if (bottomOpen) {
+        for (int i = 0; i < 3; ++i) {
+            addSpec(result, 211, cx, cy - kOffsets[i], 1.00f, kWidths[i], 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 17 + i, 0, false, kOps[i], 5, 4, ccColor3B{ 0, 0, 0 }, false);
+        }
+    }
+}
+
+// СБОРКА СВИСАЮЩИХ ЛИАН (2-4 детализированные пиксельные лианы с листьями из кубиков 211 НА КАЖДОМ ПАРТЕ!)
+static void appendCubeHangingVinesOnIsland(
+    std::vector<GeneratedObjectSpec>& result,
+    IslandBounds const& isl,
+    ContourAnalysis const& contour,
+    bool allowOverhang,
+    int styleSeed
+) {
+    int islCols = (std::max)(1, isl.maxGX - isl.minGX + 1);
+    int vineCount = std::clamp((islCols + 1) / 2, 2, 4);
+
+    ccColor3B vineDark = ccColor3B{ 18, 72, 28 };
+    ccColor3B vineMid  = ccColor3B{ 42, 156, 58 };
+    ccColor3B vineLit  = ccColor3B{ 102, 232, 88 };
+
+    // 1. Верхняя шапка мха/зелени вдоль открытого верха парта
+    for (auto const& [gx, gy] : isl.cells) {
+        if (contour.occupiedCells.count({ gx, gy + 1 }) == 0) {
+            float cx = gx * 30.f + 15.f;
+            float cy = gy * 30.f + 15.f;
+            addSpec(result, 211, cx, cy + 12.8f, 0.96f, 0.14f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 21, 0, false, 255, 5, 4, vineDark, false);
+            addSpec(result, 211, cx, cy + 13.6f, 0.88f, 0.09f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 22, 0, false, 255, 5, 4, vineMid, false);
+        }
+    }
+
+    // 2. Спускающиеся стебли лиан с боковыми листочками по всей высоте каждого парта (и свисающие кончики снизу!)
+    float islMinX = isl.minGX * 30.f;
+    float islSpanW = islCols * 30.f;
+
+    for (int v = 0; v < vineCount; ++v) {
+        float fracX = (v + 0.5f) / static_cast<float>(vineCount);
+        float baseVineX = islMinX + fracX * islSpanW;
+        int colGX = std::clamp(static_cast<int>(std::floor(baseVineX / 30.f)), isl.minGX, isl.maxGX);
+
+        // Находим самую верхнюю и самую нижнюю клетку парта в этой колонке
+        int topGY = isl.minGY;
+        int botGY = isl.maxGY;
+        bool foundCol = false;
+        for (int gy = isl.minGY; gy <= isl.maxGY; ++gy) {
+            if (isl.cells.count({ colGX, gy })) {
+                if (!foundCol) {
+                    topGY = botGY = gy;
+                    foundCol = true;
+                } else {
+                    topGY = (std::max)(topGY, gy);
+                    botGY = (std::min)(botGY, gy);
+                }
+            }
+        }
+        if (!foundCol) continue;
+
+        float startY = (topGY + 1) * 30.f - 2.0f;
+        float endY   = botGY * 30.f - (allowOverhang ? (12.0f + (v % 2) * 8.0f) : -2.0f);
+        float stepY  = 4.2f;
+        int segIdx   = 0;
+
+        for (float curY = startY; curY >= endY; curY -= stepY, ++segIdx) {
+            float waveX = std::sin((segIdx * 0.65f) + v * 1.9f + styleSeed * 0.1f) * 2.8f;
+            float vx = baseVineX + waveX;
+            bool isHangingBelow = (curY < botGY * 30.f);
+
+            // Тень стебля + основной зеленый стебель лианы
+            addSpec(result, 211, vx + 0.9f, curY - 0.5f, 0.11f, 0.16f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 22, 0, isHangingBelow, 245, 5, 4, vineDark, false);
+            addSpec(result, 211, vx,        curY,        0.10f, 0.16f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 23, 0, isHangingBelow, 255, 5, 4, vineMid,  false);
+
+            // Боковые пиксельные листья слева и справа через каждые 2 сегмента
+            if ((segIdx % 2) == 0) {
+                float leafSide = ((segIdx / 2 + v) % 2 == 0) ? -3.4f : 3.4f;
+                addSpec(result, 211, vx + leafSide, curY + 0.4f, 0.16f, 0.09f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 24, 0, isHangingBelow, 255, 5, 4, vineMid, false);
+                addSpec(result, 211, vx + leafSide * 1.25f, curY + 0.8f, 0.10f, 0.06f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 25, 0, isHangingBelow, 255, 5, 4, vineLit, false);
+            }
+        }
+    }
+}
+
+// АККУРАТНЫЙ ДЕКОР ШИПОВ ПО ЗАПРОСУ ИГРОКА:
+// Основной шип красится в цвет декора (в placeGeneratedArtInEditor), а внутри ставится 2-й такой же шип меньшего размера
+// с полной заливкой Base и Detail ОДНОГО цвета (без кривых кубиков и выступов!)
+static void appendCleanSpikeDecoration(
     std::vector<GeneratedObjectSpec>& result,
     SelectedSpikeInfo const& sp,
-    EditorTabCatalog const& cat,
-    AIDecisionResult const& ai,
-    float /*originX*/,
-    float /*originY*/,
-    float /*spanW*/,
-    float /*spanH*/,
-    int /*styleSeed*/
+    AIDecisionResult const& ai
 ) {
     float rad = -sp.rotation * (3.14159265f / 180.0f);
     float cosA = std::cos(rad);
     float sinA = std::sin(rad);
 
-    auto localToWorld = [&](float lx, float ly) -> std::pair<float, float> {
-        float sx = lx * sp.scaleX * (sp.flipX ? -1.f : 1.f);
-        float sy = ly * sp.scaleY * (sp.flipY ? -1.f : 1.f);
-        float wx = sp.x + (sx * cosA - sy * sinA);
-        float wy = sp.y + (sx * sinA + sy * cosA);
-        return { wx, wy };
-    };
+    // Смещаем внутренний меньший шип чуть ближе к основанию (-2.5 ед. по локальной оси Y), чтобы он сидел ровно по центру
+    float localY = -2.5f * sp.scaleY * (sp.flipY ? -1.f : 1.f);
+    float wx = sp.x - localY * sinA;
+    float wy = sp.y + localY * cosA;
 
-    float spikeH = (sp.objectId == 39 || sp.objectId == 103) ? 15.0f : 30.0f;
-    float baseY  = -15.0f;
+    ccColor3B innerCol = ai.wantNeon
+        ? lerpColor(ai.mainRGB, ai.glowRGB, 0.5f)
+        : lerpColor(ai.midRGB, ai.mainRGB, 0.55f);
 
-    // 1. Если включен PBR/реалистик — строим идеально ровную симметричную 6-ступенчатую пирамиду внутри треугольника шипа:
-    //    Левая половина каждой ступеньки — светлая грань, правая половина — теневая грань, по центру — ровный вертикальный хребет!
-    if (ai.wantRealisticPBR) {
-        constexpr int kSteps = 6;
-        for (int s = 0; s < kSteps; ++s) {
-            float vMid = (s + 0.5f) / static_cast<float>(kSteps);
-            float ly = baseY + vMid * spikeH;
-            // Строго внутри треугольника шипа (с запасом 0.85, чтобы уголки ступенек никогда не торчали наружу!)
-            float halfW = (1.0f - vMid) * 12.2f;
-            if (halfW < 1.0f) continue;
-
-            float stepHScale = ((spikeH / static_cast<float>(kSteps)) * 0.96f) / 30.0f * sp.scaleY;
-            float quarterWScale = (halfW / 30.0f) * sp.scaleX;
-
-            auto [leftX, leftY]   = localToWorld(-halfW * 0.5f, ly);
-            auto [rightX, rightY] = localToWorld( halfW * 0.5f, ly);
-
-            ccColor3B litCol  = lerpColor(ai.midRGB, ai.mainRGB, 0.35f + vMid * 0.55f);
-            ccColor3B darkCol = lerpColor(ai.fillRGB, ai.midRGB, vMid * 0.65f);
-
-            addSpec(result, 211, leftX,  leftY,  quarterWScale, stepHScale, sp.rotation, LayerRole::InnerDetail, ColorSlot::CustomRGB, 6 + s, 0, false, 240, 1, 2, litCol, false);
-            addSpec(result, 211, rightX, rightY, quarterWScale, stepHScale, sp.rotation, LayerRole::InnerDetail, ColorSlot::CustomRGB, 6 + s, 0, false, 240, 1, 2, darkCol, false);
-        }
-    }
-
-    // 2. Ровный центральный световой стержень и четкая подставка у основания шипа (все строго под углом sp.rotation, без кривизны!)
-    {
-        auto [coreX, coreY] = localToWorld(0.f, baseY + spikeH * 0.42f);
-        addSpec(
-            result, 211, coreX, coreY, 0.05f * sp.scaleX, (spikeH / 30.0f) * 0.72f * sp.scaleY, sp.rotation,
-            LayerRole::InnerDetail, ColorSlot::CustomRGB, 14, 0, false,
-            210, 3, 3, lerpColor(ai.mainRGB, ai.outlineRGB, 0.5f), true
-        );
-
-        auto [baseX, baseYWorld] = localToWorld(0.f, baseY + 1.8f);
-        addSpec(
-            result, 211, baseX, baseYWorld, 0.92f * sp.scaleX, 0.10f * sp.scaleY, sp.rotation,
-            LayerRole::Outline3D, ColorSlot::CustomRGB, 15, 0, false,
-            230, 3, 3, ccColor3B{ 4, 5, 8 }, false
-        );
-    }
-
-    // 3. ШИПЫ GLOW (ровный односторонний неон у основания + пирамидальное внутреннее свечение с прозрачностью 65-75% и Blending=true!)
-    if (ai.wantNeon || ai.taskMode == AITaskMode::OnlyNeon) {
-        auto [glowBaseUpX, glowBaseUpY] = localToWorld(0.f, baseY + 6.5f);
-        auto [glowDarkX, glowDarkY]     = localToWorld(0.f, baseY + 3.2f);
-        auto [glowMidX, glowMidY]       = localToWorld(0.f, baseY + spikeH * 0.42f);
-
-        // Односторонний цветной неон от основания вверх внутрь шипа (прозрачность ~70% = 180, Blending = true)
-        addSpec(
-            result, cat.idGlowEdgeSmall, glowBaseUpX, glowBaseUpY,
-            0.90f * sp.scaleX, 0.45f * sp.scaleY, sp.rotation,
-            LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 17, 0, false,
-            180, 5, 4, ai.glowRGB, true
-        );
-        // Внутренний узкий неон ближе к вершине шипа (прозрачность ~65% = 168, Blending = true)
-        addSpec(
-            result, cat.idGlowEdgeSmall, glowMidX, glowMidY,
-            0.46f * sp.scaleX, 0.38f * sp.scaleY, sp.rotation,
-            LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 18, 0, false,
-            168, 5, 4, ai.glowRGB, true
-        );
-        // Темный черный односторонний неон у самого низа шипа
-        addSpec(
-            result, cat.idGlowEdgeSmall, glowDarkX, glowDarkY,
-            0.94f * sp.scaleX, 0.36f * sp.scaleY, sp.rotation,
-            LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 19, 0, false,
-            190, 5, 4, ccColor3B{ 0, 0, 0 }, false
-        );
-    }
+    GeneratedObjectSpec innerSpike;
+    innerSpike.objectId               = sp.objectId;
+    innerSpike.x                      = wx;
+    innerSpike.y                      = wy;
+    innerSpike.scaleX                 = sp.scaleX * 0.62f;
+    innerSpike.scaleY                 = sp.scaleY * 0.62f;
+    innerSpike.rotation               = sp.rotation;
+    innerSpike.flipX                  = sp.flipX;
+    innerSpike.flipY                  = sp.flipY;
+    innerSpike.layerRole              = LayerRole::InnerDetail;
+    innerSpike.colorSlot              = ColorSlot::CustomRGB;
+    innerSpike.customColor            = innerCol;
+    innerSpike.customOpacity          = 255;
+    innerSpike.customBlending         = false;
+    // Одинаковый цвет на Base и Detail для 100% монолитной заливки внутреннего шипа!
+    innerSpike.hasSeparateDetailColor = true;
+    innerSpike.detailColor            = innerCol;
+    innerSpike.detailOpacity          = 255;
+    innerSpike.detailBlending         = false;
+    innerSpike.zOrder                 = 8;
+    innerSpike.zLayerCode             = 1;
+    innerSpike.editorLayerOffset      = 2;
+    innerSpike.priorityTier           = 0;
+    innerSpike.noTouch                = true;
+    innerSpike.noGlow                 = true;
+    result.push_back(innerSpike);
 }
 
 static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
@@ -2905,6 +3104,9 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
 ) {
     std::vector<GeneratedObjectSpec> result;
 
+    if (ai.directDeleteSelected || ai.directRecolorOnly) {
+        return result;
+    }
     auto islands = splitIntoIslands(contour.occupiedCells);
 
     if (ai.taskMode == AITaskMode::Only3D) {
@@ -2949,31 +3151,11 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                 bool leftOpen   = (contour.occupiedCells.count({ gx - 1, gy }) == 0);
                 bool rightOpen  = (contour.occupiedCells.count({ gx + 1, gy }) == 0);
 
-                if (topOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx, cy + 10.5f, 1.00f, 0.48f, 180.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 0, false, 185, 5, 4, ai.glowRGB, true);
-                    if (allowOverhang) {
-                        addSpec(result, cat.idGlowEdgeSmall, cx, cy + 18.0f, 1.00f, 0.45f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 17, 0, true, 165, 7, 5, ai.glowRGB, true);
-                    }
-                }
-                if (leftOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx - 10.5f, cy, 1.00f, 0.46f, 90.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 0, false, 175, 5, 4, ai.glowRGB, true);
-                }
-                if (rightOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx + 10.5f, cy, 1.00f, 0.46f, 270.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 0, false, 175, 5, 4, ai.glowRGB, true);
-                }
-                if (bottomOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx, cy - 10.5f, 1.00f, 0.48f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 17, 0, false, 190, 5, 4, ccColor3B{ 0, 0, 0 }, false);
-                }
+                appendOneSidedEdgeNeon(result, cx, cy, topOpen, bottomOpen, leftOpen, rightOpen, allowOverhang, ai.glowRGB);
             }
         }
-        int spikeSeed = static_cast<int>(ai.glowRGB.r * 73 + g_variantIndex * 997);
-        float spanW = static_cast<float>((std::max)(1, contour.maxGX - contour.minGX + 1)) * 30.f;
-        float spanH = static_cast<float>((std::max)(1, contour.maxGY - contour.minGY + 1)) * 30.f;
         for (auto const& sp : contour.spikes) {
-            appendSingleRealisticOrGlowSpike(
-                result, sp, cat, ai,
-                contour.minGX * 30.f, contour.minGY * 30.f, spanW, spanH, spikeSeed
-            );
+            appendCleanSpikeDecoration(result, sp, ai);
         }
         return result;
     }
@@ -3027,11 +3209,23 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                 addSpec(result, 211, cx, cy, 1.00f, 1.00f, 0.f, LayerRole::Fill, ColorSlot::CustomRGB, 1, 0, false, 255, -3, 0, ai.fillRGB, false);
             }
 
-            // 2. СБОРКА КИРПИЧЕЙ ИЗ КУБИКОВ 211 (если попросили кирпичную стену/структуру!)
+            // 2. СБОРКА КИРПИЧЕЙ ИЗ КУБИКОВ 211 (строго только когда попросили кирпичи!)
             if (ai.wantBricks) {
                 appendCubeBrickworkInCell(result, cx, cy, gx, gy, ai, styleSeed);
             }
-            // 3. ПОПИКСЕЛЬНЫЙ PBR ИЗ КУБИКОВ 211 (ТОЛЬКО если есть референс ИЛИ игрок попросил реалистик/PBR!)
+            // 3. СБОРКА НЕОНОВОГО СТИЛЯ (когда попросили стиль неон / glow без кирпичей: неоновые трубки, внутренний контур, свечение!)
+            else if (ai.wantNeon && !ai.wantRealisticPBR && !g_hasReferenceImage) {
+                // Внутренняя неоновая рамка с отступом 4.2 ед. от внешних краев и светящаяся кибер-решетка
+                if (topOpen)    addSpec(result, 211, cx, cy + 10.2f, 0.88f, 0.05f, 0.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 9, 0, false, 215, 3, 2, ai.glowRGB, true);
+                if (bottomOpen) addSpec(result, 211, cx, cy - 10.2f, 0.88f, 0.05f, 0.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 9, 0, false, 195, 3, 2, ai.mainRGB, true);
+                if (leftOpen)   addSpec(result, 211, cx - 10.2f, cy, 0.05f, 0.88f, 0.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 9, 0, false, 215, 3, 2, ai.glowRGB, true);
+                if (rightOpen)  addSpec(result, 211, cx + 10.2f, cy, 0.05f, 0.88f, 0.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 9, 0, false, 215, 3, 2, ai.glowRGB, true);
+
+                // Внутренний неоновый импульс в центре клетки
+                addSpec(result, 211, cx, cy, 0.42f, 0.04f, 0.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 7, 0, false, 145, 1, 2, ai.midRGB, true);
+                addSpec(result, 211, cx, cy, 0.04f, 0.42f, 0.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 7, 0, false, 145, 1, 2, ai.midRGB, true);
+            }
+            // 4. ПОПИКСЕЛЬНЫЙ PBR ИЗ КУБИКОВ 211 (ТОЛЬКО если есть референс ИЛИ игрок попросил реалистик/PBR!)
             else if (ai.wantRealisticPBR || g_hasReferenceImage) {
                 constexpr int kSubDiv = 6;
                 float stepPx = 30.0f / static_cast<float>(kSubDiv);
@@ -3079,7 +3273,37 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                 }
             }
 
-            // 4. СБОРКА РЕАЛИСТИЧНЫХ ОКОН ИЗ КУБИКОВ 211 (если попросили окна/дом/здание/фасад!)
+            // 5. ПРЯМАЯ ГЕНЕРАЦИЯ ИИ ВНУТРИ КАЖДОЙ КЛЕТКИ 30x30 (cell_elements — любые узоры, доски, лава, соты, трещины, схемы, кристаллы, которых нет в коде!)
+            for (auto const& cel : ai.cellElements) {
+                float localX = (cx - 15.f) + std::clamp(cel.rx, -0.15f, 1.15f) * 30.f;
+                float localY = (cy - 15.f) + std::clamp(cel.ry, -0.15f, 1.15f) * 30.f;
+
+                GeneratedObjectSpec cs;
+                cs.objectId               = resolveAIElementObjectID(cel, cat, true);
+                cs.x                      = localX;
+                cs.y                      = localY;
+                cs.scaleX                 = std::clamp(cel.scaleX, 0.005f, 2.5f);
+                cs.scaleY                 = std::clamp(cel.scaleY, 0.005f, 2.5f);
+                cs.rotation               = cel.rot;
+                cs.layerRole              = LayerRole::InnerDetail;
+                cs.editorLayerOffset      = std::clamp(cel.editorLayerOff, 1, 5);
+                cs.zLayerCode             = (std::max)(1, cel.zLayerCode);
+                cs.zOrder                 = (std::max)(8, cel.zOrder);
+                cs.colorSlot              = ColorSlot::CustomRGB;
+                cs.customColor            = cel.color;
+                cs.customOpacity          = cel.opacity;
+                cs.customBlending         = cel.blending;
+                cs.hasSeparateDetailColor = cel.hasDetailColor;
+                cs.detailColor            = cel.detailColor;
+                cs.detailOpacity          = cel.detailOpacity;
+                cs.detailBlending         = cel.detailBlending;
+                cs.priorityTier           = 0;
+                cs.noTouch                = true;
+                cs.noGlow                 = true;
+                result.push_back(cs);
+            }
+
+            // 6. СБОРКА РЕАЛИСТИЧНЫХ ОКОН ИЗ КУБИКОВ 211 (если попросили окна/дом/здание/фасад!)
             if (ai.wantWindows) {
                 int localCol = gx - isl.minGX;
                 int localRow = gy - isl.minGY;
@@ -3095,114 +3319,90 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                 }
             }
 
-            // 5. Аккуратный ровный контур границы структуры
-            if (topOpen)    addSpec(result, 211, cx, cy + 14.3f, 1.00f, 0.055f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 240, 3, 3, ai.outlineRGB, false);
-            if (leftOpen)   addSpec(result, 211, cx - 14.3f, cy, 0.055f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 220, 3, 3, ai.outlineRGB, false);
-            if (rightOpen)  addSpec(result, 211, cx + 14.3f, cy, 0.055f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 220, 3, 3, ai.outlineRGB, false);
-            if (bottomOpen && gy > 0) addSpec(result, 211, cx, cy - 14.3f, 1.00f, 0.055f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 200, 3, 3, ai.outlineRGB, false);
+            // 7. Аккуратный ровный контур границы структуры
+            bool glowBorder = ai.wantNeon;
+            if (topOpen)    addSpec(result, 211, cx, cy + 14.3f, 1.00f, 0.06f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 245, 3, 3, ai.outlineRGB, glowBorder);
+            if (leftOpen)   addSpec(result, 211, cx - 14.3f, cy, 0.06f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 235, 3, 3, ai.outlineRGB, glowBorder);
+            if (rightOpen)  addSpec(result, 211, cx + 14.3f, cy, 0.06f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 235, 3, 3, ai.outlineRGB, glowBorder);
+            if (bottomOpen && gy > 0) addSpec(result, 211, cx, cy - 14.3f, 1.00f, 0.06f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 215, 3, 3, ai.outlineRGB, glowBorder);
 
-            // 6. ТОЛЬКО ОДНОСТОРОННИЙ НЕОН ПО КРАЯМ (60-80% прозрачность + Blending, снизу черный)
+            // 8. ОДНОСТОРОННИЙ НЕОН ПО КРАЯМ (ровные полоски 211 с Blending=true, ТОЛЬКО когда запрошен неон!)
             if (ai.wantNeon) {
-                if (topOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx, cy + 10.5f, 1.00f, 0.46f, 180.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 0, false, 185, 5, 4, ai.glowRGB, true);
-                    if (allowOverhang) {
-                        addSpec(result, cat.idGlowEdgeSmall, cx, cy + 17.5f, 1.00f, 0.42f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 17, 0, true, 160, 7, 5, ai.glowRGB, true);
+                appendOneSidedEdgeNeon(result, cx, cy, topOpen, bottomOpen, leftOpen, rightOpen, allowOverhang, ai.glowRGB);
+            }
+        }
+
+        // 9. СПУСКАЮЩИЕСЯ ЛИАНЫ НА КАЖДОМ ПАРТЕ (если игрок попросил лианы/плющ/зелень!)
+        if (ai.wantVines) {
+            appendCubeHangingVinesOnIsland(result, isl, contour, allowOverhang, styleSeed);
+        }
+
+        // 10. ПРЯМАЯ ГЕНЕРАЦИЯ ЭЛЕМЕНТОВ ИИ НА КАЖДОМ ПАРТЕ (elements — любые рисунки, объекты редактора, выступы, лианы, сосульки, огонь, черепа, глаза, крыши и т.д.!)
+        float islOriginX = isl.minGX * 30.f;
+        float islOriginY = isl.minGY * 30.f;
+        float islSpanW   = static_cast<float>((std::max)(1, islCols)) * 30.f;
+        float islSpanH   = static_cast<float>((std::max)(1, islRows)) * 30.f;
+
+        for (auto const& el : ai.customElements) {
+            bool isIntentionalOverhang = (el.rx < 0.0f || el.rx > 1.0f || el.ry < 0.0f || el.ry > 1.0f);
+            if (isIntentionalOverhang && !allowOverhang) {
+                continue;
+            }
+
+            float worldX = islOriginX + el.rx * islSpanW;
+            float worldY = islOriginY + el.ry * islSpanH;
+            int cellGX = static_cast<int>(std::floor(worldX / 30.f));
+            int cellGY = static_cast<int>(std::floor(worldY / 30.f));
+
+            // Если точка должна быть внутри парта (0..1), но парт Г-образный — привязываем к ближайшей клетке парта;
+            // а если ИИ специально рисует свисающий/выступающий декор (ry < 0 или ry > 1) — оставляем точные координаты ИИ!
+            if (!isIntentionalOverhang && isl.cells.count({ cellGX, cellGY }) == 0) {
+                int bestGX = isl.cells.begin()->first;
+                int bestGY = isl.cells.begin()->second;
+                int bestDist = 999999;
+                for (auto const& [cgx, cgy] : isl.cells) {
+                    int d = std::abs(cgx - cellGX) + std::abs(cgy - cellGY);
+                    if (d < bestDist) {
+                        bestDist = d;
+                        bestGX = cgx;
+                        bestGY = cgy;
                     }
                 }
-                if (leftOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx - 10.5f, cy, 1.00f, 0.44f, 90.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 0, false, 175, 5, 4, ai.glowRGB, true);
-                }
-                if (rightOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx + 10.5f, cy, 1.00f, 0.44f, 270.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 0, false, 175, 5, 4, ai.glowRGB, true);
-                }
-                if (bottomOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx, cy - 10.5f, 1.00f, 0.46f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 17, 0, false, 190, 5, 4, ccColor3B{ 0, 0, 0 }, false);
-                }
+                worldX = bestGX * 30.f + (worldX - cellGX * 30.f);
+                worldY = bestGY * 30.f + (worldY - cellGY * 30.f);
             }
+
+            GeneratedObjectSpec cs;
+            cs.objectId               = resolveAIElementObjectID(el, cat, true);
+            cs.x                      = worldX;
+            cs.y                      = worldY;
+            cs.scaleX                 = std::clamp(el.scaleX, 0.005f, 12.0f);
+            cs.scaleY                 = std::clamp(el.scaleY, 0.005f, 12.0f);
+            // Сохраняем точный угол поворота от ИИ (0..360), чтобы ИИ мог строить наклонные ветки, кристаллы, звезды, крыши и любой арт!
+            cs.rotation               = el.rot;
+            cs.layerRole              = LayerRole::InnerDetail;
+            cs.editorLayerOffset      = std::clamp(el.editorLayerOff, 2, 5);
+            cs.zLayerCode             = (std::max)(3, el.zLayerCode);
+            cs.zOrder                 = (std::max)(18, el.zOrder);
+            cs.colorSlot              = ColorSlot::CustomRGB;
+            cs.customColor            = el.color;
+            cs.customOpacity          = el.opacity;
+            cs.customBlending         = el.blending || (ai.wantNeon && (el.color.r > 140 || el.color.g > 140 || el.color.b > 140));
+            cs.hasSeparateDetailColor = el.hasDetailColor;
+            cs.detailColor            = el.detailColor;
+            cs.detailOpacity          = el.detailOpacity;
+            cs.detailBlending         = el.detailBlending;
+            cs.priorityTier           = 0;
+            cs.isOverhang             = isIntentionalOverhang;
+            cs.noTouch                = !isSpikeObjectID(cs.objectId);
+            cs.noGlow                 = true;
+            result.push_back(cs);
         }
     }
 
-    // 7. Размещаем кастомные кубики 211 от ИИ — СТРОГО выровненные по сетке (rot кратно 90 градусам, никаких случайных наклонных текстур!)
-    for (auto const& el : ai.customElements) {
-        float worldX = originX + el.rx * spanW;
-        float worldY = originY + el.ry * spanH;
-        int cellGX = static_cast<int>(std::floor(worldX / 30.f));
-        int cellGY = static_cast<int>(std::floor(worldY / 30.f));
-
-        // Если точка попала в узкий зазор между партами (не внутри занятой клетки) — пропускаем ее, чтобы пустота между партами оставалась чистой!
-        if (contour.occupiedCells.count({ cellGX, cellGY }) == 0) {
-            continue;
-        }
-
-        int resolvedId = resolveAIElementObjectID(el, cat, true);
-        GLubyte finalOp = el.opacity;
-        bool finalBlend = el.blending;
-        if (resolvedId == cat.idGlowEdgeSmall || resolvedId == cat.idGlowBeam) {
-            finalOp = static_cast<GLubyte>(std::clamp(static_cast<int>(el.opacity), 153, 204));
-            if (el.color.r > 20 || el.color.g > 20 || el.color.b > 20) {
-                finalBlend = true;
-            }
-        }
-
-        // Выравниваем угол кратно 90 градусам (0, 90, 180, 270), чтобы не было кривых наклонных объектов!
-        float snappedRot = std::round(el.rot / 90.0f) * 90.0f;
-
-        GeneratedObjectSpec cs;
-        cs.objectId               = resolvedId;
-        cs.x                      = worldX;
-        cs.y                      = worldY;
-        cs.scaleX                 = std::clamp(el.scaleX, 0.005f, 0.95f);
-        cs.scaleY                 = std::clamp(el.scaleY, 0.005f, 0.95f);
-        cs.rotation               = snappedRot;
-        cs.layerRole              = LayerRole::InnerDetail;
-        cs.editorLayerOffset      = std::clamp(el.editorLayerOff, 0, 5);
-        cs.zLayerCode             = el.zLayerCode;
-        cs.zOrder                 = el.zOrder;
-        cs.colorSlot              = ColorSlot::CustomRGB;
-        cs.customColor            = el.color;
-        cs.customOpacity          = finalOp;
-        cs.customBlending         = finalBlend;
-        cs.hasSeparateDetailColor = el.hasDetailColor;
-        cs.detailColor            = el.detailColor;
-        cs.detailOpacity          = el.detailOpacity;
-        cs.detailBlending         = el.detailBlending;
-        cs.priorityTier           = 0;
-        cs.noTouch                = true;
-        cs.noGlow                 = true;
-        result.push_back(cs);
-    }
-
-    // 8. ДЕКОРИРОВАНИЕ ВЫДЕЛЕННЫХ ШИПОВ (ровные пирамидальные грани + односторонний Glow)
-    {
-        std::vector<SelectedSpikeInfo> spikesToDecorate = contour.spikes;
-        std::string lowerPrompt = g_lastBuildPrompt;
-        for (char& c : lowerPrompt) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        bool promptMentionsSpikes = (lowerPrompt.find("ship") != std::string::npos ||
-                                     lowerPrompt.find("spike") != std::string::npos);
-
-        if (spikesToDecorate.empty() && promptMentionsSpikes && allowOverhang) {
-            for (auto const& [gx, gy] : contour.occupiedCells) {
-                if (contour.occupiedCells.count({ gx, gy + 1 }) == 0) {
-                    if (((gx + gy + g_variantIndex) % 2) == 0) {
-                        SelectedSpikeInfo autoSp;
-                        autoSp.x = gx * 30.f + 15.f;
-                        autoSp.y = (gy + 1) * 30.f + 15.f;
-                        autoSp.rotation = 0.f;
-                        autoSp.scaleX = 1.0f;
-                        autoSp.scaleY = 1.0f;
-                        autoSp.objectId = 8;
-                        spikesToDecorate.push_back(autoSp);
-                    }
-                }
-            }
-        }
-
-        for (auto const& sp : spikesToDecorate) {
-            appendSingleRealisticOrGlowSpike(
-                result, sp, cat, ai,
-                originX, originY, spanW, spanH, styleSeed
-            );
-        }
+    // 10. ДЕКОРИРОВАНИЕ ВЫДЕЛЕННЫХ ШИПОВ (окраска + 2-й меньший шип внутри с полной заливкой Base и Detail одного цвета!)
+    for (auto const& sp : contour.spikes) {
+        appendCleanSpikeDecoration(result, sp, ai);
     }
 
     std::stable_sort(result.begin(), result.end(), [](GeneratedObjectSpec const& a, GeneratedObjectSpec const& b) {
@@ -3238,6 +3438,8 @@ struct SpawnSummary {
     int firstLayer = 1;
 };
 
+static AIDecisionResult g_lastAIDecisionForEditor;
+
 static SpawnSummary placeGeneratedArtInEditor(
     EditorUI* ui,
     ContourAnalysis const& contour,
@@ -3253,12 +3455,72 @@ static SpawnSummary placeGeneratedArtInEditor(
     auto* editorLayer = ui->m_editorLayer;
     summary.firstLayer = findFirstFreeEditorLayerBlock(editorLayer, 6);
 
+    // 1. ПРЯМЫЕ ОПЕРАЦИИ ИИ С ВЫДЕЛЕННЫМИ ОБЪЕКТАМИ В РЕДАКТОРЕ (удаление, сдвиг, поворот, масштаб, дублирование, покраска!)
+    if (g_lastAIDecisionForEditor.directDeleteSelected) {
+        for (GameObject* baseObj : contour.solidObjects) {
+            if (!baseObj) continue;
+            writeObjScale(baseObj, 0.f, 0.f);
+            baseObj->setPosition(CCPoint{ -99999.f, -99999.f });
+            baseObj->setOpacity(0);
+        }
+        for (auto const& sp : contour.spikes) {
+            if (!sp.sourceObj) continue;
+            writeObjScale(sp.sourceObj, 0.f, 0.f);
+            sp.sourceObj->setPosition(CCPoint{ -99999.f, -99999.f });
+            sp.sourceObj->setOpacity(0);
+        }
+        return summary;
+    }
+
+    bool hasMoveOrRotOrScale = (std::fabs(g_lastAIDecisionForEditor.directMoveX) > 0.01f ||
+                                std::fabs(g_lastAIDecisionForEditor.directMoveY) > 0.01f ||
+                                std::fabs(g_lastAIDecisionForEditor.directRotateDeg) > 0.01f ||
+                                std::fabs(g_lastAIDecisionForEditor.directScaleMulX - 1.0f) > 0.01f ||
+                                std::fabs(g_lastAIDecisionForEditor.directScaleMulY - 1.0f) > 0.01f);
+
+    if (hasMoveOrRotOrScale) {
+        for (GameObject* baseObj : contour.solidObjects) {
+            if (!baseObj) continue;
+            CCPoint p = baseObj->getPosition();
+            baseObj->setPosition(CCPoint{ p.x + g_lastAIDecisionForEditor.directMoveX, p.y + g_lastAIDecisionForEditor.directMoveY });
+            baseObj->setRotation(baseObj->getRotation() + g_lastAIDecisionForEditor.directRotateDeg);
+            writeObjScale(baseObj, baseObj->getScaleX() * g_lastAIDecisionForEditor.directScaleMulX, baseObj->getScaleY() * g_lastAIDecisionForEditor.directScaleMulY);
+        }
+        for (auto const& sp : contour.spikes) {
+            if (!sp.sourceObj) continue;
+            CCPoint p = sp.sourceObj->getPosition();
+            sp.sourceObj->setPosition(CCPoint{ p.x + g_lastAIDecisionForEditor.directMoveX, p.y + g_lastAIDecisionForEditor.directMoveY });
+            sp.sourceObj->setRotation(sp.sourceObj->getRotation() + g_lastAIDecisionForEditor.directRotateDeg);
+            writeObjScale(sp.sourceObj, sp.sourceObj->getScaleX() * g_lastAIDecisionForEditor.directScaleMulX, sp.sourceObj->getScaleY() * g_lastAIDecisionForEditor.directScaleMulY);
+        }
+    }
+
+    if (g_lastAIDecisionForEditor.directDuplicateCount > 0) {
+        for (int d = 1; d <= g_lastAIDecisionForEditor.directDuplicateCount; ++d) {
+            float dx = g_lastAIDecisionForEditor.directDuplicateStepX * d;
+            float dy = g_lastAIDecisionForEditor.directDuplicateStepY * d;
+            for (GameObject* baseObj : contour.solidObjects) {
+                if (!baseObj) continue;
+                int id = readObjID(baseObj);
+                CCPoint p = baseObj->getPosition();
+                if (GameObject* dup = editorLayer->createObject(id > 0 ? id : 211, CCPoint{ p.x + dx, p.y + dy }, false)) {
+                    dup->setRotation(baseObj->getRotation());
+                    writeObjScale(dup, baseObj->getScaleX(), baseObj->getScaleY());
+                    bindObjectToColor(dup, palette, ColorSlot::BrightMain, g_lastAIDecisionForEditor.mainRGB);
+                    g_lastPlacedObjects.push_back(dup);
+                    summary.createdCount++;
+                }
+            }
+        }
+    }
+
     if (taskMode == AITaskMode::FullDecor || taskMode == AITaskMode::OnlyFill || taskMode == AITaskMode::OnlyNeon) {
+        ColorSlot blockSlot = g_lastAIDecisionForEditor.directRecolorOnly ? ColorSlot::BrightMain : ColorSlot::DarkFill;
         for (GameObject* baseObj : contour.solidObjects) {
             if (!baseObj) continue;
             writeObjEditorLayers(baseObj, summary.firstLayer, 0);
             writeObjFlags(baseObj, 0, -3, false, true);
-            bindObjectToColor(baseObj, palette, ColorSlot::DarkFill, ccColor3B{ 0, 0, 0 });
+            bindObjectToColor(baseObj, palette, blockSlot, g_lastAIDecisionForEditor.mainRGB);
         }
         for (auto const& sp : contour.spikes) {
             if (!sp.sourceObj) continue;
@@ -3324,7 +3586,7 @@ static constexpr RusKeyEntry kRusKeyTable[] = {
     { 'P', "z",   'p', 'P' }, { 0xDB, "h",  '[', '{' }, { 0xDD, "",   ']', '}' },
     { 'A', "f",   'a', 'A' }, { 'S', "y",   's', 'S' }, { 'D', "v",   'd', 'D' },
     { 'F', "a",   'f', 'F' }, { 'G', "p",   'g', 'G' }, { 'H', "r",   'h', 'H' },
-    { 'J', "o",   'j', 'J' }, { 'K', "l",   'k', 'K' }, { 'L', "d",   'd', 'D' },
+    { 'J', "o",   'j', 'J' }, { 'K', "l",   'k', 'K' }, { 'L', "d",   'l', 'L' },
     { 0xBA, "zh", ';', ':' }, { 0xDE, "e",  '\'', '"' },
     { 'Z', "ya",  'z', 'Z' }, { 'X', "ch",  'x', 'X' }, { 'C', "s",   'c', 'C' },
     { 'V', "m",   'v', 'V' }, { 'B', "i",   'b', 'B' }, { 'N', "t",   'n', 'N' },
@@ -4341,7 +4603,8 @@ protected:
                     int px = centerPx + dx;
                     if (px < 0 || px >= texW) continue;
                     size_t idx = static_cast<size_t>((py * texW + px) * 4);
-                    if (rgba[idx + 3] == 0) continue; // не выходим за силуэт структуры!
+                    if (rgba[idx + 3] == 0 && !s.isOverhang) continue;
+                    rgba[idx + 3] = 255;
                     rgba[idx + 0] = static_cast<uint8_t>(std::clamp(static_cast<int>(rgba[idx + 0] * (1.f - alpha) + col.r * alpha), 0, 255));
                     rgba[idx + 1] = static_cast<uint8_t>(std::clamp(static_cast<int>(rgba[idx + 1] * (1.f - alpha) + col.g * alpha), 0, 255));
                     rgba[idx + 2] = static_cast<uint8_t>(std::clamp(static_cast<int>(rgba[idx + 2] * (1.f - alpha) + col.b * alpha), 0, 255));
@@ -4810,13 +5073,11 @@ protected:
             return;
         }
 
-        // Если игрок написал "переделай / нет / заново" — усиливаем запрос на переделку!
-        if (g_hasPendingDrawingApproval && !promptText.empty() && isUserRedoMessage(promptText)) {
+        // Если игрок написал короткое "переделай / нет / заново" без нового описания — переделываем прошлый запрос,
+        // а если написал новый стиль (например "сделай стиль неон") — выполняем ТОЛЬКО новый запрос без примешивания старого!
+        if (g_hasPendingDrawingApproval && !promptText.empty() && isUserRedoMessage(promptText) && promptText.size() <= 14) {
             g_variantIndex++;
-            promptText = fmt::format(
-                "User rejected previous Drawing ({}). Redo and improve the pixel-by-pixel art from scratch (Variant #{}): {}",
-                promptText, g_variantIndex, g_lastBuildPrompt.empty() ? "make a better design" : g_lastBuildPrompt
-            );
+            promptText = g_lastBuildPrompt.empty() ? "make a better design" : g_lastBuildPrompt;
         }
         if (promptText.empty()) {
             if (g_hasReferenceImage) {
@@ -4925,6 +5186,7 @@ protected:
 
         // ИИ СНАЧАЛА показывает готовую попиксельную работу во вкладке Drawing (БЕЗ спавна в уровень!),
         // чтобы игрок сам оценил результат и либо согласился (Keep / In GD / 'da'), либо сказал переделать!
+        g_lastAIDecisionForEditor = ai;
         g_lastPreviewSpecs = specs;
         g_lastPreviewPalette = palette;
         g_lastPreviewTaskMode = ai.taskMode;
