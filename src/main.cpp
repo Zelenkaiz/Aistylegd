@@ -173,7 +173,7 @@ struct AIDecisionResult {
     ccColor3B glowRGB{ 110, 190, 255 };
     ccColor3B gradTopRGB{ 75, 115, 185 };
     ccColor3B gradBotRGB{ 18, 22, 34 };
-    bool hasGradient = true;
+    bool hasGradient = false;
     bool wantNeon = true;
     int suggestedCount = 140;
     std::vector<AICustomDrawElement> customElements;
@@ -1480,7 +1480,7 @@ static bool executeSingleNeuralNetPass(
         bool c7 = extractJsonRGBArray(innerJson, "grad_bot",    outRes.gradBotRGB);
         if (!c6) outRes.gradTopRGB = outRes.mainRGB;
         if (!c7) outRes.gradBotRGB = outRes.fillRGB;
-        outRes.hasGradient = true;
+        outRes.hasGradient = extractJsonBoolField(innerJson, "want_gradient", false);
         outRes.hasCustomPalette = (c1 || c2 || c3 || c4 || c5 || c6 || c7);
 
         outRes.wantNeon       = extractJsonBoolField(innerJson, "want_neon", true);
@@ -1535,11 +1535,13 @@ static AIDecisionResult queryRealNeuralNetwork(
         "1. Always communicate in the user's language (if Russian, write in Russian translit with Latin letters so GD bitmap font shows every character). "
         "2. NO PREMADE 3D BLOCKS OR TEMPLATES: Never use premade 3D blocks unless explicitly asked 'only_3d'. Build 100% custom art from scratch by choosing Editor object IDs, colors, opacities (15..255), blending, and layers (including internal sub-layers inside blocks!). "
         "3. ONE STRUCTURE FROM REFERENCE + FINE TEXTURES: When a reference image is provided, look closely at the small/fine micro-textures inside the structures, choose ONE single structure from the reference (NEVER mix multiple structures from the reference together!), and build the entire part strictly in that ONE structure's style and micro-textures. "
-        "4. PIXEL-BY-PIXEL DETAILING (NO 0.5 SCALE LIMIT!): You MUST work pixel-by-pixel! Scales sx and sy go all the way down to 0.01 (e.g. 0.02, 0.04, 0.07, 0.12, 0.18, 0.28). Actively place tiny pixel elements (sx/sy 0.02..0.32) for cracks, bevels, gradients, micro-shading, highlights, and fine textures — never limit yourself to >= 0.5! "
-        "5. NEVER REPEAT PAST STYLES: Previously generated styles: [{}]. When no reference is given, invent a completely NEW theme and pixel composition every time. "
-        "6. LAYERS & COLORS: Control Base Color (r,g,b,op,blend) and Detail Color (dr,dg,db,dop,dblend), Editor Layer offset 'el' (0=base fill, 1=deep inner block, 2=mid inner micro-texture, 3=upper detail, 4=crisp pixel highlight, 5=top glow), Z-Layer 'zl' (-3=B4, -1=B3, 1=B2, 3=B1, 5=T1, 7=T2, 9=T3), and 'z' (-15..45). "
-        "7. REAL GD OBJECT IDs for \"id\": 211 (pixel/square/stripe), 1888 (soft glow), {} (dot), {} (ring), {} (triangle), {} (thin line), {} (arc), {} (parallel lines), {} (diag shine), {} (chevron), {} (cross), {} (corner), {} (arch), {} (brick), 406/407/408 (foliage). "
-        "8. Contour: {} blocks ({}x{} units). Limit: {}. Mode: {}. Variant #{}. {} "
+        "4. PIXEL-BY-PIXEL DETAILING (NO 0.5 SCALE LIMIT!): Work pixel-by-pixel! Scales sx and sy go all the way down to 0.01 (0.02..0.32) for fine micro-textures, bevels, cracks, and pixel art. Stay STRICTLY inside the selected contour cells! "
+        "5. GRADIENT ONLY WHEN REQUESTED: Set \"want_gradient\": true ONLY if the user explicitly asks for a gradient (otherwise set \"want_gradient\": false). "
+        "6. NEON RULES: Use round glow (1888) ONLY as a large, low-opacity (25..55), additive-blended ambient backlight on low Z-layers (zl=-3,-1,1 / B4,B3,B2). Use one-sided directional glow ({}) as an outline along top/left/right edges with blending=true, and use DARK/BLACK one-sided glow (0,0,0, blend=false) for the bottom edge! "
+        "7. NEVER REPEAT PAST STYLES: Previously generated styles: [{}]. When no reference is given, invent a completely NEW theme and pixel composition every time. "
+        "8. LAYERS & COLORS: Base Color (r,g,b,op,blend), Detail Color (dr,dg,db,dop,dblend), Editor Layer 'el' (0..5), Z-Layer 'zl' (-3=B4, -1=B3, 1=B2, 3=B1, 5=T1, 7=T2, 9=T3), 'z' (-15..45). "
+        "9. REAL GD OBJECT IDs: 211 (pixel/square), 1888 (round ambient glow), {} (one-sided edge glow), {} (dot), {} (ring), {} (triangle), {} (thin line), {} (arc), {} (parallel lines), {} (diag shine), {} (chevron), {} (cross), {} (corner), {} (arch), {} (brick), 406/407/408 (foliage). "
+        "10. Contour: {} blocks ({}x{} units). Limit: {}. Mode: {}. Variant #{}. {} "
         "Respond ONLY with a single valid JSON object (no markdown fences): "
         "{{"
         "\"action\": \"chat\" | \"build\" | \"only_3d\" | \"only_neon\" | \"only_fill\" | \"undo\", "
@@ -1548,13 +1550,14 @@ static AIDecisionResult queryRealNeuralNetwork(
         "\"plan\": \"short summary of the chosen structure, micro-textures, layers, and pixel scales\", "
         "\"match_score\": 0..100, "
         "\"critique\": \"honest self-evaluation of micro-textures and pixel accuracy\", "
-        "\"fill_rgb\": [r,g,b], \"mid_rgb\": [r,g,b], \"main_rgb\": [r,g,b], \"outline_rgb\": [r,g,b], \"glow_rgb\": [r,g,b], "
-        "\"want_neon\": true/false, \"count\": 80..600, "
+        "\"fill_rgb\": [r,g,b], \"mid_rgb\": [r,g,b], \"main_rgb\": [r,g,b], \"outline_rgb\": [r,g,b], \"glow_rgb\": [r,g,b], \"grad_top\": [r,g,b], \"grad_bot\": [r,g,b], "
+        "\"want_gradient\": false, \"want_neon\": true/false, \"count\": 80..600, "
         "\"elements\": [{{\"id\":211,\"rx\":0.0..1.0,\"ry\":0.0..1.0,\"sx\":0.01..1.6,\"sy\":0.01..1.6,\"rot\":0..360,\"r\":0..255,\"g\":0..255,\"b\":0..255,\"op\":15..255,\"blend\":false,\"dr\":0..255,\"dg\":0..255,\"db\":0..255,\"dop\":15..255,\"dblend\":false,\"el\":0..5,\"zl\":-3..9,\"z\":-15..45}}]"
         "}}. "
         "IMPORTANT: When \"action\" is \"build\", output 36 to 75 pixel-by-pixel \"elements\" with many fine micro-elements (sx/sy 0.02..0.30) across internal block layers (el=0..5, zl=-3..9) so the micro-textures look crisp and authentic.",
+        cat.idGlowEdgeSmall,
         forbiddenThemes,
-        cat.idCircleDot, cat.idCircleRing, cat.idSmallTriangle, cat.idThinLineLong,
+        cat.idGlowEdgeSmall, cat.idCircleDot, cat.idCircleRing, cat.idSmallTriangle, cat.idThinLineLong,
         cat.idArcThin, cat.idParallelLines, cat.idDiagShine1, cat.idChevron,
         cat.idSmallCross, cat.idBracketCorner, cat.idBracketArch, cat.idBrickBlock,
         contour.cellCount(),
@@ -2052,47 +2055,52 @@ static std::vector<IslandBounds> splitIntoIslands(std::set<std::pair<int, int>> 
     return islands;
 }
 
+// Заливаем ТОЛЬКО полностью замкнутые внутренние полости внутри сложной структуры (flood-fill снаружи),
+// чтобы сложные П-образные, ступенчатые и невыпуклые формы НИКОГДА не выходили за свои реальные пределы!
 static void fillAllStructureInteriorsCompletely(std::set<std::pair<int, int>>& occupied) {
-    if (occupied.size() < 3) return;
+    if (occupied.size() < 8) return;
 
     auto islands = splitIntoIslands(occupied);
     for (auto const& isl : islands) {
-        if (isl.cells.size() < 3) continue;
+        if (isl.cells.size() < 8) continue;
+        int w = isl.maxGX - isl.minGX + 1;
+        int h = isl.maxGY - isl.minGY + 1;
+        if (w <= 2 || h <= 2 || w > 40 || h > 40) continue;
 
-        std::set<std::pair<int, int>> filled = isl.cells;
+        int padMinX = isl.minGX - 1;
+        int padMaxX = isl.maxGX + 1;
+        int padMinY = isl.minGY - 1;
+        int padMaxY = isl.maxGY + 1;
+
+        std::set<std::pair<int, int>> outsideVisited;
+        std::queue<std::pair<int, int>> q;
+        std::pair<int, int> start{ padMinX, padMinY };
+        outsideVisited.insert(start);
+        q.push(start);
+
+        while (!q.empty()) {
+            auto [cx, cy] = q.front();
+            q.pop();
+            const int dx[4] = { 1, -1, 0, 0 };
+            const int dy[4] = { 0, 0, 1, -1 };
+            for (int k = 0; k < 4; ++k) {
+                int nx = cx + dx[k];
+                int ny = cy + dy[k];
+                if (nx < padMinX || nx > padMaxX || ny < padMinY || ny > padMaxY) continue;
+                std::pair<int, int> np{ nx, ny };
+                if (isl.cells.count(np) > 0 || outsideVisited.count(np) > 0) continue;
+                outsideVisited.insert(np);
+                q.push(np);
+            }
+        }
 
         for (int gy = isl.minGY; gy <= isl.maxGY; ++gy) {
-            int leftX = 999999;
-            int rightX = -999999;
-            for (auto const& [x, y] : isl.cells) {
-                if (y == gy) {
-                    leftX  = (std::min)(leftX, x);
-                    rightX = (std::max)(rightX, x);
-                }
-            }
-            if (leftX < rightX && (rightX - leftX) <= 24) {
-                for (int gx = leftX; gx <= rightX; ++gx) {
-                    filled.insert({ gx, gy });
-                }
-            }
-        }
-
-        if (isl.minGY <= 2 && (isl.maxGX - isl.minGX) <= 20 && (isl.maxGY - isl.minGY) <= 20) {
             for (int gx = isl.minGX; gx <= isl.maxGX; ++gx) {
-                int topY = -999999;
-                for (auto const& [x, y] : filled) {
-                    if (x == gx) topY = (std::max)(topY, y);
-                }
-                if (topY >= isl.minGY) {
-                    for (int gy = isl.minGY; gy <= topY; ++gy) {
-                        filled.insert({ gx, gy });
-                    }
+                std::pair<int, int> cell{ gx, gy };
+                if (isl.cells.count(cell) == 0 && outsideVisited.count(cell) == 0) {
+                    occupied.insert(cell);
                 }
             }
-        }
-
-        for (auto const& c : filled) {
-            occupied.insert(c);
         }
     }
 }
@@ -2410,13 +2418,26 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
     float originX = contour.minGX * 30.f;
     float originY = contour.minGY * 30.f;
 
-    // 1. ЕДИНАЯ СТИЛИСТИКА ДЛЯ ВСЕХ БЛОКОВ СТРУКТУРЫ + НАСТОЯЩИЙ ПЛАВНЫЙ ГРАДИЕНТ:
-    //    - Никаких случайных объектов (кружков/треугольников/дуг), если ИИ сам их не выбрал!
-    //    - Каждый блок в структуре сохраняет одинаковый стиль, единый наклон и единые слои.
-    //    - Внутри каждого блока рисуется 4-ступенчатый плавный вертикальный градиент (grad_top -> grad_bot)
-    //      плюс мягкий световой градиент 1888 для гладкого перехода цветов!
+    // 1. ЕДИНАЯ СТИЛИСТИКА ДЛЯ ВСЕХ БЛОКОВ СТРУКТУРЫ:
+    //    - Градиент добавляется ТОЛЬКО если пользователь попросил его (ai.hasGradient == true)!
+    //    - Круглый неон (1888) ставится ОДИН раз как большое заднее свечение структуры на низком слое (B3 = -1) с низкой прозрачностью!
+    //    - Односторонний неон (idGlowEdgeSmall) служит обводкой с blending=true (сверху/слева/справа) и темным черным неоном снизу!
     (void)rng;
     for (auto const& isl : islands) {
+        if (ai.wantNeon && !isl.cells.empty()) {
+            float islCenterX = ((isl.minGX + isl.maxGX + 1) * 0.5f) * 30.f;
+            float islCenterY = ((isl.minGY + isl.maxGY + 1) * 0.5f) * 30.f;
+            float islW = static_cast<float>(isl.maxGX - isl.minGX + 1);
+            float islH = static_cast<float>(isl.maxGY - isl.minGY + 1);
+            float bigGlowSX = std::clamp(islW * 0.85f, 1.4f, 6.5f);
+            float bigGlowSY = std::clamp(islH * 0.85f, 1.4f, 6.5f);
+            addSpec(
+                result, 1888, islCenterX, islCenterY, bigGlowSX, bigGlowSY, 0.f,
+                LayerRole::Fill, ColorSlot::CustomRGB, 0, 1, false,
+                38, -1, 0, ai.glowRGB, true
+            );
+        }
+
         for (auto const& [gx, gy] : isl.cells) {
             float cx = gx * 30.f + 15.f;
             float cy = gy * 30.f + 15.f;
@@ -2426,77 +2447,64 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
             bool leftOpen   = (contour.occupiedCells.count({ gx - 1, gy }) == 0);
             bool rightOpen  = (contour.occupiedCells.count({ gx + 1, gy }) == 0);
 
-            // Глобальная координата по высоте структуры для плавного общего градиента (0 = низ, 1 = верх)
-            float normYBottom = std::clamp(((cy - 15.f) - originY) / spanH, 0.0f, 1.0f);
-            float normYTop    = std::clamp(((cy + 15.f) - originY) / spanH, 0.0f, 1.0f);
-
-            // Слой 0 (Внутреннее дно блока, Z-Layer B4 = -3, EditorLayer +0)
-            ccColor3B baseCol = lerpColor(ai.gradBotRGB, ai.gradTopRGB, (normYBottom + normYTop) * 0.5f);
-            addSpec(
-                result, 211, cx, cy, 1.00f, 1.00f, 0.f,
-                LayerRole::Fill, ColorSlot::CustomRGB, 1, 0, false,
-                255, -3, 0, baseCol, false
-            );
-
-            // Слой 1 (Плавный 4-ступенчатый цветовой градиент внутри блока, Z-Layer B3 = -1, EditorLayer +1)
-            for (int band = 0; band < 4; ++band) {
-                float bandFrac = (band + 0.5f) / 4.0f;
-                float bandY = (cy - 15.f) + bandFrac * 30.f;
-                float globalT = std::clamp((bandY - originY) / spanH, 0.0f, 1.0f);
-                ccColor3B bandCol = lerpColor(ai.gradBotRGB, ai.gradTopRGB, globalT);
+            if (ai.hasGradient) {
+                float normYMid = std::clamp((cy - originY) / spanH, 0.0f, 1.0f);
+                ccColor3B baseCol = lerpColor(ai.gradBotRGB, ai.gradTopRGB, normYMid);
                 addSpec(
-                    result, 211, cx, bandY, 1.00f, 0.27f, 0.f,
-                    LayerRole::InnerDetail, ColorSlot::CustomRGB, 2 + band, 0, false,
-                    220, -1, 1, bandCol, false
+                    result, 211, cx, cy, 1.00f, 1.00f, 0.f,
+                    LayerRole::Fill, ColorSlot::CustomRGB, 1, 0, false,
+                    255, -3, 0, baseCol, false
+                );
+                for (int band = 0; band < 4; ++band) {
+                    float bandFrac = (band + 0.5f) / 4.0f;
+                    float bandY = (cy - 15.f) + bandFrac * 30.f;
+                    float globalT = std::clamp((bandY - originY) / spanH, 0.0f, 1.0f);
+                    ccColor3B bandCol = lerpColor(ai.gradBotRGB, ai.gradTopRGB, globalT);
+                    addSpec(
+                        result, 211, cx, bandY, 1.00f, 0.27f, 0.f,
+                        LayerRole::InnerDetail, ColorSlot::CustomRGB, 2 + band, 0, false,
+                        220, -1, 1, bandCol, false
+                    );
+                }
+            } else {
+                addSpec(
+                    result, 211, cx, cy, 1.00f, 1.00f, 0.f,
+                    LayerRole::Fill, ColorSlot::CustomRGB, 1, 0, false,
+                    255, -3, 0, ai.fillRGB, false
                 );
             }
 
-            // Мягкий градиентный световой переход (объект 1888) внутри верхнего/нижнего края структуры
-            if (topOpen) {
-                addSpec(
-                    result, 1888, cx, cy + 7.5f, 0.95f, 0.45f, 180.f,
-                    LayerRole::InnerDetail, ColorSlot::CustomRGB, 7, 1, false,
-                    110, 1, 2, ai.gradTopRGB, true
-                );
-            }
-            if (bottomOpen) {
-                addSpec(
-                    result, 1888, cx, cy - 7.5f, 0.95f, 0.45f, 0.f,
-                    LayerRole::InnerDetail, ColorSlot::CustomRGB, 7, 1, false,
-                    95, 1, 2, ai.gradBotRGB, false
-                );
-            }
+            if (topOpen)    addSpec(result, 211, cx, cy + 14.3f, 1.00f, 0.055f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 240, 3, 3, ai.outlineRGB, false);
+            if (leftOpen)   addSpec(result, 211, cx - 14.3f, cy, 0.055f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 220, 3, 3, ai.outlineRGB, false);
+            if (rightOpen)  addSpec(result, 211, cx + 14.3f, cy, 0.055f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 220, 3, 3, ai.outlineRGB, false);
+            if (bottomOpen && gy > 0) addSpec(result, 211, cx, cy - 14.3f, 1.00f, 0.055f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 200, 3, 3, ai.outlineRGB, false);
 
-            // Единый аккуратный контур границы всей структуры (Z-Layer B1 = 3, EditorLayer +3)
-            if (topOpen)    addSpec(result, 211, cx, cy + 14.3f, 1.02f, 0.055f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 240, 3, 3, ai.outlineRGB, false);
-            if (leftOpen)   addSpec(result, 211, cx - 14.3f, cy, 0.055f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 220, 3, 3, ai.outlineRGB, false);
-            if (rightOpen)  addSpec(result, 211, cx + 14.3f, cy, 0.055f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 220, 3, 3, ai.outlineRGB, false);
-            if (bottomOpen && gy > 0) addSpec(result, 211, cx, cy - 14.3f, 1.02f, 0.055f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 200, 3, 3, ai.outlineRGB, false);
-
-            // Аккуратное свечение по внешнему краю (Z-Layer T2 = 7, EditorLayer +5)
             if (ai.wantNeon) {
                 if (topOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx, cy + 11.0f, 0.85f, 0.40f, 180.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 1, false, 85, 7, 5, ai.glowRGB, true);
+                    addSpec(result, cat.idGlowEdgeSmall, cx, cy + 10.5f, 0.96f, 0.42f, 180.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 1, false, 115, 5, 4, ai.glowRGB, true);
                 }
                 if (leftOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx - 11.0f, cy, 0.85f, 0.36f, 90.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 1, false, 75, 7, 5, ai.glowRGB, true);
+                    addSpec(result, cat.idGlowEdgeSmall, cx - 10.5f, cy, 0.96f, 0.40f, 90.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 1, false, 105, 5, 4, ai.glowRGB, true);
                 }
                 if (rightOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx + 11.0f, cy, 0.85f, 0.36f, 270.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 1, false, 75, 7, 5, ai.glowRGB, true);
+                    addSpec(result, cat.idGlowEdgeSmall, cx + 10.5f, cy, 0.96f, 0.40f, 270.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 1, false, 105, 5, 4, ai.glowRGB, true);
+                }
+                if (bottomOpen) {
+                    // Темный черный односторонний неон для нижней грани структуры
+                    addSpec(result, cat.idGlowEdgeSmall, cx, cy - 10.5f, 0.96f, 0.44f, 0.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 17, 1, false, 195, 5, 4, ccColor3B{ 0, 0, 0 }, false);
                 }
             }
         }
     }
 
-    // 2. Размещаем все объекты, которые ИИ сам выбрал из редактора (со своими ID, цветами, прозрачностью, блендингом и слоями!)
+    // 2. Размещаем объекты, которые ИИ выбрал сам — СТРОГО В ПРЕДЕЛАХ выделенных клеток сложной структуры!
     for (auto const& el : ai.customElements) {
         float worldX = originX + el.rx * spanW;
         float worldY = originY + el.ry * spanH;
         int cellGX = static_cast<int>(std::floor(worldX / 30.f));
         int cellGY = static_cast<int>(std::floor(worldY / 30.f));
 
-        // Если клетка вне выделенного контура, а Overhang выключен — мягко притягиваем к ближайшей клетке внутри контура
-        if (contour.occupiedCells.count({ cellGX, cellGY }) == 0 && !allowOverhang && !contour.occupiedCells.empty()) {
+        if (contour.occupiedCells.count({ cellGX, cellGY }) == 0 && !contour.occupiedCells.empty()) {
             float bestDistSq = 1e18f;
             std::pair<int, int> bestCell = *contour.occupiedCells.begin();
             for (auto const& c : contour.occupiedCells) {
@@ -2508,33 +2516,35 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                     bestCell = c;
                 }
             }
-            worldX = bestCell.first * 30.f + 15.f + std::clamp(worldX - (bestCell.first * 30.f + 15.f), -11.f, 11.f);
-            worldY = bestCell.second * 30.f + 15.f + std::clamp(worldY - (bestCell.second * 30.f + 15.f), -11.f, 11.f);
+            float ccx = bestCell.first * 30.f + 15.f;
+            float ccy = bestCell.second * 30.f + 15.f;
+            float margin = allowOverhang ? 13.5f : 10.5f;
+            worldX = ccx + std::clamp(worldX - ccx, -margin, margin);
+            worldY = ccy + std::clamp(worldY - ccy, -margin, margin);
         }
 
-        ccColor3B finalBaseCol = el.color;
+        float maxElemScale = (el.directObjectId == 1888) ? 2.50f : 0.92f;
 
         GeneratedObjectSpec cs;
         cs.objectId               = resolveAIElementObjectID(el, cat, true /* строго без 3D-блоков! */);
-        cs.x                      = std::clamp(worldX, originX - (allowOverhang ? 14.f : -2.f), originX + spanW + (allowOverhang ? 14.f : -2.f));
-        cs.y                      = std::clamp(worldY, originY - (allowOverhang ? 14.f : -2.f), originY + spanH + (allowOverhang ? 14.f : -2.f));
-        // Попиксельная свобода масштаба: от 0.01 (тончайший пиксель!) до 2.50 — ограничение 0.5 полностью снято
-        cs.scaleX                 = std::clamp(el.scaleX, 0.01f, 2.50f);
-        cs.scaleY                 = std::clamp(el.scaleY, 0.01f, 2.50f);
+        cs.x                      = worldX;
+        cs.y                      = worldY;
+        cs.scaleX                 = std::clamp(el.scaleX, 0.01f, maxElemScale);
+        cs.scaleY                 = std::clamp(el.scaleY, 0.01f, maxElemScale);
         cs.rotation               = el.rot;
         cs.layerRole              = LayerRole::InnerDetail;
         cs.editorLayerOffset      = std::clamp(el.editorLayerOff, 0, 5);
         cs.zLayerCode             = el.zLayerCode;
         cs.zOrder                 = el.zOrder;
         cs.colorSlot              = ColorSlot::CustomRGB;
-        cs.customColor            = finalBaseCol;
+        cs.customColor            = el.color;
         cs.customOpacity          = el.opacity;
         cs.customBlending         = el.blending;
         cs.hasSeparateDetailColor = el.hasDetailColor;
         cs.detailColor            = el.detailColor;
         cs.detailOpacity          = el.detailOpacity;
         cs.detailBlending         = el.detailBlending;
-        cs.priorityTier           = 0; // Максимальный приоритет у объектов, выбранных самим ИИ!
+        cs.priorityTier           = 0;
         cs.noTouch                = true;
         cs.noGlow                 = true;
         result.push_back(cs);
