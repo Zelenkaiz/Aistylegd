@@ -171,6 +171,9 @@ struct AIDecisionResult {
     ccColor3B mainRGB{ 165, 215, 255 };
     ccColor3B outlineRGB{ 235, 245, 255 };
     ccColor3B glowRGB{ 110, 190, 255 };
+    ccColor3B gradTopRGB{ 75, 115, 185 };
+    ccColor3B gradBotRGB{ 18, 22, 34 };
+    bool hasGradient = true;
     bool wantNeon = true;
     int suggestedCount = 140;
     std::vector<AICustomDrawElement> customElements;
@@ -744,6 +747,48 @@ static void loadAndVerifySavedApiFromDisk() {
 // ============================================================================
 // Парсер JSON-ответа от реальной ИИ-нейросети
 // ============================================================================
+static std::string extractGeminiFinalTextPart(std::string const& rawResp) {
+    // В Gemini 4 (Argon / Carbon / Hydrogen) сначала может идти блок {"thought":true,"text":"..."},
+    // а финальный JSON лежит в следующем блоке {"text":"{...}"}. Ищем последний не-thought "text"!
+    std::string bestText;
+    size_t searchPos = 0;
+    while (true) {
+        size_t pos = rawResp.find("\"text\"", searchPos);
+        if (pos == std::string::npos) break;
+        size_t colon = rawResp.find(':', pos + 6);
+        if (colon == std::string::npos) break;
+        size_t qStart = rawResp.find('\"', colon + 1);
+        if (qStart == std::string::npos) break;
+        size_t cur = qStart + 1;
+        std::string val;
+        while (cur < rawResp.size()) {
+            char c = rawResp[cur++];
+            if (c == '\\' && cur < rawResp.size()) {
+                char esc = rawResp[cur++];
+                if (esc == 'n') val.push_back(' ');
+                else if (esc == '\"') val.push_back('\"');
+                else if (esc == '\\') val.push_back('\\');
+                else val.push_back(esc);
+            } else if (c == '\"') {
+                break;
+            } else {
+                val.push_back(c);
+            }
+        }
+        // Проверяем, не помечен ли этот кусок как "thought": true рядом
+        size_t winStart = (pos > 40) ? (pos - 40) : 0;
+        std::string ctx = rawResp.substr(winStart, pos - winStart);
+        bool isThought = (ctx.find("\"thought\"") != std::string::npos && ctx.find("true") != std::string::npos);
+        if (!isThought && !val.empty()) {
+            bestText = val;
+        } else if (bestText.empty() && !val.empty()) {
+            bestText = val;
+        }
+        searchPos = cur;
+    }
+    return bestText;
+}
+
 static std::string extractJsonStringField(std::string const& json, std::string const& key) {
     std::string pattern = "\"" + key + "\"";
     size_t pos = json.find(pattern);
@@ -1063,8 +1108,8 @@ static bool tryLoadReferenceImageFromClipboard(std::string& outStatus) {
     return false;
 }
 
-// Асинхронный выбор файла в отдельном STA COM-потоке (с CoInitializeEx),
-// чтобы диалог Windows 10/11 гарантированно открывался поверх игры, не зависал и закрывался!
+// Асинхронный выбор файла через отдельный изолированный STA-процесс PowerShell OpenFileDialog:
+// гарантированно открывается поверх полноэкранного GD, не зависает и мгновенно закрывается!
 static bool g_fileDialogThreadActive = false;
 static bool g_fileDialogHasResult = false;
 static bool g_fileDialogPickedSuccess = false;
@@ -1079,76 +1124,76 @@ static void startAsyncReferenceImageDialog() {
 
 #ifdef GEODE_IS_WINDOWS
     std::thread([]() {
-        // Обязательная инициализация STA COM на фоновом потоке, иначе GetOpenFileNameA не открывается в Win10/11!
-        HMODULE hOle = LoadLibraryA("ole32.dll");
-        using FnCoInitEx = long(WINAPI*)(void*, uint32_t);
-        using FnCoUninit = void(WINAPI*)();
-        FnCoUninit pCoUninit = nullptr;
-        bool comInited = false;
-        if (hOle) {
-            auto pCoInit = reinterpret_cast<FnCoInitEx>(GetProcAddress(hOle, "CoInitializeEx"));
-            pCoUninit = reinterpret_cast<FnCoUninit>(GetProcAddress(hOle, "CoUninitialize"));
-            if (pCoInit) {
-                long hr = pCoInit(nullptr, 0x2); // COINIT_APARTMENTTHREADED
-                comInited = (hr >= 0);
-            }
-        }
+        SECURITY_ATTRIBUTES sa{};
+        sa.nLength = sizeof(sa);
+        sa.bInheritHandle = TRUE;
+        sa.lpSecurityDescriptor = nullptr;
 
-        struct OPENFILENAMEA_FULL {
-            uint32_t lStructSize;
-            void* hwndOwner;
-            void* hInstance;
-            const char* lpstrFilter;
-            char* lpstrCustomFilter;
-            uint32_t nMaxCustFilter;
-            uint32_t nFilterIndex;
-            char* lpstrFile;
-            uint32_t nMaxFile;
-            char* lpstrFileTitle;
-            uint32_t nMaxFileTitle;
-            const char* lpstrInitialDir;
-            const char* lpstrTitle;
-            uint32_t Flags;
-            uint16_t nFileOffset;
-            uint16_t nFileExtension;
-            const char* lpstrDefExt;
-            uintptr_t lCustData;
-            void* lpfnHook;
-            const char* lpTemplateName;
-            void* pvReserved;
-            uint32_t dwReserved;
-            uint32_t FlagsEx;
-        };
+        HANDLE hReadPipe = nullptr;
+        HANDLE hWritePipe = nullptr;
+        if (CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
+            SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
 
-        HMODULE hComDlg = LoadLibraryA("comdlg32.dll");
-        if (hComDlg) {
-            using FnGetOpenFileNameA = BOOL(WINAPI*)(OPENFILENAMEA_FULL*);
-            auto pGetOpen = reinterpret_cast<FnGetOpenFileNameA>(GetProcAddress(hComDlg, "GetOpenFileNameA"));
-            if (pGetOpen) {
-                char fileBuf[1024]{};
-                static constexpr char kFilterStr[] =
-                    "Reference Images (*.png;*.jpg;*.jpeg;*.webp;*.bmp)\0*.png;*.jpg;*.jpeg;*.webp;*.bmp\0All Files (*.*)\0*.*\0";
+            STARTUPINFOA si{};
+            si.cb = sizeof(si);
+            si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+            si.wShowWindow = SW_HIDE;
+            si.hStdOutput = hWritePipe;
+            si.hStdError  = hWritePipe;
 
-                OPENFILENAMEA_FULL ofn{};
-                ofn.lStructSize = sizeof(OPENFILENAMEA_FULL);
-                ofn.hwndOwner = nullptr;
-                ofn.lpstrFilter = kFilterStr;
-                ofn.lpstrFile = fileBuf;
-                ofn.nMaxFile = sizeof(fileBuf);
-                ofn.lpstrTitle = "Select Reference Image for AI Art Agent";
-                ofn.Flags = 0x00080000 | 0x00001000 | 0x00000800 | 0x00000008;
+            PROCESS_INFORMATION pi{};
+            std::string cmd =
+                "powershell.exe -NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -Command \""
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "$f = New-Object System.Windows.Forms.OpenFileDialog; "
+                "$f.Title = 'Select Reference Image for AI Art Agent'; "
+                "$f.Filter = 'Images (*.png;*.jpg;*.jpeg;*.webp;*.bmp)|*.png;*.jpg;*.jpeg;*.webp;*.bmp|All Files (*.*)|*.*'; "
+                "$f.TopMost = $true; "
+                "if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $f.FileName }"
+                "\"";
 
-                BOOL picked = pGetOpen(&ofn);
-                if (picked && fileBuf[0] != 0) {
-                    g_fileDialogPickedPath = std::string(fileBuf);
+            std::vector<char> cmdBuf(cmd.begin(), cmd.end());
+            cmdBuf.push_back('\0');
+
+            BOOL ok = CreateProcessA(
+                nullptr,
+                cmdBuf.data(),
+                nullptr,
+                nullptr,
+                TRUE,
+                CREATE_NO_WINDOW,
+                nullptr,
+                nullptr,
+                &si,
+                &pi
+            );
+
+            CloseHandle(hWritePipe);
+
+            if (ok) {
+                std::string output;
+                char buf[512];
+                DWORD readBytes = 0;
+                while (ReadFile(hReadPipe, buf, sizeof(buf) - 1, &readBytes, nullptr) && readBytes > 0) {
+                    output.append(buf, readBytes);
+                }
+                WaitForSingleObject(pi.hProcess, 5000);
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+
+                output = trimWhitespace(output);
+                // Берем последнюю непустую строку (путь к выбранному файлу)
+                size_t lastNl = output.find_last_of("\r\n");
+                if (lastNl != std::string::npos) {
+                    output = trimWhitespace(output.substr(lastNl + 1));
+                }
+                if (!output.empty() && output.find(":\\") != std::string::npos) {
+                    g_fileDialogPickedPath = output;
                     g_fileDialogPickedSuccess = true;
                 }
             }
-            FreeLibrary(hComDlg);
+            CloseHandle(hReadPipe);
         }
-
-        if (comInited && pCoUninit) pCoUninit();
-        if (hOle) FreeLibrary(hOle);
 
         g_fileDialogHasResult = true;
         g_fileDialogThreadActive = false;
@@ -1327,7 +1372,7 @@ static bool executeSingleNeuralNetPass(
             outRes.replyText = fmt::format("Gemini API Error (HTTP {}): {}", httpStatus, errText);
             return false;
         }
-        assistantContent = extractJsonStringField(rawResp, "text");
+        assistantContent = extractGeminiFinalTextPart(rawResp);
     } else {
         std::string messagesJson = fmt::format(
             "{{\"role\":\"system\",\"content\":\"{}\"}}",
@@ -1431,7 +1476,12 @@ static bool executeSingleNeuralNetPass(
         bool c3 = extractJsonRGBArray(innerJson, "main_rgb",    outRes.mainRGB);
         bool c4 = extractJsonRGBArray(innerJson, "outline_rgb", outRes.outlineRGB);
         bool c5 = extractJsonRGBArray(innerJson, "glow_rgb",    outRes.glowRGB);
-        outRes.hasCustomPalette = (c1 || c2 || c3 || c4 || c5);
+        bool c6 = extractJsonRGBArray(innerJson, "grad_top",    outRes.gradTopRGB);
+        bool c7 = extractJsonRGBArray(innerJson, "grad_bot",    outRes.gradBotRGB);
+        if (!c6) outRes.gradTopRGB = outRes.mainRGB;
+        if (!c7) outRes.gradBotRGB = outRes.fillRGB;
+        outRes.hasGradient = true;
+        outRes.hasCustomPalette = (c1 || c2 || c3 || c4 || c5 || c6 || c7);
 
         outRes.wantNeon       = extractJsonBoolField(innerJson, "want_neon", true);
         outRes.suggestedCount = std::clamp(extractJsonIntField(innerJson, "count", 160), 25, 600);
@@ -2360,82 +2410,79 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
     float originX = contour.minGX * 30.f;
     float originY = contour.minGY * 30.f;
 
-    // Уникальное смещение геометрии для каждого нового запуска (чтобы декор НИКОГДА не повторялся)
-    float uniqueAngleOffset = static_cast<float>((rng() % 360));
-    int uniqueSubLayerPattern = static_cast<int>(rng() % 7);
-
-    // 1. Внутренние слои внутри каждого блока контура (Deep Sub-Layer B4, Mid Inner Layer B2, Sub-Surface Shading B1)
+    // 1. ЕДИНАЯ СТИЛИСТИКА ДЛЯ ВСЕХ БЛОКОВ СТРУКТУРЫ + НАСТОЯЩИЙ ПЛАВНЫЙ ГРАДИЕНТ:
+    //    - Никаких случайных объектов (кружков/треугольников/дуг), если ИИ сам их не выбрал!
+    //    - Каждый блок в структуре сохраняет одинаковый стиль, единый наклон и единые слои.
+    //    - Внутри каждого блока рисуется 4-ступенчатый плавный вертикальный градиент (grad_top -> grad_bot)
+    //      плюс мягкий световой градиент 1888 для гладкого перехода цветов!
+    (void)rng;
     for (auto const& isl : islands) {
         for (auto const& [gx, gy] : isl.cells) {
             float cx = gx * 30.f + 15.f;
             float cy = gy * 30.f + 15.f;
-
-            float normX = std::clamp((cx - originX) / spanW, 0.0f, 1.0f);
-            float normY = std::clamp((cy - originY) / spanH, 0.0f, 1.0f);
 
             bool topOpen    = (contour.occupiedCells.count({ gx, gy + 1 }) == 0);
             bool bottomOpen = (contour.occupiedCells.count({ gx, gy - 1 }) == 0);
             bool leftOpen   = (contour.occupiedCells.count({ gx - 1, gy }) == 0);
             bool rightOpen  = (contour.occupiedCells.count({ gx + 1, gy }) == 0);
 
-            // Локальный цвет блока берется строго из палитры ОДНОЙ выбранной ИИ структуры (без смешивания всего скриншота!)
-            ccColor3B cellBaseCol = lerpColor(ai.fillRGB, ai.midRGB, normY * 0.65f + normX * 0.35f);
-            ccColor3B cellInnerCol = lerpColor(ai.midRGB, ai.mainRGB, normY);
+            // Глобальная координата по высоте структуры для плавного общего градиента (0 = низ, 1 = верх)
+            float normYBottom = std::clamp(((cy - 15.f) - originY) / spanH, 0.0f, 1.0f);
+            float normYTop    = std::clamp(((cy + 15.f) - originY) / spanH, 0.0f, 1.0f);
 
             // Слой 0 (Внутреннее дно блока, Z-Layer B4 = -3, EditorLayer +0)
+            ccColor3B baseCol = lerpColor(ai.gradBotRGB, ai.gradTopRGB, (normYBottom + normYTop) * 0.5f);
             addSpec(
                 result, 211, cx, cy, 1.00f, 1.00f, 0.f,
                 LayerRole::Fill, ColorSlot::CustomRGB, 1, 0, false,
-                255, -3, 0, cellBaseCol, false
+                255, -3, 0, baseCol, false
             );
 
-            // Слой 1 (Внутренний полупрозрачный подслой глубины внутри блока, Z-Layer B3 = -1, EditorLayer +1)
-            float innerRot = ((gx * 37 + gy * 53 + uniqueSubLayerPattern * 19) % 2 == 0) ? 0.f : 45.f;
-            float innerScale = (innerRot == 45.f) ? 0.56f : 0.78f;
-            addSpec(
-                result, 211, cx, cy, innerScale, innerScale, innerRot,
-                LayerRole::InnerDetail, ColorSlot::CustomRGB, 3, 1, false,
-                static_cast<GLubyte>(115 + ((gx + gy) % 3) * 25), -1, 1, cellInnerCol, false
-            );
-
-            // Мелкие внутренние микро-текстуры (масштаб < 0.35, без ограничения 0.5!)
-            {
-                // Без референса: уникальная внутренняя микро-слоистость (каждый раз новая!)
-                int innerShapeId = cat.idCircleRing;
-                switch ((gx + gy + uniqueSubLayerPattern) % 5) {
-                    case 0: innerShapeId = cat.idCircleDot; break;
-                    case 1: innerShapeId = cat.idSmallTriangle; break;
-                    case 2: innerShapeId = cat.idArcThin; break;
-                    case 3: innerShapeId = cat.idDiagShine1; break;
-                    default: innerShapeId = cat.idParallelLines; break;
-                }
+            // Слой 1 (Плавный 4-ступенчатый цветовой градиент внутри блока, Z-Layer B3 = -1, EditorLayer +1)
+            for (int band = 0; band < 4; ++band) {
+                float bandFrac = (band + 0.5f) / 4.0f;
+                float bandY = (cy - 15.f) + bandFrac * 30.f;
+                float globalT = std::clamp((bandY - originY) / spanH, 0.0f, 1.0f);
+                ccColor3B bandCol = lerpColor(ai.gradBotRGB, ai.gradTopRGB, globalT);
                 addSpec(
-                    result, innerShapeId,
-                    cx + ((gx % 2 == 0) ? -4.5f : 4.5f),
-                    cy + ((gy % 2 == 0) ? 4.5f : -4.5f),
-                    0.34f, 0.34f,
-                    std::fmod(uniqueAngleOffset + (gx * 45.f + gy * 90.f), 360.f),
-                    LayerRole::InnerDetail, ColorSlot::CustomRGB, 5, 2, false,
-                    145, 1, 2, lerpColor(cellInnerCol, ai.outlineRGB, 0.35f), false
+                    result, 211, cx, bandY, 1.00f, 0.27f, 0.f,
+                    LayerRole::InnerDetail, ColorSlot::CustomRGB, 2 + band, 0, false,
+                    220, -1, 1, bandCol, false
                 );
             }
 
-            // Тонкий аккуратный контур границы формы (СТРОГО БЕЗ 3D-блоков!) на слое B1 (zl=3, el=3)
-            if (topOpen)    addSpec(result, 211, cx, cy + 14.3f, 1.02f, 0.055f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 235, 3, 3, ai.outlineRGB, false);
-            if (leftOpen)   addSpec(result, 211, cx - 14.3f, cy, 0.055f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 215, 3, 3, ai.outlineRGB, false);
-            if (rightOpen)  addSpec(result, 211, cx + 14.3f, cy, 0.055f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 215, 3, 3, ai.outlineRGB, false);
-            if (bottomOpen && gy > 0) addSpec(result, 211, cx, cy - 14.3f, 1.02f, 0.055f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 195, 3, 3, ai.outlineRGB, false);
+            // Мягкий градиентный световой переход (объект 1888) внутри верхнего/нижнего края структуры
+            if (topOpen) {
+                addSpec(
+                    result, 1888, cx, cy + 7.5f, 0.95f, 0.45f, 180.f,
+                    LayerRole::InnerDetail, ColorSlot::CustomRGB, 7, 1, false,
+                    110, 1, 2, ai.gradTopRGB, true
+                );
+            }
+            if (bottomOpen) {
+                addSpec(
+                    result, 1888, cx, cy - 7.5f, 0.95f, 0.45f, 0.f,
+                    LayerRole::InnerDetail, ColorSlot::CustomRGB, 7, 1, false,
+                    95, 1, 2, ai.gradBotRGB, false
+                );
+            }
 
-            // Мягкое атмосферное свечение и внутренняя подсветка краев (Additive Blending, zl=7, el=5)
+            // Единый аккуратный контур границы всей структуры (Z-Layer B1 = 3, EditorLayer +3)
+            if (topOpen)    addSpec(result, 211, cx, cy + 14.3f, 1.02f, 0.055f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 240, 3, 3, ai.outlineRGB, false);
+            if (leftOpen)   addSpec(result, 211, cx - 14.3f, cy, 0.055f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 220, 3, 3, ai.outlineRGB, false);
+            if (rightOpen)  addSpec(result, 211, cx + 14.3f, cy, 0.055f, 1.02f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 220, 3, 3, ai.outlineRGB, false);
+            if (bottomOpen && gy > 0) addSpec(result, 211, cx, cy - 14.3f, 1.02f, 0.055f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 12, 0, false, 200, 3, 3, ai.outlineRGB, false);
+
+            // Аккуратное свечение по внешнему краю (Z-Layer T2 = 7, EditorLayer +5)
             if (ai.wantNeon) {
                 if (topOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx, cy + 11.0f, 0.85f, 0.42f, 180.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 1, false, 95, 7, 5, ai.glowRGB, true);
+                    addSpec(result, cat.idGlowEdgeSmall, cx, cy + 11.0f, 0.85f, 0.40f, 180.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 1, false, 85, 7, 5, ai.glowRGB, true);
                 }
                 if (leftOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx - 11.0f, cy, 0.85f, 0.38f, 90.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 1, false, 80, 7, 5, ai.glowRGB, true);
+                    addSpec(result, cat.idGlowEdgeSmall, cx - 11.0f, cy, 0.85f, 0.36f, 90.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 1, false, 75, 7, 5, ai.glowRGB, true);
                 }
                 if (rightOpen) {
-                    addSpec(result, cat.idGlowEdgeSmall, cx + 11.0f, cy, 0.85f, 0.38f, 270.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 1, false, 80, 7, 5, ai.glowRGB, true);
+                    addSpec(result, cat.idGlowEdgeSmall, cx + 11.0f, cy, 0.85f, 0.36f, 270.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 16, 1, false, 75, 7, 5, ai.glowRGB, true);
                 }
             }
         }
