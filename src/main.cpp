@@ -212,9 +212,10 @@ struct AIDecisionResult {
     bool directDeleteSelected = false;
     bool directRecolorOnly = false;
 
-    bool wantCustomSpikes = false;    // Кастомные шипы от ИИ (собираются внутри треугольника шипа или спавнятся с нуля)
-    bool allowOrbsAndPortals = false; // Разрешение декорить орбы, дэш-орбы и порталы (ТОЛЬКО если игрок попросил!)
-    bool wantBackground = false;      // Создание заднего фона (BG), если ничего не выделено или попросили фон
+    bool wantCustomSpikes = false;      // Кастомные шипы от ИИ (собираются внутри треугольника шипа или спавнятся с нуля)
+    bool allowOrbsAndPortals = false;   // Разрешение трогать орбы, дэш-орбы и порталы
+    bool wantCustomOrbTexture = false;  // Кастомная текстура внутри орбов ТОЛЬКО по явной просьбе (иначе на орбах только неон!)
+    bool wantBackground = false;        // Создание заднего фона (BG), если ничего не выделено или попросили фон
 
     // cellElements: микро-дизайн ИИ внутри КАЖДОГО блока 30x30
     std::vector<AICustomDrawElement> cellElements;
@@ -245,7 +246,8 @@ static int g_lastRefinementPasses = 1;
 
 static int g_lastLayoutSeed = -1;
 static int g_variantIndex = 1;
-static int g_objectLimit = 16000;
+static int g_objectLimit = 250;          // Точное выбранное игроком количество блоков для постройки
+static bool g_aiAutoObjectCount = false; // Если true — нейросеть сама выбирает количество блоков (ai.suggestedCount)!
 static bool g_overhangAllowed = true;
 static std::string g_lastBuildPrompt;
 static std::vector<Ref<GameObject>> g_lastPlacedObjects;
@@ -1690,6 +1692,12 @@ static bool executeSingleNeuralNetPass(
                                  lp.find("sfer") != std::string::npos || lp.find("dash") != std::string::npos ||
                                  lp.find("desh") != std::string::npos || lp.find("portal") != std::string::npos ||
                                  lp.find("ring") != std::string::npos || lp.find("kolts") != std::string::npos);
+        bool hasCustomOrbTexWord = hasOrbPortalWord && (
+            lp.find("kastom") != std::string::npos || lp.find("custom") != std::string::npos ||
+            lp.find("tekstur") != std::string::npos || lp.find("texture") != std::string::npos ||
+            lp.find("uzor") != std::string::npos || lp.find("vnutr") != std::string::npos ||
+            lp.find("risun") != std::string::npos || lp.find("art") != std::string::npos
+        );
         bool hasSpikeWord = (lp.find("ship") != std::string::npos || lp.find("spike") != std::string::npos ||
                              lp.find("kolyuch") != std::string::npos || lp.find("thorn") != std::string::npos);
         bool hasBgWord    = (lp.find("fon") != std::string::npos || lp.find("zadn") != std::string::npos ||
@@ -1749,9 +1757,10 @@ static bool executeSingleNeuralNetPass(
         outRes.wantNeon            = hasNeonWord || (outRes.wantNeon && !outRes.wantBricks && !outRes.wantWindows && !hasVineWord);
         outRes.hasGradient         = (lp.find("grad") != std::string::npos);
         outRes.wantCustomSpikes    = hasSpikeWord || outRes.wantCustomSpikes || !outRes.spikeElements.empty();
-        // Орбы, дэш-орбы и порталы декорятся СТРОГО только если игрок сам попросил их в запросе!
-        outRes.allowOrbsAndPortals = hasOrbPortalWord;
-        outRes.wantBackground      = hasBgWord || outRes.wantBackground;
+        // На орбах по умолчанию делается ТОЛЬКО НЕОН (без кастомной текстуры!), а кастомная текстура внутри орба — ТОЛЬКО по явной просьбе!
+        outRes.allowOrbsAndPortals  = hasOrbPortalWord || outRes.wantNeon;
+        outRes.wantCustomOrbTexture = hasCustomOrbTexWord;
+        outRes.wantBackground       = hasBgWord || outRes.wantBackground;
 
         ccColor3B uFill, uMid, uMain, uOutl, glowC;
         if (detectUserColorOverride(uFill, uMid, uMain, uOutl, glowC)) {
@@ -1834,7 +1843,7 @@ static bool executeSingleNeuralNetPass(
         outRes.hasCustomPalette = (c1 || c2 || c3 || c4 || c5 || c6 || c7);
 
         outRes.wantNeon       = extractJsonBoolField(innerJson, "want_neon", false);
-        outRes.suggestedCount = std::clamp(extractJsonIntField(innerJson, "count", 160), 25, 600);
+        outRes.suggestedCount = std::clamp(extractJsonIntField(innerJson, "count", 220), 20, 4000);
 
         outRes.directMoveX          = extractJsonFloatField(innerJson, "move_x", 0.0f);
         outRes.directMoveY          = extractJsonFloatField(innerJson, "move_y", 0.0f);
@@ -3259,7 +3268,9 @@ static void appendSpikeDecoration(
     }
 }
 
-// ДЕКОРИРОВАНИЕ ОРБОВ, ДЭШ-ОРБОВ И ПОРТАЛОВ (выполняется СТРОГО только с разрешения игрока!)
+// ДЕКОРИРОВАНИЕ ОРБОВ, ДЭШ-ОРБОВ И ПОРТАЛОВ:
+// По умолчанию делает ТОЛЬКО мягкое неоновое свечение (Blending = true, прозрачность 60-75%),
+// а кастомную текстуру внутри ставит СТРОГО только по явной просьбе игрока (ai.wantCustomOrbTexture)!
 static void appendCustomOrbDashPortalDecoration(
     std::vector<GeneratedObjectSpec>& result,
     SelectedOrbPortalInfo const& op,
@@ -3277,24 +3288,39 @@ static void appendCustomOrbDashPortalDecoration(
         return { op.x + (lx * cosA - ly * sinA), op.y + (lx * sinA + ly * cosA) };
     };
 
-    // 1. Внутренняя кастомная начинка для Орбов / Дэш-орбов / Порталов в цветовой гамме запроса игрока
+    // 1. ЧИСТЫЙ НЕОН НА ОРБАХ / ДЭШ-ОРБАХ / ПОРТАЛАХ (мягкое свечение с Blending = true без перекрытия орба текстурой!)
     if (op.isPortal) {
-        // Внутри портала: энергетическое ядро и 3 вертикальные световые дуги
-        addSpec(result, 211, op.x, op.y, 0.24f * op.scaleX, 1.85f * op.scaleY, op.rotation, LayerRole::InnerDetail, ColorSlot::CustomRGB, 14, 0, false, 185, 3, 3, ai.mainRGB, true);
-        addSpec(result, 211, op.x, op.y, 0.11f * op.scaleX, 1.65f * op.scaleY, op.rotation, LayerRole::InnerDetail, ColorSlot::CustomRGB, 15, 0, false, 235, 5, 4, ai.outlineRGB, true);
-    } else if (op.isDashOrb) {
-        // Внутри дэш-орба: направленный световой сердечник + ромбовидный контур
-        addSpec(result, 211, op.x, op.y, 0.42f * op.scaleX, 0.42f * op.scaleY, op.rotation + 45.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 14, 0, false, 220, 3, 3, ai.fillRGB, false);
-        addSpec(result, 211, op.x, op.y, 0.48f * op.scaleX, 0.14f * op.scaleY, op.rotation,        LayerRole::InnerDetail, ColorSlot::CustomRGB, 15, 0, false, 245, 5, 4, ai.mainRGB, true);
-        addSpec(result, 211, op.x, op.y, 0.22f * op.scaleX, 0.22f * op.scaleY, op.rotation + 45.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 16, 0, false, 255, 5, 4, ai.outlineRGB, true);
+        addSpec(result, 211, op.x, op.y, 0.28f * op.scaleX, 1.75f * op.scaleY, op.rotation, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 7, 0, false, 155, -1, 3, ai.glowRGB, true);
+        addSpec(result, 211, op.x, op.y, 0.14f * op.scaleX, 1.55f * op.scaleY, op.rotation, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 8, 0, false, 185, 3, 4, ai.outlineRGB, true);
     } else {
-        // Внутри обычного орба: кастомное кольцо + светящееся ядро
-        addSpec(result, 211, op.x, op.y, 0.46f * op.scaleX, 0.46f * op.scaleY, op.rotation,        LayerRole::InnerDetail, ColorSlot::CustomRGB, 14, 0, false, 225, 3, 3, ai.fillRGB, false);
-        addSpec(result, 211, op.x, op.y, 0.34f * op.scaleX, 0.34f * op.scaleY, op.rotation + 45.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 15, 0, false, 240, 5, 4, ai.mainRGB, true);
-        addSpec(result, 211, op.x, op.y, 0.16f * op.scaleX, 0.16f * op.scaleY, op.rotation,        LayerRole::InnerDetail, ColorSlot::CustomRGB, 16, 0, false, 255, 5, 4, ai.outlineRGB, true);
+        // Неоновый ореол по краям орба (4 тонкие неоновые полоски с Blending = true и прозрачностью ~65-75%)
+        constexpr float kEdgeDist = 11.2f;
+        auto [topX, topY] = localToWorld(0.f,  kEdgeDist);
+        auto [botX, botY] = localToWorld(0.f, -kEdgeDist);
+        auto [lftX, lftY] = localToWorld(-kEdgeDist, 0.f);
+        auto [rgtX, rgtY] = localToWorld( kEdgeDist, 0.f);
+
+        addSpec(result, 211, topX, topY, 0.56f * op.scaleX, 0.08f * op.scaleY, op.rotation, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 7, 0, false, 175, 3, 3, ai.glowRGB, true);
+        addSpec(result, 211, botX, botY, 0.56f * op.scaleX, 0.08f * op.scaleY, op.rotation, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 7, 0, false, 175, 3, 3, ai.glowRGB, true);
+        addSpec(result, 211, lftX, lftY, 0.08f * op.scaleX, 0.56f * op.scaleY, op.rotation, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 7, 0, false, 175, 3, 3, ai.glowRGB, true);
+        addSpec(result, 211, rgtX, rgtY, 0.08f * op.scaleX, 0.56f * op.scaleY, op.rotation, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 7, 0, false, 175, 3, 3, ai.glowRGB, true);
+        // Мягкое центральное неоновое свечение на заднем подслое (B3, Blending = true)
+        addSpec(result, 211, op.x, op.y, 0.42f * op.scaleX, 0.42f * op.scaleY, op.rotation + 45.f, LayerRole::NeonAndGrass, ColorSlot::CustomRGB, 6, 0, false, 145, -1, 2, ai.glowRGB, true);
     }
 
-    // 2. Размещаем все элементы, которые ИИ сгенерировал специально внутрь орба/дэш-орба/портала (orb_elements или customElements)
+    // 2. КАСТОМНАЯ ТЕКСТУРА ВНУТРИ ОРБА — СТРОГО ТОЛЬКО ПО ЯВНОЙ ПРОСЬБЕ ИГРОКА!
+    if (!ai.wantCustomOrbTexture) {
+        return;
+    }
+
+    if (op.isDashOrb) {
+        addSpec(result, 211, op.x, op.y, 0.38f * op.scaleX, 0.38f * op.scaleY, op.rotation + 45.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 14, 0, false, 220, 3, 3, ai.fillRGB, false);
+        addSpec(result, 211, op.x, op.y, 0.44f * op.scaleX, 0.12f * op.scaleY, op.rotation,        LayerRole::InnerDetail, ColorSlot::CustomRGB, 15, 0, false, 245, 5, 4, ai.mainRGB, true);
+    } else if (!op.isPortal) {
+        addSpec(result, 211, op.x, op.y, 0.40f * op.scaleX, 0.40f * op.scaleY, op.rotation,        LayerRole::InnerDetail, ColorSlot::CustomRGB, 14, 0, false, 220, 3, 3, ai.fillRGB, false);
+        addSpec(result, 211, op.x, op.y, 0.22f * op.scaleX, 0.22f * op.scaleY, op.rotation + 45.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 15, 0, false, 245, 5, 4, ai.mainRGB, true);
+    }
+
     auto const& srcList = !ai.orbElements.empty() ? ai.orbElements : ai.customElements;
     for (auto const& oel : srcList) {
         float lx = (std::clamp(oel.rx, 0.05f, 0.95f) - 0.5f) * spanX;
@@ -3424,14 +3450,18 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         return result;
     }
 
-    int effectiveCap = (std::max)(60, maxObjectLimit);
+    // Если включен режим AI Auto — нейросеть сама выбирает количество блоков (ai.suggestedCount),
+    // иначе строим РОВНО столько блоков, сколько выбрал игрок (maxObjectLimit)!
+    int targetBlockCount = g_aiAutoObjectCount
+        ? std::clamp(ai.suggestedCount, 25, 4000)
+        : std::clamp(maxObjectLimit, 10, 40000);
     int styleSeed = static_cast<int>(ai.fillRGB.r * 73 + ai.mainRGB.g * 151 + g_variantIndex * 997);
 
     // ЕСЛИ НИЧЕГО НЕ ВЫДЕЛЕНО (0 блоков) — ИИ СТРОИТ ЗАДНИЙ ФОН (BACKGROUND) ИЛИ СВОБОДНЫЙ АРТ НА ЭКРАНЕ КАМЕРЫ!
     if (!contour.hasAnySelection || (ai.wantBackground && contour.occupiedCells.empty())) {
         appendCustomBackgroundInEditor(result, contour, cat, ai, styleSeed);
-        if (static_cast<int>(result.size()) > effectiveCap) {
-            result.resize(effectiveCap);
+        if (static_cast<int>(result.size()) > targetBlockCount) {
+            result.resize(targetBlockCount);
         }
         return result;
     }
@@ -3749,12 +3779,32 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         }
     }
 
+    // Если объектов получилось меньше выбранного количества targetBlockCount — достраиваем микро-пиксельные детали
+    // внутри клеток структуры, чтобы итоговое число построенных блоков ТОЧНО совпадало с выбранным количеством!
+    if (!contour.occupiedCells.empty() && static_cast<int>(result.size()) < targetBlockCount) {
+        std::vector<std::pair<int, int>> cellVec(contour.occupiedCells.begin(), contour.occupiedCells.end());
+        int fillIdx = 0;
+        while (static_cast<int>(result.size()) < targetBlockCount && fillIdx < 8000) {
+            auto const& [gx, gy] = cellVec[fillIdx % cellVec.size()];
+            int subStep = fillIdx / static_cast<int>(cellVec.size());
+            float u = hash2DNoise(gx * 19 + subStep, gy * 23 + fillIdx, styleSeed + 401);
+            float v = hash2DNoise(gx * 31 + fillIdx, gy * 13 + subStep, styleSeed + 809);
+            float px = gx * 30.f + 3.0f + u * 24.0f;
+            float py = gy * 30.f + 3.0f + v * 24.0f;
+            float scX = 0.04f + (fillIdx % 5) * 0.03f;
+            float scY = 0.04f + ((fillIdx / 3) % 4) * 0.03f;
+            ccColor3B detailCol = lerpColor(ai.midRGB, ai.mainRGB, (fillIdx % 10) / 10.0f);
+            addSpec(result, 211, px, py, scX, scY, 0.f, LayerRole::InnerDetail, ColorSlot::CustomRGB, 9 + (fillIdx % 6), 2, false, 195, 1, 2, detailCol, ai.wantNeon);
+            fillIdx++;
+        }
+    }
+
     std::stable_sort(result.begin(), result.end(), [](GeneratedObjectSpec const& a, GeneratedObjectSpec const& b) {
         return a.priorityTier < b.priorityTier;
     });
 
-    if (static_cast<int>(result.size()) > effectiveCap) {
-        result.resize(effectiveCap);
+    if (static_cast<int>(result.size()) > targetBlockCount) {
+        result.resize(targetBlockCount);
     }
 
     return result;
@@ -4124,6 +4174,8 @@ protected:
     CCLayerColor* m_tabInGDBg = nullptr;
     CCMenuItemSpriteExtra* m_shapeFillToggleBtn = nullptr;
     CCLabelBMFont* m_shapeFillToggleLbl = nullptr;
+    CCLayerColor* m_aiCountToggleBg = nullptr;
+    CCLabelBMFont* m_aiCountToggleLbl = nullptr;
     CCNode* m_previewCanvasContent = nullptr;
     CCLabelBMFont* m_previewSubInfoLabel = nullptr;
     CCLabelBMFont* m_limitValueLabel = nullptr;
@@ -4692,16 +4744,44 @@ protected:
         m_previewSubInfoLabel->setPosition(CCPoint{ rightX, center.y - 62.f });
         m_mainLayer->addChild(m_previewSubInfoLabel);
 
-        auto* limitPill = createSolidPanel(108.f, 22.f, ccColor3B{ 24, 16, 20 }, 255);
-        limitPill->setPosition(CCPoint{ rightX - 58.f, center.y - 84.f });
-        m_mainLayer->addChild(limitPill);
+        // Кнопка переключения режима "AI Blocks: ON/OFF" (разрешает нейросети самой выбирать количество блоков!)
+        m_aiCountToggleBg = createSolidPanel(78.f, 15.f, g_aiAutoObjectCount ? ccColor3B{ 28, 125, 68 } : ccColor3B{ 38, 24, 32 }, 240);
+        auto* aiCountBorder = createSolidPanel(80.f, 17.f, ccColor3B{ 95, 225, 165 }, 255);
+        aiCountBorder->setPosition(CCPoint{ 39.f, 7.5f });
+        aiCountBorder->setZOrder(-1);
+        m_aiCountToggleBg->addChild(aiCountBorder);
 
-        std::string limStr = fmt::format("Limit  {}", g_objectLimit);
+        m_aiCountToggleLbl = CCLabelBMFont::create(
+            g_aiAutoObjectCount ? "AI Blocks: ON" : "AI Blocks: OFF",
+            "chatFont.fnt"
+        );
+        m_aiCountToggleLbl->setScale(0.35f);
+        m_aiCountToggleLbl->setColor(ccColor3B{ 240, 255, 245 });
+        m_aiCountToggleLbl->setPosition(CCPoint{ 39.f, 7.5f });
+        m_aiCountToggleBg->addChild(m_aiCountToggleLbl);
+
+        auto* aiCountBtn = CCMenuItemSpriteExtra::create(
+            m_aiCountToggleBg, this, menu_selector(AIDecorPopup::onToggleAIAutoBlockCount)
+        );
+        aiCountBtn->setPosition(CCPoint{ rightX - 68.f, center.y + 64.f });
+        m_buttonMenu->addChild(aiCountBtn);
+
+        // Выбор точного количества блоков (< Blocks: N >) ИЛИ клик по центру для переключения AI Auto
+        auto* limitPill = createSolidPanel(108.f, 22.f, ccColor3B{ 24, 16, 20 }, 255);
+        std::string limStr = g_aiAutoObjectCount
+            ? std::string("Blocks: AI Auto")
+            : fmt::format("Blocks: {}", g_objectLimit);
         m_limitValueLabel = CCLabelBMFont::create(limStr.c_str(), "chatFont.fnt");
-        m_limitValueLabel->setScale(0.42f);
-        m_limitValueLabel->setColor(ccColor3B{ 235, 240, 250 });
-        m_limitValueLabel->setPosition(CCPoint{ rightX - 58.f, center.y - 84.f });
-        m_mainLayer->addChild(m_limitValueLabel);
+        m_limitValueLabel->setScale(0.38f);
+        m_limitValueLabel->setColor(g_aiAutoObjectCount ? ccColor3B{ 115, 255, 175 } : ccColor3B{ 235, 240, 250 });
+        m_limitValueLabel->setPosition(CCPoint{ 54.f, 11.f });
+        limitPill->addChild(m_limitValueLabel);
+
+        auto* limitToggleBtn = CCMenuItemSpriteExtra::create(
+            limitPill, this, menu_selector(AIDecorPopup::onToggleAIAutoBlockCount)
+        );
+        limitToggleBtn->setPosition(CCPoint{ rightX - 58.f, center.y - 84.f });
+        m_buttonMenu->addChild(limitToggleBtn);
 
         auto* decBtn = createSolidButton(18.f, 18.f, ccColor3B{ 44, 28, 34 }, "<", 0.45f, ccColor3B{ 245, 248, 255 }, this, menu_selector(AIDecorPopup::onLimitDec));
         decBtn->setPosition(CCPoint{ rightX - 101.f, center.y - 84.f });
@@ -5252,20 +5332,39 @@ protected:
         refreshRightPanelTabsAndCanvas();
     }
 
-    void onLimitDec(CCObject*) {
-        g_objectLimit = (std::max)(50, g_objectLimit - 1000);
+    void refreshBlockCountLabels() {
         if (m_limitValueLabel) {
-            std::string s = fmt::format("Limit  {}", g_objectLimit);
+            std::string s = g_aiAutoObjectCount
+                ? std::string("Blocks: AI Auto")
+                : fmt::format("Blocks: {}", g_objectLimit);
             m_limitValueLabel->setString(s.c_str());
+            m_limitValueLabel->setColor(g_aiAutoObjectCount ? ccColor3B{ 115, 255, 175 } : ccColor3B{ 235, 240, 250 });
+        }
+        if (m_aiCountToggleLbl) {
+            m_aiCountToggleLbl->setString(g_aiAutoObjectCount ? "AI Blocks: ON" : "AI Blocks: OFF");
+        }
+        if (m_aiCountToggleBg) {
+            m_aiCountToggleBg->setColor(g_aiAutoObjectCount ? ccColor3B{ 28, 125, 68 } : ccColor3B{ 38, 24, 32 });
         }
     }
 
+    void onToggleAIAutoBlockCount(CCObject*) {
+        g_aiAutoObjectCount = !g_aiAutoObjectCount;
+        refreshBlockCountLabels();
+    }
+
+    void onLimitDec(CCObject*) {
+        g_aiAutoObjectCount = false;
+        int step = (g_objectLimit <= 100) ? 25 : ((g_objectLimit <= 500) ? 50 : ((g_objectLimit <= 2000) ? 100 : 500));
+        g_objectLimit = (std::max)(25, g_objectLimit - step);
+        refreshBlockCountLabels();
+    }
+
     void onLimitInc(CCObject*) {
-        g_objectLimit = (std::min)(40000, g_objectLimit + 1000);
-        if (m_limitValueLabel) {
-            std::string s = fmt::format("Limit  {}", g_objectLimit);
-            m_limitValueLabel->setString(s.c_str());
-        }
+        g_aiAutoObjectCount = false;
+        int step = (g_objectLimit < 100) ? 25 : ((g_objectLimit < 500) ? 50 : ((g_objectLimit < 2000) ? 100 : 500));
+        g_objectLimit = (std::min)(20000, g_objectLimit + step);
+        refreshBlockCountLabels();
     }
 
     void onSelectInside(CCObject*)   { g_overhangAllowed = false; refreshRightPanelTabsAndCanvas(); }
