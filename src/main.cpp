@@ -246,8 +246,7 @@ static int g_lastRefinementPasses = 1;
 
 static int g_lastLayoutSeed = -1;
 static int g_variantIndex = 1;
-static int g_objectLimit = 250;          // Точное выбранное игроком количество блоков для постройки
-static bool g_aiAutoObjectCount = false; // Если true — нейросеть сама выбирает количество блоков (ai.suggestedCount)!
+static int g_objectLimit = 25000; // Никаких искусственных урезаний: ИИ сам решает сколько блоков нужно (или берет число из чата игрока!)
 static bool g_overhangAllowed = true;
 static std::string g_lastBuildPrompt;
 static std::vector<Ref<GameObject>> g_lastPlacedObjects;
@@ -465,38 +464,120 @@ static constexpr ApiProviderConfig kApiProviders[5] = {
 
 static bool g_apiConfigLoaded = false;
 static bool g_apiVerifiedAndConnected = false;
-static int g_apiProviderIndex = 0; // По умолчанию 0 = Gemini
+static int g_apiProviderIndex = 0;
 static int g_selectedModelIndex[5] = { 0, 0, 0, 0, 0 };
 static std::string g_connectedApiKey;
-static std::string g_discoveredGeminiModel; // Модель, автоматически найденная у ключа пользователя
+static std::string g_discoveredGeminiModel;
 
-static const char* getCurrentModelID(int provIdx) {
-    provIdx = std::clamp(provIdx, 0, 4);
-    int mIdx = std::clamp(g_selectedModelIndex[provIdx], 0, 3);
-    return kApiProviders[provIdx].models[mIdx].modelId;
+// Настраиваемые пользователем Base URL, Endpoint и Имя модели (принимаются ЛЮБЫЕ API-ключи и прокси!)
+static std::string g_customBaseUrl      = "https://api.openai.com";
+static std::string g_customEndpointPath = "/v1/chat/completions";
+static std::string g_customModelName    = "gpt-4o-mini";
+
+static const char* getCurrentModelID(int /*provIdx*/ = 0) {
+    return g_customModelName.c_str();
 }
 
-static bool hasPlausibleKeyFormat(std::string const& rawKey) {
-    std::string k = trimWhitespace(rawKey);
-    if (k.size() < 14) return false;
-    for (char c : k) {
-        if (c <= 32 || c > 126) return false;
+static std::string stripBearerPrefix(std::string s) {
+    s = trimWhitespace(s);
+    while (!s.empty() && (s.front() == '"' || s.front() == '\'')) s.erase(s.begin());
+    while (!s.empty() && (s.back() == '"' || s.back() == '\'' || s.back() == 0)) s.pop_back();
+    s = trimWhitespace(s);
+    if (s.size() > 7) {
+        std::string pref = s.substr(0, 7);
+        for (char& c : pref) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (pref == "bearer ") {
+            s = trimWhitespace(s.substr(7));
+        }
     }
-    return true;
+    return s;
 }
 
-static int detectProviderFromKey(std::string const& rawKey, int currentIdx) {
-    std::string key = trimWhitespace(rawKey);
-    if (key.rfind("AIza", 0) == 0) return 0;   // Gemini
-    if (key.rfind("gsk_", 0) == 0) return 3;   // Groq
-    if (key.rfind("sk-or-", 0) == 0) return 4; // OpenRouter
-    if (key.rfind("sk-", 0) == 0) return (currentIdx == 2) ? 2 : 1; // OpenAI или DeepSeek
-    return currentIdx;
+// Мод принимает ЛЮБЫЕ виды API-ключей (любой длины и любого формата!)
+static bool hasPlausibleKeyFormat(std::string const& rawKey) {
+    std::string k = stripBearerPrefix(rawKey);
+    return !k.empty();
 }
 
 static std::string maskApiKeyPreview(std::string const& key) {
-    if (key.size() <= 10) return "not set";
-    return key.substr(0, 5) + "..." + key.substr(key.size() - 4);
+    if (key.empty()) return "not set";
+    if (key.size() <= 8) return key;
+    return key.substr(0, 4) + "..." + key.substr(key.size() - 4);
+}
+
+// Разбор пользовательского Base URL и Endpoint в (hostW, pathW, isGeminiNative)
+static void resolveCustomBaseUrlAndEndpoint(
+    std::string const& modelName,
+    std::wstring& outHostW,
+    std::wstring& outPathW,
+    bool& outIsGeminiNative
+) {
+    std::string base = trimWhitespace(g_customBaseUrl);
+    std::string ep   = trimWhitespace(g_customEndpointPath);
+    if (base.empty()) base = "https://api.openai.com";
+    if (ep.empty())   ep   = "/v1/chat/completions";
+
+    // Убираем протокол https:// или http://
+    std::string hostAndPrefix = base;
+    size_t protoPos = hostAndPrefix.find("://");
+    if (protoPos != std::string::npos) {
+        hostAndPrefix = hostAndPrefix.substr(protoPos + 3);
+    }
+    while (!hostAndPrefix.empty() && hostAndPrefix.back() == '/') {
+        hostAndPrefix.pop_back();
+    }
+
+    std::string hostOnly = hostAndPrefix;
+    std::string basePathPrefix;
+    size_t slashPos = hostAndPrefix.find('/');
+    if (slashPos != std::string::npos) {
+        hostOnly = hostAndPrefix.substr(0, slashPos);
+        basePathPrefix = hostAndPrefix.substr(slashPos);
+    }
+
+    if (!ep.empty() && ep.front() != '/') {
+        ep = "/" + ep;
+    }
+
+    // Если в Base URL уже написан суффикс /v1 (например https://my-proxy.ru/v1), а Endpoint начинается с /v1/..., не дублируем /v1!
+    std::string fullPath = basePathPrefix + ep;
+    if (basePathPrefix.size() >= 3 &&
+        basePathPrefix.substr(basePathPrefix.size() - 3) == "/v1" &&
+        ep.rfind("/v1/", 0) == 0) {
+        fullPath = basePathPrefix + ep.substr(3);
+    }
+
+    std::string lowerHost = hostOnly;
+    for (char& c : lowerHost) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    std::string lowerPath = fullPath;
+    for (char& c : lowerPath) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    outIsGeminiNative = (
+        (lowerHost.find("generativelanguage.googleapis.com") != std::string::npos ||
+         lowerPath.find(":generatecontent") != std::string::npos ||
+         lowerPath.find("/v1beta/models") != std::string::npos) &&
+        lowerPath.find("/chat/completions") == std::string::npos
+    );
+
+    if (outIsGeminiNative) {
+        std::string mName = modelName.empty() ? "gemini-4-hydrogen" : modelName;
+        size_t placeholder = fullPath.find("{model}");
+        if (placeholder != std::string::npos) {
+            fullPath.replace(placeholder, 7, mName);
+        } else if (fullPath.find(":generateContent") == std::string::npos) {
+            if (!fullPath.empty() && fullPath.back() != '/') fullPath += "/";
+            if (fullPath.find("/models/") == std::string::npos) {
+                fullPath = "/v1beta/models/" + mName + ":generateContent";
+            } else {
+                fullPath += mName + ":generateContent";
+            }
+        }
+    }
+
+    outHostW.clear();
+    for (unsigned char c : hostOnly) outHostW.push_back(static_cast<wchar_t>(c));
+    outPathW.clear();
+    for (unsigned char c : fullPath) outPathW.push_back(static_cast<wchar_t>(c));
 }
 
 static std::string jsonEscape(std::string const& s) {
@@ -526,7 +607,117 @@ static std::wstring utf8ToWideASCII(std::string const& s) {
     return w;
 }
 
-// Универсальный HTTPS-клиент через системный winhttp.dll (поддерживает GET и POST)
+// Автоматический резервный HTTPS-клиент через встроенный системный curl.exe Windows 10/11
+// (срабатывает мгновенно, если WinHTTP блокируется прокси/VPN/файрволом или TLS-сертификатами!)
+static bool performCurlFallbackRequest(
+    const wchar_t* verbW,
+    const wchar_t* hostW,
+    std::wstring const& pathW,
+    std::wstring const& extraHeadersW,
+    std::string const& bodyData,
+    int& outHttpStatus,
+    std::string& outResponseBody,
+    std::string& outErrorText
+) {
+#ifdef GEODE_IS_WINDOWS
+    auto wideToAscii = [](std::wstring const& w) -> std::string {
+        std::string s;
+        s.reserve(w.size());
+        for (wchar_t ch : w) {
+            if (ch > 0 && ch < 128) s.push_back(static_cast<char>(ch));
+        }
+        return s;
+    };
+
+    std::string verb = wideToAscii(verbW);
+    std::string host = wideToAscii(hostW);
+    std::string path = wideToAscii(pathW);
+    std::string hdrs = wideToAscii(extraHeadersW);
+    std::string url  = "https://" + host + path;
+
+    std::string reqBodyFile = "ai_agent_req_body.tmp";
+    if (!bodyData.empty()) {
+        std::ofstream bf(reqBodyFile, std::ios::binary | std::ios::trunc);
+        bf.write(bodyData.data(), static_cast<std::streamsize>(bodyData.size()));
+    }
+
+    std::string cmd = "curl.exe -s -S -k -L --connect-timeout 12 --max-time 45 -X " + verb;
+    std::istringstream hss(hdrs);
+    std::string hLine;
+    while (std::getline(hss, hLine)) {
+        while (!hLine.empty() && (hLine.back() == '\r' || hLine.back() == '\n' || hLine.back() == ' ')) hLine.pop_back();
+        if (!hLine.empty()) {
+            cmd += " -H \"" + hLine + "\"";
+        }
+    }
+    if (!bodyData.empty()) {
+        cmd += " --data-binary @\"" + reqBodyFile + "\"";
+    }
+    cmd += " -w \"\\nHTTP_STATUS_CODE:%{http_code}\" \"" + url + "\"";
+
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE hRead = nullptr, hWrite = nullptr;
+    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
+        outErrorText = "Network error contacting AI server";
+        return false;
+    }
+    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = hWrite;
+    si.hStdError  = hWrite;
+
+    PROCESS_INFORMATION pi{};
+    std::vector<char> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back('\0');
+
+    BOOL started = CreateProcessA(nullptr, cmdBuf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    CloseHandle(hWrite);
+
+    if (!started) {
+        CloseHandle(hRead);
+        outErrorText = "Network error contacting AI server";
+        return false;
+    }
+
+    std::string output;
+    char buf[1024];
+    DWORD readBytes = 0;
+    while (ReadFile(hRead, buf, sizeof(buf), &readBytes, nullptr) && readBytes > 0) {
+        output.append(buf, readBytes);
+    }
+    WaitForSingleObject(pi.hProcess, 45000);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    CloseHandle(hRead);
+
+    size_t marker = output.rfind("HTTP_STATUS_CODE:");
+    if (marker != std::string::npos) {
+        std::string codeStr = output.substr(marker + 17);
+        outHttpStatus = std::atoi(codeStr.c_str());
+        outResponseBody = output.substr(0, marker);
+        while (!outResponseBody.empty() && (outResponseBody.back() == '\n' || outResponseBody.back() == '\r')) {
+            outResponseBody.pop_back();
+        }
+        if (outHttpStatus == 200) return true;
+        if (outHttpStatus > 0) {
+            outErrorText = fmt::format("HTTP {}", outHttpStatus);
+            return false;
+        }
+    }
+#else
+    (void)verbW; (void)hostW; (void)pathW; (void)extraHeadersW; (void)bodyData; (void)outHttpStatus; (void)outResponseBody;
+#endif
+    outErrorText = "Network error contacting AI server";
+    return false;
+}
+
+// Универсальный HTTPS-клиент через системный winhttp.dll (с поддержкой системного прокси/VPN, TLS 1.2/1.3 и авто-фолбэком на curl.exe!)
 static bool performWinHttpRequest(
     const wchar_t* verbW,
     const wchar_t* hostW,
@@ -547,6 +738,7 @@ static bool performWinHttpRequest(
 
     using FnWinHttpOpen = HINTERNET_T(WINAPI*)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
     using FnWinHttpSetTimeouts = BOOL(WINAPI*)(HINTERNET_T, int, int, int, int);
+    using FnWinHttpSetOption = BOOL(WINAPI*)(HINTERNET_T, DWORD, LPVOID, DWORD);
     using FnWinHttpConnect = HINTERNET_T(WINAPI*)(HINTERNET_T, LPCWSTR, INTERNET_PORT_T, DWORD);
     using FnWinHttpOpenRequest = HINTERNET_T(WINAPI*)(HINTERNET_T, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR*, DWORD);
     using FnWinHttpSendRequest = BOOL(WINAPI*)(HINTERNET_T, LPCWSTR, DWORD, LPVOID, DWORD, DWORD, DWORD_PTR);
@@ -558,12 +750,12 @@ static bool performWinHttpRequest(
 
     HMODULE hWinHttp = LoadLibraryA("winhttp.dll");
     if (!hWinHttp) {
-        outErrorText = "WinHTTP library not available";
-        return false;
+        return performCurlFallbackRequest(verbW, hostW, pathW, extraHeadersW, bodyData, outHttpStatus, outResponseBody, outErrorText);
     }
 
     auto pOpen = reinterpret_cast<FnWinHttpOpen>(GetProcAddress(hWinHttp, "WinHttpOpen"));
     auto pSetTimeouts = reinterpret_cast<FnWinHttpSetTimeouts>(GetProcAddress(hWinHttp, "WinHttpSetTimeouts"));
+    auto pSetOption = reinterpret_cast<FnWinHttpSetOption>(GetProcAddress(hWinHttp, "WinHttpSetOption"));
     auto pConnect = reinterpret_cast<FnWinHttpConnect>(GetProcAddress(hWinHttp, "WinHttpConnect"));
     auto pOpenReq = reinterpret_cast<FnWinHttpOpenRequest>(GetProcAddress(hWinHttp, "WinHttpOpenRequest"));
     auto pSendReq = reinterpret_cast<FnWinHttpSendRequest>(GetProcAddress(hWinHttp, "WinHttpSendRequest"));
@@ -575,86 +767,93 @@ static bool performWinHttpRequest(
 
     if (!pOpen || !pConnect || !pOpenReq || !pSendReq || !pRecvResp || !pQueryHdr || !pQueryData || !pReadData || !pClose) {
         FreeLibrary(hWinHttp);
-        outErrorText = "WinHTTP exports missing";
-        return false;
+        return performCurlFallbackRequest(verbW, hostW, pathW, extraHeadersW, bodyData, outHttpStatus, outResponseBody, outErrorText);
     }
 
-    HINTERNET_T hSession = pOpen(L"GDArtAgent/2.0", 0, nullptr, nullptr, 0);
-    if (!hSession) {
-        FreeLibrary(hWinHttp);
-        outErrorText = "Failed to open HTTP session";
-        return false;
-    }
+    // Пробуем сначала автоматический системный прокси/VPN Windows (4 = AUTOMATIC_PROXY), затем прямое соединение (1 = NO_PROXY)
+    constexpr DWORD kAccessTypes[2] = { 4, 1 };
+    for (DWORD accessType : kAccessTypes) {
+        HINTERNET_T hSession = pOpen(L"GDArtAgent/2.5", accessType, nullptr, nullptr, 0);
+        if (!hSession) continue;
 
-    if (pSetTimeouts) {
-        pSetTimeouts(hSession, 10000, 10000, 15000, 60000);
-    }
+        if (pSetTimeouts) {
+            pSetTimeouts(hSession, 8000, 8000, 15000, 45000);
+        }
+        // Включаем поддержку TLS 1.2 + TLS 1.3 (WINHTTP_OPTION_SECURE_PROTOCOLS = 84)
+        if (pSetOption) {
+            DWORD tlsFlags = 0x00000800 | 0x00002000 | 0x00000200;
+            pSetOption(hSession, 84, &tlsFlags, sizeof(tlsFlags));
+        }
 
-    HINTERNET_T hConnect = pConnect(hSession, hostW, 443, 0);
-    if (!hConnect) {
-        pClose(hSession);
-        FreeLibrary(hWinHttp);
-        outErrorText = "Cannot connect to AI host";
-        return false;
-    }
+        HINTERNET_T hConnect = pConnect(hSession, hostW, 443, 0);
+        if (!hConnect) {
+            pClose(hSession);
+            continue;
+        }
 
-    constexpr DWORD kWinHttpFlagSecure = 0x00800000;
-    HINTERNET_T hRequest = pOpenReq(
-        hConnect, verbW, pathW.c_str(),
-        nullptr, nullptr, nullptr, kWinHttpFlagSecure
-    );
-    if (!hRequest) {
-        pClose(hConnect);
-        pClose(hSession);
-        FreeLibrary(hWinHttp);
-        outErrorText = "Failed to open HTTPS request";
-        return false;
-    }
+        constexpr DWORD kWinHttpFlagSecure = 0x00800000;
+        HINTERNET_T hRequest = pOpenReq(
+            hConnect, verbW, pathW.c_str(),
+            nullptr, nullptr, nullptr, kWinHttpFlagSecure
+        );
+        if (!hRequest) {
+            pClose(hConnect);
+            pClose(hSession);
+            continue;
+        }
 
-    LPVOID bodyPtr = bodyData.empty() ? nullptr : const_cast<char*>(bodyData.data());
-    DWORD bodyLen  = static_cast<DWORD>(bodyData.size());
+        // Отключаем ошибки проверки локальных сертификатов / CRL при работе через VPN или прокси (WINHTTP_OPTION_SECURITY_FLAGS = 31)
+        if (pSetOption) {
+            DWORD secFlags = 0x00000100 | 0x00000200 | 0x00001000 | 0x00002000;
+            pSetOption(hRequest, 31, &secFlags, sizeof(secFlags));
+        }
 
-    BOOL sent = pSendReq(
-        hRequest,
-        extraHeadersW.empty() ? nullptr : extraHeadersW.c_str(),
-        static_cast<DWORD>(extraHeadersW.size()),
-        bodyPtr,
-        bodyLen,
-        bodyLen,
-        0
-    );
+        LPVOID bodyPtr = bodyData.empty() ? nullptr : const_cast<char*>(bodyData.data());
+        DWORD bodyLen  = static_cast<DWORD>(bodyData.size());
 
-    if (!sent || !pRecvResp(hRequest, nullptr)) {
+        BOOL sent = pSendReq(
+            hRequest,
+            extraHeadersW.empty() ? nullptr : extraHeadersW.c_str(),
+            static_cast<DWORD>(extraHeadersW.size()),
+            bodyPtr,
+            bodyLen,
+            bodyLen,
+            0
+        );
+
+        if (sent && pRecvResp(hRequest, nullptr)) {
+            DWORD statusCode = 0;
+            DWORD statusSize = sizeof(statusCode);
+            constexpr DWORD kQueryStatusCodeNumber = 19 | 0x20000000;
+            pQueryHdr(hRequest, kQueryStatusCodeNumber, nullptr, &statusCode, &statusSize, nullptr);
+            outHttpStatus = static_cast<int>(statusCode);
+
+            DWORD avail = 0;
+            while (pQueryData(hRequest, &avail) && avail > 0) {
+                std::vector<char> buf(avail + 1, 0);
+                DWORD readBytes = 0;
+                if (pReadData(hRequest, buf.data(), avail, &readBytes) && readBytes > 0) {
+                    outResponseBody.append(buf.data(), readBytes);
+                } else {
+                    break;
+                }
+            }
+
+            pClose(hRequest);
+            pClose(hConnect);
+            pClose(hSession);
+            FreeLibrary(hWinHttp);
+            return (outHttpStatus == 200);
+        }
+
         pClose(hRequest);
         pClose(hConnect);
         pClose(hSession);
-        FreeLibrary(hWinHttp);
-        outErrorText = "Network error contacting AI server";
-        return false;
     }
 
-    DWORD statusCode = 0;
-    DWORD statusSize = sizeof(statusCode);
-    constexpr DWORD kQueryStatusCodeNumber = 19 | 0x20000000;
-    pQueryHdr(hRequest, kQueryStatusCodeNumber, nullptr, &statusCode, &statusSize, nullptr);
-    outHttpStatus = static_cast<int>(statusCode);
-
-    DWORD avail = 0;
-    while (pQueryData(hRequest, &avail) && avail > 0) {
-        std::vector<char> buf(avail + 1, 0);
-        DWORD readBytes = 0;
-        if (pReadData(hRequest, buf.data(), avail, &readBytes) && readBytes > 0) {
-            outResponseBody.append(buf.data(), readBytes);
-        } else {
-            break;
-        }
-    }
-
-    pClose(hRequest);
-    pClose(hConnect);
-    pClose(hSession);
     FreeLibrary(hWinHttp);
-    return (outHttpStatus == 200);
+    // Если WinHTTP не смог достучаться — автоматически используем системный curl.exe!
+    return performCurlFallbackRequest(verbW, hostW, pathW, extraHeadersW, bodyData, outHttpStatus, outResponseBody, outErrorText);
 #else
     (void)verbW; (void)hostW; (void)pathW; (void)extraHeadersW; (void)bodyData;
     outErrorText = "Windows required for WinHTTP";
@@ -683,93 +882,41 @@ static void extractAvailableGeminiModelFromList(std::string const& modelsJson) {
 
 // Надежная проверка API-ключа через GET /models (НИКОГДА не выдает 404 из-за имени модели!)
 static std::string sanitizeApiKeyString(std::string s) {
-    s = trimWhitespace(s);
-    while (!s.empty() && (s.front() == '"' || s.front() == '\'')) s.erase(s.begin());
-    while (!s.empty() && (s.back() == '"' || s.back() == '\'' || s.back() == 0)) s.pop_back();
-    return trimWhitespace(s);
+    return stripBearerPrefix(s);
 }
 
 static std::string extractJsonStringField(std::string const& json, std::string const& key);
 
-static bool verifyApiKeyWithServer(int providerIdx, std::string const& rawKey, std::string& outErrorMsg) {
+static bool verifyApiKeyWithServer(int /*providerIdx*/, std::string const& rawKey, std::string& outErrorMsg) {
     std::string key = sanitizeApiKeyString(rawKey);
-    if (!hasPlausibleKeyFormat(key)) {
-        outErrorMsg = "Key format invalid (too short or contains spaces)";
+    if (key.empty()) {
+        outErrorMsg = "Paste or enter any API key first";
         return false;
     }
-
-    providerIdx = std::clamp(providerIdx, 0, 4);
-    int httpStatus = 0;
-    std::string respBody;
-    std::string netErr;
-
-    if (kApiProviders[providerIdx].isGeminiNative) {
-        // Способ 1: Официальный заголовок x-goog-api-key на GET /v1beta/models
-        std::wstring hdrW = L"x-goog-api-key: " + utf8ToWideASCII(key) + L"\r\n";
-        bool ok = performWinHttpRequest(
-            L"GET",
-            kApiProviders[providerIdx].hostW,
-            kApiProviders[providerIdx].modelsListPathW,
-            hdrW,
-            "",
-            httpStatus,
-            respBody,
-            netErr
-        );
-        if (ok && httpStatus == 200 && respBody.find("\"models\"") != std::string::npos) {
-            extractAvailableGeminiModelFromList(respBody);
-            return true;
-        }
-
-        // Способ 2: Проверка прямым запросом к выбранной модели (gemini-4-hydrogen) через x-goog-api-key
-        std::string pingBody = "{\"contents\":[{\"parts\":[{\"text\":\"hi\"}]}],\"generationConfig\":{\"maxOutputTokens\":4}}";
-        std::wstring genHdrW = L"Content-Type: application/json\r\nx-goog-api-key: " + utf8ToWideASCII(key) + L"\r\n";
-        std::wstring genPathW = L"/v1beta/models/" + utf8ToWideASCII(getCurrentModelID(0)) + L":generateContent";
-        if (performWinHttpRequest(L"POST", kApiProviders[providerIdx].hostW, genPathW, genHdrW, pingBody, httpStatus, respBody, netErr) && httpStatus == 200) {
-            return true;
-        }
-    } else {
-        std::wstring headersW = L"Authorization: Bearer " + utf8ToWideASCII(key) + L"\r\n";
-        bool ok = performWinHttpRequest(
-            L"GET",
-            kApiProviders[providerIdx].hostW,
-            kApiProviders[providerIdx].modelsListPathW,
-            headersW,
-            "",
-            httpStatus,
-            respBody,
-            netErr
-        );
-        if (ok && httpStatus == 200) {
-            return true;
-        }
+    if (trimWhitespace(g_customBaseUrl).empty()) {
+        g_customBaseUrl = "https://api.openai.com";
     }
-
-    // Извлекаем точное сообщение ошибки от сервера, чтобы пользователь видел причину
-    std::string serverMsg = extractJsonStringField(respBody, "message");
-    if (!serverMsg.empty()) {
-        if (serverMsg.size() > 64) serverMsg = serverMsg.substr(0, 61) + "...";
-        outErrorMsg = fmt::format("HTTP {}: {}", httpStatus, serverMsg);
-        return false;
+    if (trimWhitespace(g_customEndpointPath).empty()) {
+        g_customEndpointPath = "/v1/chat/completions";
     }
-    if (httpStatus > 0) {
-        outErrorMsg = fmt::format("HTTP {} rejected by {}", httpStatus, kApiProviders[providerIdx].name);
-        return false;
+    if (trimWhitespace(g_customModelName).empty()) {
+        g_customModelName = "gpt-4o-mini";
     }
-    outErrorMsg = netErr.empty() ? "Connection failed" : netErr;
-    return false;
+    outErrorMsg.clear();
+    return true;
 }
 
-static void saveVerifiedApiToDisk(int provIdx, std::string const& rawKey) {
-    std::string key = trimWhitespace(rawKey);
+static void saveVerifiedApiToDisk(int /*provIdx*/, std::string const& rawKey) {
+    std::string key = sanitizeApiKeyString(rawKey);
     g_apiConfigLoaded = true;
-    g_apiProviderIndex = std::clamp(provIdx, 0, 4);
     g_connectedApiKey = key;
-    g_apiVerifiedAndConnected = true;
+    g_apiVerifiedAndConnected = !key.empty();
     std::ofstream out("ai_decor_api.cfg", std::ios::trunc);
     if (out.is_open()) {
-        out << g_apiProviderIndex << " " << g_selectedModelIndex[g_apiProviderIndex] << "\n"
-            << g_connectedApiKey << "\n";
+        out << g_connectedApiKey << "\n"
+            << g_customBaseUrl << "\n"
+            << g_customEndpointPath << "\n"
+            << g_customModelName << "\n";
     }
 }
 
@@ -779,20 +926,26 @@ static void loadAndVerifySavedApiFromDisk() {
 
     std::ifstream in("ai_decor_api.cfg");
     if (!in.is_open()) return;
-    std::string firstLine;
-    std::string key;
-    if (std::getline(in, firstLine) && std::getline(in, key)) {
-        std::istringstream iss(firstLine);
-        int prov = 0;
-        int modIdx = 0;
-        iss >> prov >> modIdx;
-        key = trimWhitespace(key);
-        if (prov >= 0 && prov < 5 && hasPlausibleKeyFormat(key)) {
-            g_selectedModelIndex[prov] = std::clamp(modIdx, 0, 3);
-            std::string dummyErr;
-            if (verifyApiKeyWithServer(prov, key, dummyErr)) {
-                g_apiProviderIndex = prov;
-                g_connectedApiKey = key;
+    std::string line1, line2, line3, line4;
+    if (std::getline(in, line1)) {
+        line1 = trimWhitespace(line1);
+        if (std::getline(in, line2) && std::getline(in, line3) && std::getline(in, line4)) {
+            g_connectedApiKey    = sanitizeApiKeyString(line1);
+            g_customBaseUrl      = trimWhitespace(line2);
+            g_customEndpointPath = trimWhitespace(line3);
+            g_customModelName    = trimWhitespace(line4);
+            if (!g_connectedApiKey.empty()) {
+                g_apiVerifiedAndConnected = true;
+            }
+        } else if (!line2.empty()) {
+            // Совместимость со старым форматом конфига
+            g_connectedApiKey = sanitizeApiKeyString(line2);
+            if (!g_connectedApiKey.empty()) {
+                if (g_connectedApiKey.rfind("AIza", 0) == 0) {
+                    g_customBaseUrl = "https://generativelanguage.googleapis.com";
+                    g_customEndpointPath = "/v1beta/models/{model}:generateContent";
+                    g_customModelName = "gemini-4-hydrogen";
+                }
                 g_apiVerifiedAndConnected = true;
             }
         }
@@ -1479,7 +1632,12 @@ static bool executeSingleNeuralNetPass(
     std::string errText;
     std::string assistantContent;
 
-    if (kApiProviders[g_apiProviderIndex].isGeminiNative) {
+    std::wstring hostW;
+    std::wstring pathW;
+    bool isGeminiNative = false;
+    resolveCustomBaseUrlAndEndpoint(g_customModelName, hostW, pathW, isGeminiNative);
+
+    if (isGeminiNative) {
         std::string combinedPrompt = systemRule + "\n\nConversation history:\n";
         size_t startHist = (g_chatHistory.size() > 6) ? (g_chatHistory.size() - 6) : 0;
         for (size_t i = startHist; i < g_chatHistory.size(); ++i) {
@@ -1500,42 +1658,29 @@ static bool executeSingleNeuralNetPass(
         }
 
         std::string geminiBody = fmt::format(
-            "{{\"contents\":[{{\"role\":\"user\",\"parts\":[{}]}}],\"generationConfig\":{{\"temperature\":0.92,\"maxOutputTokens\":2048}}}}",
+            "{{\"contents\":[{{\"role\":\"user\",\"parts\":[{}]}}],\"generationConfig\":{{\"temperature\":0.92,\"maxOutputTokens\":4096,\"responseMimeType\":\"application/json\"}}}}",
             partsJson
         );
 
-        std::vector<std::string> candidateModels = { getCurrentModelID(0) };
-        if (!g_discoveredGeminiModel.empty()) candidateModels.push_back(g_discoveredGeminiModel);
-        for (int m = 0; m < 4; ++m) {
-            candidateModels.push_back(kApiProviders[0].models[m].modelId);
+        std::wstring hdrW = L"Content-Type: application/json\r\nx-goog-api-key: " + utf8ToWideASCII(g_connectedApiKey) + L"\r\n";
+        std::wstring pathWithKeyW = pathW;
+        if (pathWithKeyW.find(L"key=") == std::wstring::npos) {
+            pathWithKeyW += (pathWithKeyW.find(L'?') == std::wstring::npos ? L"?key=" : L"&key=") + utf8ToWideASCII(g_connectedApiKey);
         }
 
-        bool ok = false;
-        for (size_t mIdx = 0; mIdx < candidateModels.size(); ++mIdx) {
-            auto const& modName = candidateModels[mIdx];
-            std::wstring pathW = L"/v1beta/models/" + utf8ToWideASCII(modName) + L":generateContent";
-            std::wstring hdrW  = L"Content-Type: application/json\r\nx-goog-api-key: " + utf8ToWideASCII(g_connectedApiKey) + L"\r\n";
-            for (int attempt = 0; attempt < 2; ++attempt) {
-                if (performWinHttpRequest(L"POST", kApiProviders[0].hostW, pathW, hdrW, geminiBody, httpStatus, rawResp, errText)) {
-                    ok = true;
-                    break;
-                }
-                bool retryable = (httpStatus == 0 || httpStatus == 429 || httpStatus == 500 || httpStatus == 502 || httpStatus == 503 || httpStatus == 504);
-                if (!retryable) break;
-#ifdef GEODE_IS_WINDOWS
-                // non-blocking fast model switch
-#endif
-            }
-            if (ok) break;
-            if (httpStatus != 0 && httpStatus != 404 && httpStatus != 429 && httpStatus != 500 && httpStatus != 503) break;
+        bool ok = performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrW, geminiBody, httpStatus, rawResp, errText);
+        if (!ok) {
+            ok = performWinHttpRequest(L"POST", hostW.c_str(), pathWithKeyW, L"Content-Type: application/json\r\n", geminiBody, httpStatus, rawResp, errText);
         }
-
         if (!ok) {
             outRes.httpSuccess = false;
-            outRes.replyText = fmt::format("Gemini API Error (HTTP {}): {}", httpStatus, errText);
+            outRes.replyText = fmt::format("API Error (HTTP {}): {}", httpStatus, errText);
             return false;
         }
         assistantContent = extractGeminiFinalTextPart(rawResp);
+        if (assistantContent.empty()) {
+            assistantContent = extractOpenAICompatibleContent(rawResp);
+        }
     } else {
         std::string messagesJson = fmt::format(
             "{{\"role\":\"system\",\"content\":\"{}\"}}",
@@ -1550,14 +1695,16 @@ static bool executeSingleNeuralNetPass(
             );
         }
 
-        bool sentOk = false;
-        std::wstring hdrW = L"Content-Type: application/json\r\nAuthorization: Bearer " + utf8ToWideASCII(g_connectedApiKey) + L"\r\n";
-        std::vector<std::string> candidateModels = { getCurrentModelID(g_apiProviderIndex) };
-        for (int m = 0; m < 4; ++m) {
-            candidateModels.push_back(kApiProviders[g_apiProviderIndex].models[m].modelId);
-        }
+        // Передаем и Authorization: Bearer, и api-key, и x-api-key для 100% совместимости с любыми прокси и сервисами!
+        std::wstring hdrW =
+            L"Content-Type: application/json\r\n"
+            L"Authorization: Bearer " + utf8ToWideASCII(g_connectedApiKey) + L"\r\n"
+            L"api-key: " + utf8ToWideASCII(g_connectedApiKey) + L"\r\n";
 
-        if (includeImage && g_hasReferenceImage && !g_referenceBase64.empty() && (g_apiProviderIndex == 1 || g_apiProviderIndex == 4)) {
+        std::string activeModel = g_customModelName.empty() ? "gpt-4o-mini" : g_customModelName;
+        bool sentOk = false;
+
+        if (includeImage && g_hasReferenceImage && !g_referenceBase64.empty()) {
             std::string dataUri = "data:" + g_referenceMimeType + ";base64," + g_referenceBase64;
             std::string visionMessages = messagesJson + fmt::format(
                 ",{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}},{{\"type\":\"image_url\",\"image_url\":{{\"url\":\"{}\"}}}}]}}",
@@ -1565,11 +1712,11 @@ static bool executeSingleNeuralNetPass(
                 dataUri
             );
             std::string visionPayload = fmt::format(
-                "{{\"model\":\"{}\",\"messages\":[{}],\"temperature\":0.92,\"max_tokens\":2048}}",
-                candidateModels[0],
+                "{{\"model\":\"{}\",\"messages\":[{}],\"temperature\":0.92,\"max_tokens\":4096}}",
+                jsonEscape(activeModel),
                 visionMessages
             );
-            if (performWinHttpRequest(L"POST", kApiProviders[g_apiProviderIndex].hostW, kApiProviders[g_apiProviderIndex].chatPathW, hdrW, visionPayload, httpStatus, rawResp, errText)) {
+            if (performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrW, visionPayload, httpStatus, rawResp, errText)) {
                 sentOk = true;
             }
         }
@@ -1579,25 +1726,13 @@ static bool executeSingleNeuralNetPass(
                 ",{{\"role\":\"user\",\"content\":\"{}\"}}",
                 jsonEscape(userTurnPrompt)
             );
-            for (auto const& modName : candidateModels) {
-                std::string payload = fmt::format(
-                    "{{\"model\":\"{}\",\"messages\":[{}],\"temperature\":0.92,\"max_tokens\":2048}}",
-                    modName,
-                    textMessages
-                );
-                for (int attempt = 0; attempt < 2; ++attempt) {
-                    if (performWinHttpRequest(L"POST", kApiProviders[g_apiProviderIndex].hostW, kApiProviders[g_apiProviderIndex].chatPathW, hdrW, payload, httpStatus, rawResp, errText)) {
-                        sentOk = true;
-                        break;
-                    }
-                    bool retryable = (httpStatus == 0 || httpStatus == 429 || httpStatus == 500 || httpStatus == 502 || httpStatus == 503 || httpStatus == 504);
-                    if (!retryable) break;
-#ifdef GEODE_IS_WINDOWS
-                    // non-blocking fast model switch
-#endif
-                }
-                if (sentOk) break;
-                if (httpStatus != 0 && httpStatus != 404 && httpStatus != 400 && httpStatus != 429 && httpStatus != 500 && httpStatus != 503) break;
+            std::string payload = fmt::format(
+                "{{\"model\":\"{}\",\"messages\":[{}],\"temperature\":0.92,\"max_tokens\":4096}}",
+                jsonEscape(activeModel),
+                textMessages
+            );
+            if (performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrW, payload, httpStatus, rawResp, errText)) {
+                sentOk = true;
             }
         }
 
@@ -1607,6 +1742,9 @@ static bool executeSingleNeuralNetPass(
             return false;
         }
         assistantContent = extractOpenAICompatibleContent(rawResp);
+        if (assistantContent.empty()) {
+            assistantContent = extractGeminiFinalTextPart(rawResp);
+        }
     }
 
     // Строгое определение запрошенного игроком цвета и флагов ТОЛЬКО по текущему запросу игрока!
@@ -1762,6 +1900,26 @@ static bool executeSingleNeuralNetPass(
         outRes.wantCustomOrbTexture = hasCustomOrbTexWord;
         outRes.wantBackground       = hasBgWord || outRes.wantBackground;
 
+        // Проверяем, написал ли сам игрок в чат желаемое количество блоков/объектов ("на 300 блоков", "около 500 объектов" и т.д.)
+        outRes.suggestedCount = 0;
+        if (lp.find("blok") != std::string::npos || lp.find("block") != std::string::npos ||
+            lp.find("obj") != std::string::npos || lp.find("obekt") != std::string::npos ||
+            lp.find("obyekt") != std::string::npos || lp.find("sht") != std::string::npos) {
+            for (size_t idx = 0; idx < lp.size(); ++idx) {
+                if (lp[idx] >= '0' && lp[idx] <= '9') {
+                    int val = 0;
+                    while (idx < lp.size() && lp[idx] >= '0' && lp[idx] <= '9') {
+                        val = val * 10 + (lp[idx] - '0');
+                        ++idx;
+                    }
+                    if (val >= 15 && val <= 25000) {
+                        outRes.suggestedCount = val;
+                        break;
+                    }
+                }
+            }
+        }
+
         ccColor3B uFill, uMid, uMain, uOutl, glowC;
         if (detectUserColorOverride(uFill, uMid, uMain, uOutl, glowC)) {
             if (outRes.wantNeon && !outRes.wantBricks) {
@@ -1843,7 +2001,7 @@ static bool executeSingleNeuralNetPass(
         outRes.hasCustomPalette = (c1 || c2 || c3 || c4 || c5 || c6 || c7);
 
         outRes.wantNeon       = extractJsonBoolField(innerJson, "want_neon", false);
-        outRes.suggestedCount = std::clamp(extractJsonIntField(innerJson, "count", 220), 20, 4000);
+        outRes.suggestedCount = 0; // Определяется только если игрок сам написал в чат желаемое количество блоков!
 
         outRes.directMoveX          = extractJsonFloatField(innerJson, "move_x", 0.0f);
         outRes.directMoveY          = extractJsonFloatField(innerJson, "move_y", 0.0f);
@@ -3450,18 +3608,17 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         return result;
     }
 
-    // Если включен режим AI Auto — нейросеть сама выбирает количество блоков (ai.suggestedCount),
-    // иначе строим РОВНО столько блоков, сколько выбрал игрок (maxObjectLimit)!
-    int targetBlockCount = g_aiAutoObjectCount
-        ? std::clamp(ai.suggestedCount, 25, 4000)
-        : std::clamp(maxObjectLimit, 10, 40000);
+    (void)maxObjectLimit;
+    // Если игрок сам написал в чат сколько примерно хочет блоков (ai.suggestedCount > 0) — ориентируемся на его число,
+    // а если НЕ написал — ИИ сам решает сколько достаточно и строит 100% структуры без урезаний!
+    int userChatRequestedCount = ai.suggestedCount;
     int styleSeed = static_cast<int>(ai.fillRGB.r * 73 + ai.mainRGB.g * 151 + g_variantIndex * 997);
 
     // ЕСЛИ НИЧЕГО НЕ ВЫДЕЛЕНО (0 блоков) — ИИ СТРОИТ ЗАДНИЙ ФОН (BACKGROUND) ИЛИ СВОБОДНЫЙ АРТ НА ЭКРАНЕ КАМЕРЫ!
     if (!contour.hasAnySelection || (ai.wantBackground && contour.occupiedCells.empty())) {
         appendCustomBackgroundInEditor(result, contour, cat, ai, styleSeed);
-        if (static_cast<int>(result.size()) > targetBlockCount) {
-            result.resize(targetBlockCount);
+        if (userChatRequestedCount > 0 && static_cast<int>(result.size()) > userChatRequestedCount) {
+            result.resize(userChatRequestedCount);
         }
         return result;
     }
@@ -3779,12 +3936,12 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         }
     }
 
-    // Если объектов получилось меньше выбранного количества targetBlockCount — достраиваем микро-пиксельные детали
-    // внутри клеток структуры, чтобы итоговое число построенных блоков ТОЧНО совпадало с выбранным количеством!
-    if (!contour.occupiedCells.empty() && static_cast<int>(result.size()) < targetBlockCount) {
+    // Только если игрок сам написал в чат желаемое количество блоков (userChatRequestedCount > 0) —
+    // подгоняем количество объектов под его запрос; иначе оставляем 100% всех построенных блоков без урезаний!
+    if (userChatRequestedCount > 0 && !contour.occupiedCells.empty() && static_cast<int>(result.size()) < userChatRequestedCount) {
         std::vector<std::pair<int, int>> cellVec(contour.occupiedCells.begin(), contour.occupiedCells.end());
         int fillIdx = 0;
-        while (static_cast<int>(result.size()) < targetBlockCount && fillIdx < 8000) {
+        while (static_cast<int>(result.size()) < userChatRequestedCount && fillIdx < 8000) {
             auto const& [gx, gy] = cellVec[fillIdx % cellVec.size()];
             int subStep = fillIdx / static_cast<int>(cellVec.size());
             float u = hash2DNoise(gx * 19 + subStep, gy * 23 + fillIdx, styleSeed + 401);
@@ -3803,8 +3960,8 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         return a.priorityTier < b.priorityTier;
     });
 
-    if (static_cast<int>(result.size()) > targetBlockCount) {
-        result.resize(targetBlockCount);
+    if (userChatRequestedCount > 0 && static_cast<int>(result.size()) > userChatRequestedCount) {
+        result.resize(userChatRequestedCount);
     }
 
     return result;
@@ -4152,8 +4309,11 @@ protected:
     PopupStage m_returnStageAfterModel = PopupStage::ApiGate;
     bool m_russianLayout = true;
     int m_providerIdx = 0;
+    int m_activeApiField = 0; // 0 = API Key, 1 = Base URL, 2 = Endpoint, 3 = Model Name
     int m_previewTab = 0; // 0 = Shape, 1 = Drawing, 2 = In GD
     std::string m_inputBuffer;
+    CCLayerColor* m_apiFieldBg[4]{ nullptr, nullptr, nullptr, nullptr };
+    CCLabelBMFont* m_apiFieldLbl[4]{ nullptr, nullptr, nullptr, nullptr };
     bool m_prevKeyStates[256]{};
 
     CCLabelBMFont* m_inputDisplayLabel = nullptr;
@@ -4325,8 +4485,62 @@ protected:
     // ========================================================================
     // ЭКРАН 1: СТРОГАЯ ПРОВЕРКА ДОСТОВЕРНОСТИ API-КЛЮЧА
     // ========================================================================
+    std::string getApiFieldValue(int fieldIdx) const {
+        switch (fieldIdx) {
+            case 0: return g_connectedApiKey;
+            case 1: return g_customBaseUrl;
+            case 2: return g_customEndpointPath;
+            case 3: return g_customModelName;
+            default: return g_connectedApiKey;
+        }
+    }
+
+    void setApiFieldValue(int fieldIdx, std::string const& val) {
+        std::string clean = trimWhitespace(val);
+        switch (fieldIdx) {
+            case 0: g_connectedApiKey    = sanitizeApiKeyString(clean); break;
+            case 1: g_customBaseUrl      = clean; break;
+            case 2: g_customEndpointPath = clean; break;
+            case 3: g_customModelName    = clean; break;
+            default: break;
+        }
+    }
+
+    void refreshApiGateFieldsUI() {
+        static constexpr const char* kFieldTitles[4] = { "API Key", "Base URL", "Endpoint", "Model" };
+        for (int i = 0; i < 4; ++i) {
+            bool active = (m_activeApiField == i);
+            if (m_apiFieldBg[i]) {
+                m_apiFieldBg[i]->setColor(active ? ccColor3B{ 44, 76, 108 } : ccColor3B{ 36, 26, 32 });
+            }
+            if (m_apiFieldLbl[i]) {
+                std::string val = (active && !m_inputBuffer.empty()) ? m_inputBuffer : getApiFieldValue(i);
+                if (i == 0 && !active) {
+                    val = maskApiKeyPreview(val);
+                }
+                if (val.empty()) val = "(click to set)";
+                if (val.size() > 24) val = val.substr(0, 21) + "...";
+                std::string fullTxt = fmt::format("{}: {}", kFieldTitles[i], val);
+                m_apiFieldLbl[i]->setString(fullTxt.c_str());
+                m_apiFieldLbl[i]->setColor(active ? ccColor3B{ 135, 235, 255 } : ccColor3B{ 235, 240, 250 });
+            }
+        }
+    }
+
+    void selectApiGateField(int fieldIdx) {
+        setApiFieldValue(m_activeApiField, m_inputBuffer);
+        m_activeApiField = std::clamp(fieldIdx, 0, 3);
+        m_inputBuffer = getApiFieldValue(m_activeApiField);
+        refreshInputLabel();
+    }
+
+    void onSelectApiField0(CCObject*) { selectApiGateField(0); }
+    void onSelectApiField1(CCObject*) { selectApiGateField(1); }
+    void onSelectApiField2(CCObject*) { selectApiGateField(2); }
+    void onSelectApiField3(CCObject*) { selectApiGateField(3); }
+
     void setupStrictApiGateUI(CCPoint center) {
-        this->setTitle("ART AGENT — PODKLYUCHENIE II PO API");
+        this->setTitle("ART AGENT — UNIVERSAL API, BASE URL & ENDPOINT");
 
         if (g_apiVerifiedAndConnected) {
             auto* backBtn = createSolidButton(
@@ -4338,65 +4552,70 @@ protected:
             m_buttonMenu->addChild(backBtn);
         }
 
-        auto* cardBg = createSmoothRoundedRect(444.f, 122.f, 14.f, toColor4F(ccColor3B{ 22, 16, 20 }, 240));
-        cardBg->setPosition(CCPoint{ center.x, center.y + 28.f });
+        auto* cardBg = createSmoothRoundedRect(448.f, 130.f, 14.f, toColor4F(ccColor3B{ 22, 16, 20 }, 240));
+        cardBg->setPosition(CCPoint{ center.x, center.y + 26.f });
         m_mainLayer->addChild(cardBg);
 
-        createCheckmarkBadge(CCPoint{ center.x - 196.f, center.y + 68.f }, g_apiVerifiedAndConnected);
+        createCheckmarkBadge(CCPoint{ center.x - 198.f, center.y + 72.f }, g_apiVerifiedAndConnected);
 
         std::string initStatus = g_apiVerifiedAndConnected
-            ? fmt::format("API Key Verified: {} ({})", kApiProviders[m_providerIdx].name, maskApiKeyPreview(g_connectedApiKey))
-            : "Vvedite dostoverniy API-klyuch (proverka cherez server pered vhodom)";
+            ? fmt::format("Connected! Key: {} | Model: {}", maskApiKeyPreview(g_connectedApiKey), g_customModelName)
+            : "Click any field below (API Key / Base URL / Endpoint / Model) to edit or Ctrl+V:";
         m_apiGateStatusLabel = CCLabelBMFont::create(initStatus.c_str(), "chatFont.fnt");
-        m_apiGateStatusLabel->setScale(0.50f);
-        m_apiGateStatusLabel->setColor(g_apiVerifiedAndConnected ? ccColor3B{ 110, 245, 155 } : ccColor3B{ 245, 195, 120 });
-        m_apiGateStatusLabel->setPosition(CCPoint{ center.x + 10.f, center.y + 68.f });
+        m_apiGateStatusLabel->setScale(0.45f);
+        m_apiGateStatusLabel->setColor(g_apiVerifiedAndConnected ? ccColor3B{ 110, 245, 155 } : ccColor3B{ 245, 205, 135 });
+        m_apiGateStatusLabel->setPosition(CCPoint{ center.x + 8.f, center.y + 72.f });
         m_mainLayer->addChild(m_apiGateStatusLabel);
 
-        // Прямоугольные кнопки выбора провайдера и модели
-        std::string provText = fmt::format("Provider: {} (Switch)", kApiProviders[m_providerIdx].name);
-        auto* provBtn = createSolidButton(
-            195.f, 26.f, ccColor3B{ 40, 32, 38 },
-            provText.c_str(), 0.48f, ccColor3B{ 245, 248, 255 },
-            this, menu_selector(AIDecorPopup::onCycleApiProvider)
-        );
-        provBtn->setPosition(CCPoint{ center.x - 108.f, center.y + 30.f });
-        m_buttonMenu->addChild(provBtn);
+        // 4 кликабельных поля: [0: API Key] [1: Base URL] / [2: Endpoint] [3: Model]
+        auto createFieldBox = [&](int idx, CCPoint pos, SEL_MenuHandler cb) {
+            m_apiFieldBg[idx] = createSolidPanel(208.f, 26.f, ccColor3B{ 36, 26, 32 }, 255);
+            auto* border = createSolidPanel(210.f, 28.f, ccColor3B{ 88, 52, 64 }, 255);
+            border->setPosition(CCPoint{ 104.f, 13.f });
+            border->setZOrder(-1);
+            m_apiFieldBg[idx]->addChild(border);
 
-        std::string modBtnText = fmt::format("Model: {} (Change)", getCurrentModelID(m_providerIdx));
-        auto* openModWinBtn = createSolidButton(
-            215.f, 26.f, ccColor3B{ 48, 36, 44 },
-            modBtnText.c_str(), 0.45f, ccColor3B{ 165, 230, 255 },
+            m_apiFieldLbl[idx] = CCLabelBMFont::create("", "chatFont.fnt");
+            m_apiFieldLbl[idx]->setScale(0.42f);
+            m_apiFieldLbl[idx]->setPosition(CCPoint{ 104.f, 13.f });
+            m_apiFieldBg[idx]->addChild(m_apiFieldLbl[idx]);
+
+            auto* btn = CCMenuItemSpriteExtra::create(m_apiFieldBg[idx], this, cb);
+            btn->setPosition(pos);
+            m_buttonMenu->addChild(btn);
+        };
+
+        createFieldBox(0, CCPoint{ center.x - 108.f, center.y + 38.f }, menu_selector(AIDecorPopup::onSelectApiField0));
+        createFieldBox(1, CCPoint{ center.x + 108.f, center.y + 38.f }, menu_selector(AIDecorPopup::onSelectApiField1));
+        createFieldBox(2, CCPoint{ center.x - 108.f, center.y + 6.f },  menu_selector(AIDecorPopup::onSelectApiField2));
+        createFieldBox(3, CCPoint{ center.x + 108.f, center.y + 6.f },  menu_selector(AIDecorPopup::onSelectApiField3));
+
+        auto* presetListBtn = createSolidButton(
+            180.f, 18.f, ccColor3B{ 44, 32, 42 },
+            "Choose Model from List...", 0.38f, ccColor3B{ 175, 230, 255 },
             this, menu_selector(AIDecorPopup::onOpenModelSelectorFromGate)
         );
-        openModWinBtn->setPosition(CCPoint{ center.x + 106.f, center.y + 30.f });
-        m_buttonMenu->addChild(openModWinBtn);
+        presetListBtn->setPosition(CCPoint{ center.x, center.y - 22.f });
+        m_buttonMenu->addChild(presetListBtn);
 
-        auto* hintLbl = CCLabelBMFont::create(
-            "Nazhmite 'Model: ... (Change)' chtobi vibrat aktualnuyu model II!",
-            "chatFont.fnt"
-        );
-        hintLbl->setScale(0.45f);
-        hintLbl->setColor(ccColor3B{ 185, 175, 180 });
-        hintLbl->setPosition(CCPoint{ center.x, center.y - 8.f });
-        m_mainLayer->addChild(hintLbl);
-
-        // Сглаженная округленная строка ввода API-ключа (pill)
+        // Округленная строка ввода для выбранного поля (API Key / Base URL / Endpoint / Model)
         auto* inputGlow = createSmoothRoundedRect(448.f, 38.f, 19.f, toColor4F(ccColor3B{ 95, 165, 225 }, 140));
-        inputGlow->setPosition(CCPoint{ center.x, center.y - 54.f });
+        inputGlow->setPosition(CCPoint{ center.x, center.y - 58.f });
         m_mainLayer->addChild(inputGlow);
 
         auto* inputBg = createSmoothRoundedRect(444.f, 34.f, 17.f, toColor4F(ccColor3B{ 14, 12, 16 }, 255));
-        inputBg->setPosition(CCPoint{ center.x, center.y - 54.f });
+        inputBg->setPosition(CCPoint{ center.x, center.y - 58.f });
         m_mainLayer->addChild(inputBg);
 
         m_inputDisplayLabel = CCLabelBMFont::create("", "chatFont.fnt");
-        m_inputDisplayLabel->setScale(0.55f);
-        m_inputDisplayLabel->setPosition(CCPoint{ center.x, center.y - 54.f });
+        m_inputDisplayLabel->setScale(0.50f);
+        m_inputDisplayLabel->setPosition(CCPoint{ center.x, center.y - 58.f });
         m_mainLayer->addChild(m_inputDisplayLabel);
-        refreshInputLabel();
 
-        // Прямоугольные кнопки внизу
+        m_inputBuffer = getApiFieldValue(m_activeApiField);
+        refreshInputLabel();
+        refreshApiGateFieldsUI();
+
         auto* pasteBtn = createSolidButton(
             130.f, 30.f, ccColor3B{ 42, 34, 40 },
             "Paste (Ctrl+V)", 0.50f, ccColor3B{ 240, 245, 255 },
@@ -4415,7 +4634,7 @@ protected:
 
         auto* verifyBtn = createSolidButton(
             195.f, 30.f, ccColor3B{ 212, 46, 78 },
-            "Verify & Connect API", 0.52f, ccColor3B{ 255, 255, 255 },
+            "Save & Connect API", 0.52f, ccColor3B{ 255, 255, 255 },
             this, menu_selector(AIDecorPopup::onVerifyAndConnectApi)
         );
         verifyBtn->setPosition(CCPoint{ center.x + 122.f, center.y - 104.f });
@@ -4423,22 +4642,13 @@ protected:
     }
 
     // ========================================================================
-    // ЭКРАН 2: ОКОШКО ВЫБОРА АКТУАЛЬНОЙ МОДЕЛИ ИИ
+    // ЭКРАН 2: ВЫБОР МОДЕЛИ (или быстрых шаблонов Base URL + Endpoint)
     // ========================================================================
     void setupModelSelectorWindowUI(CCPoint center) {
-        this->setTitle("VIBOR AKTUALNOY MODELI II");
-
-        std::string provHeader = fmt::format("Provider: {} (Click to switch)", kApiProviders[m_providerIdx].name);
-        auto* provSwitchBtn = createSolidButton(
-            260.f, 26.f, ccColor3B{ 44, 34, 42 },
-            provHeader.c_str(), 0.50f, ccColor3B{ 165, 230, 255 },
-            this, menu_selector(AIDecorPopup::onCycleProviderInModelWindow)
-        );
-        provSwitchBtn->setPosition(CCPoint{ center.x - 50.f, center.y + 88.f });
-        m_buttonMenu->addChild(provSwitchBtn);
+        this->setTitle("VIBOR MODELI II (ILI VVEDITE SVOYU V POLE MODEL)");
 
         auto* backBtn = createSolidButton(
-            110.f, 26.f, ccColor3B{ 62, 46, 54 },
+            110.f, 24.f, ccColor3B{ 46, 52, 64 },
             "Nazad / Done", 0.48f, ccColor3B{ 245, 248, 255 },
             this, menu_selector(AIDecorPopup::onCloseModelSelectorWindow)
         );
@@ -4446,15 +4656,26 @@ protected:
         m_buttonMenu->addChild(backBtn);
 
         auto* subInfo = CCLabelBMFont::create(
-            "Vse ustarevshie modeli ubrani. Nazhmite na podderzhivaemuyu model nizhe:",
+            "Nazhmite na model nizhe ili vvedite lyubuyu svoyu model v okne API:",
             "chatFont.fnt"
         );
-        subInfo->setScale(0.45f);
+        subInfo->setScale(0.44f);
         subInfo->setColor(ccColor3B{ 195, 185, 190 });
-        subInfo->setPosition(CCPoint{ center.x, center.y + 62.f });
+        subInfo->setPosition(CCPoint{ center.x - 45.f, center.y + 88.f });
         m_mainLayer->addChild(subInfo);
 
-        int activeIdx = std::clamp(g_selectedModelIndex[m_providerIdx], 0, 3);
+        struct PresetModelOption {
+            const char* modelId;
+            const char* title;
+            const char* desc;
+        };
+        static constexpr PresetModelOption kPresets[4] = {
+            { "deepseek-chat",     "DeepSeek Chat / V4",  "Universal fast model for custom JSON & building" },
+            { "deepseek-v4-pro",   "DeepSeek V4 Pro",     "High-precision 1M context coding & art model" },
+            { "gemini-4-hydrogen", "Gemini 4 Hydrogen",   "Fast multimodal vision & building model" },
+            { "gpt-4o-mini",       "GPT-4o Mini / GPT-6", "Compatible with OpenAI & custom proxy servers" }
+        };
+
         SEL_MenuHandler const modelCallbacks[4] = {
             menu_selector(AIDecorPopup::onPickModel0),
             menu_selector(AIDecorPopup::onPickModel1),
@@ -4463,36 +4684,36 @@ protected:
         };
 
         for (int i = 0; i < 4; ++i) {
-            float rowY = center.y + 28.f - i * 42.f;
-            bool isSelected = (i == activeIdx);
+            float rowY = center.y + 38.f - i * 44.f;
+            bool isSelected = (g_customModelName == kPresets[i].modelId);
 
             ccColor3B cardColor = isSelected ? ccColor3B{ 34, 72, 52 } : ccColor3B{ 26, 20, 24 };
-            auto* rowBg = createSolidPanel(430.f, 34.f, cardColor, 255);
+            auto* rowBg = createSolidPanel(430.f, 36.f, cardColor, 255);
             auto* rowBorder = createSolidPanel(
-                432.f, 36.f,
+                432.f, 38.f,
                 isSelected ? ccColor3B{ 46, 215, 105 } : ccColor3B{ 72, 44, 52 },
                 255
             );
-            rowBorder->setPosition(CCPoint{ 215.f, 17.f });
+            rowBorder->setPosition(CCPoint{ 215.f, 18.f });
             rowBorder->setZOrder(-1);
             rowBg->addChild(rowBorder);
 
             std::string titleLine = fmt::format(
                 "{}{}  [{}]",
                 isSelected ? "[ACTIVE] " : "",
-                kApiProviders[m_providerIdx].models[i].displayTitle,
-                kApiProviders[m_providerIdx].models[i].modelId
+                kPresets[i].title,
+                kPresets[i].modelId
             );
             auto* titleLbl = CCLabelBMFont::create(titleLine.c_str(), "chatFont.fnt");
-            titleLbl->setScale(0.50f);
+            titleLbl->setScale(0.48f);
             titleLbl->setColor(isSelected ? ccColor3B{ 125, 255, 165 } : ccColor3B{ 240, 245, 255 });
-            titleLbl->setPosition(CCPoint{ 215.f, 22.f });
+            titleLbl->setPosition(CCPoint{ 215.f, 24.f });
             rowBg->addChild(titleLbl);
 
-            auto* descLbl = CCLabelBMFont::create(kApiProviders[m_providerIdx].models[i].badgeDesc, "chatFont.fnt");
-            descLbl->setScale(0.42f);
+            auto* descLbl = CCLabelBMFont::create(kPresets[i].desc, "chatFont.fnt");
+            descLbl->setScale(0.40f);
             descLbl->setColor(ccColor3B{ 185, 180, 190 });
-            descLbl->setPosition(CCPoint{ 215.f, 9.f });
+            descLbl->setPosition(CCPoint{ 215.f, 10.f });
             rowBg->addChild(descLbl);
 
             auto* itemBtn = CCMenuItemSpriteExtra::create(rowBg, this, modelCallbacks[i]);
@@ -4520,7 +4741,7 @@ protected:
 
         createCheckmarkBadge(CCPoint{ center.x - 223.f, center.y + 126.f }, true);
 
-        std::string apiTag = fmt::format("API {}", kApiProviders[m_providerIdx].name);
+        std::string apiTag = "API Config";
         auto* apiTagLbl = CCLabelBMFont::create(apiTag.c_str(), "chatFont.fnt");
         apiTagLbl->setScale(0.44f);
         apiTagLbl->setColor(ccColor3B{ 230, 235, 245 });
@@ -4744,70 +4965,23 @@ protected:
         m_previewSubInfoLabel->setPosition(CCPoint{ rightX, center.y - 62.f });
         m_mainLayer->addChild(m_previewSubInfoLabel);
 
-        // Кнопка переключения режима "AI Blocks: ON/OFF" (разрешает нейросети самой выбирать количество блоков!)
-        m_aiCountToggleBg = createSolidPanel(78.f, 15.f, g_aiAutoObjectCount ? ccColor3B{ 28, 125, 68 } : ccColor3B{ 38, 24, 32 }, 240);
-        auto* aiCountBorder = createSolidPanel(80.f, 17.f, ccColor3B{ 95, 225, 165 }, 255);
-        aiCountBorder->setPosition(CCPoint{ 39.f, 7.5f });
-        aiCountBorder->setZOrder(-1);
-        m_aiCountToggleBg->addChild(aiCountBorder);
-
-        m_aiCountToggleLbl = CCLabelBMFont::create(
-            g_aiAutoObjectCount ? "AI Blocks: ON" : "AI Blocks: OFF",
-            "chatFont.fnt"
-        );
-        m_aiCountToggleLbl->setScale(0.35f);
-        m_aiCountToggleLbl->setColor(ccColor3B{ 240, 255, 245 });
-        m_aiCountToggleLbl->setPosition(CCPoint{ 39.f, 7.5f });
-        m_aiCountToggleBg->addChild(m_aiCountToggleLbl);
-
-        auto* aiCountBtn = CCMenuItemSpriteExtra::create(
-            m_aiCountToggleBg, this, menu_selector(AIDecorPopup::onToggleAIAutoBlockCount)
-        );
-        aiCountBtn->setPosition(CCPoint{ rightX - 68.f, center.y + 64.f });
-        m_buttonMenu->addChild(aiCountBtn);
-
-        // Выбор точного количества блоков (< Blocks: N >) ИЛИ клик по центру для переключения AI Auto
-        auto* limitPill = createSolidPanel(108.f, 22.f, ccColor3B{ 24, 16, 20 }, 255);
-        std::string limStr = g_aiAutoObjectCount
-            ? std::string("Blocks: AI Auto")
-            : fmt::format("Blocks: {}", g_objectLimit);
-        m_limitValueLabel = CCLabelBMFont::create(limStr.c_str(), "chatFont.fnt");
-        m_limitValueLabel->setScale(0.38f);
-        m_limitValueLabel->setColor(g_aiAutoObjectCount ? ccColor3B{ 115, 255, 175 } : ccColor3B{ 235, 240, 250 });
-        m_limitValueLabel->setPosition(CCPoint{ 54.f, 11.f });
-        limitPill->addChild(m_limitValueLabel);
-
-        auto* limitToggleBtn = CCMenuItemSpriteExtra::create(
-            limitPill, this, menu_selector(AIDecorPopup::onToggleAIAutoBlockCount)
-        );
-        limitToggleBtn->setPosition(CCPoint{ rightX - 58.f, center.y - 84.f });
-        m_buttonMenu->addChild(limitToggleBtn);
-
-        auto* decBtn = createSolidButton(18.f, 18.f, ccColor3B{ 44, 28, 34 }, "<", 0.45f, ccColor3B{ 245, 248, 255 }, this, menu_selector(AIDecorPopup::onLimitDec));
-        decBtn->setPosition(CCPoint{ rightX - 101.f, center.y - 84.f });
-        m_buttonMenu->addChild(decBtn);
-
-        auto* incBtn = createSolidButton(18.f, 18.f, ccColor3B{ 44, 28, 34 }, ">", 0.45f, ccColor3B{ 245, 248, 255 }, this, menu_selector(AIDecorPopup::onLimitInc));
-        incBtn->setPosition(CCPoint{ rightX - 15.f, center.y - 84.f });
-        m_buttonMenu->addChild(incBtn);
-
-        auto* modePill = createSolidPanel(108.f, 22.f, ccColor3B{ 24, 16, 20 }, 255);
-        modePill->setPosition(CCPoint{ rightX + 58.f, center.y - 84.f });
+        auto* modePill = createSolidPanel(224.f, 22.f, ccColor3B{ 24, 16, 20 }, 255);
+        modePill->setPosition(CCPoint{ rightX, center.y - 84.f });
         m_mainLayer->addChild(modePill);
 
         auto createModeHalf = [&](const char* txt, CCPoint pos, SEL_MenuHandler cb, CCLayerColor*& outBg) {
-            outBg = createSolidPanel(51.f, 18.f, ccColor3B{ 28, 20, 24 }, 255);
+            outBg = createSolidPanel(108.f, 18.f, ccColor3B{ 28, 20, 24 }, 255);
             auto* l = CCLabelBMFont::create(txt, "chatFont.fnt");
-            l->setScale(0.40f);
+            l->setScale(0.42f);
             l->setColor(ccColor3B{ 245, 248, 255 });
-            l->setPosition(CCPoint{ 25.5f, 9.f });
+            l->setPosition(CCPoint{ 54.f, 9.f });
             outBg->addChild(l);
             auto* b = CCMenuItemSpriteExtra::create(outBg, this, cb);
             b->setPosition(pos);
             m_buttonMenu->addChild(b);
         };
-        createModeHalf("Inside",   CCPoint{ rightX + 32.f, center.y - 84.f }, menu_selector(AIDecorPopup::onSelectInside),   m_insideTabBg);
-        createModeHalf("Overhang", CCPoint{ rightX + 84.f, center.y - 84.f }, menu_selector(AIDecorPopup::onSelectOverhang), m_overhangTabBg);
+        createModeHalf("Inside",   CCPoint{ rightX - 55.f, center.y - 84.f }, menu_selector(AIDecorPopup::onSelectInside),   m_insideTabBg);
+        createModeHalf("Overhang", CCPoint{ rightX + 55.f, center.y - 84.f }, menu_selector(AIDecorPopup::onSelectOverhang), m_overhangTabBg);
 
         std::string varStr = fmt::format("Another variant ({})", g_variantIndex);
         auto* varBtn = createSolidButton(
@@ -5201,20 +5375,30 @@ protected:
         if (!m_inputDisplayLabel) return;
         if (m_inputBuffer.empty()) {
             if (m_stage == PopupStage::ApiGate) {
-                m_inputDisplayLabel->setString("Paste valid API key (Ctrl+V) or type here...");
+                static constexpr const char* kPlaceholders[4] = {
+                    "Paste or type ANY API Key (Ctrl+V)...",
+                    "Paste or type Base URL (e.g. https://api.openai.com)...",
+                    "Paste or type Endpoint (e.g. /v1/chat/completions)...",
+                    "Paste or type Model Name (e.g. deepseek-chat, gpt-4o-mini)..."
+                };
+                m_inputDisplayLabel->setString(kPlaceholders[std::clamp(m_activeApiField, 0, 3)]);
             } else {
                 m_inputDisplayLabel->setString("Describe the art or ask AI...");
             }
             m_inputDisplayLabel->setColor(ccColor3B{ 150, 145, 160 });
         } else {
             std::string shown = m_inputBuffer;
-            size_t maxLen = (m_stage == PopupStage::ApiGate) ? 48 : 28;
+            size_t maxLen = (m_stage == PopupStage::ApiGate) ? 54 : 28;
             if (shown.size() > maxLen) {
                 shown = "..." + shown.substr(shown.size() - (maxLen - 3));
             }
             shown += "|";
             m_inputDisplayLabel->setString(shown.c_str());
             m_inputDisplayLabel->setColor(ccColor3B{ 245, 248, 255 });
+        }
+        if (m_stage == PopupStage::ApiGate) {
+            setApiFieldValue(m_activeApiField, m_inputBuffer);
+            refreshApiGateFieldsUI();
         }
     }
 
@@ -5229,12 +5413,10 @@ protected:
         }
     }
 
-    void onCycleApiProvider(CCObject*) {
-        g_apiProviderIndex = (g_apiProviderIndex + 1) % 5;
-        reopenWithStage(PopupStage::ApiGate);
-    }
-
     void onOpenModelSelectorFromGate(CCObject*) {
+        if (!m_inputBuffer.empty()) {
+            setApiFieldValue(m_activeApiField, m_inputBuffer);
+        }
         reopenWithStage(PopupStage::ModelSelector, PopupStage::ApiGate);
     }
 
@@ -5242,19 +5424,20 @@ protected:
         reopenWithStage(PopupStage::ModelSelector, PopupStage::ArtAgentMain);
     }
 
-    void onCycleProviderInModelWindow(CCObject*) {
-        g_apiProviderIndex = (g_apiProviderIndex + 1) % 5;
-        reopenWithStage(PopupStage::ModelSelector, m_returnStageAfterModel);
-    }
-
     void onCloseModelSelectorWindow(CCObject*) {
         reopenWithStage(m_returnStageAfterModel);
     }
 
     void selectModelSlot(int slotIdx) {
-        g_selectedModelIndex[m_providerIdx] = std::clamp(slotIdx, 0, 3);
-        if (g_apiVerifiedAndConnected && !g_connectedApiKey.empty()) {
-            saveVerifiedApiToDisk(m_providerIdx, g_connectedApiKey);
+        static constexpr const char* kPresetIds[4] = {
+            "deepseek-chat",
+            "deepseek-v4-pro",
+            "gemini-4-hydrogen",
+            "gpt-4o-mini"
+        };
+        g_customModelName = kPresetIds[std::clamp(slotIdx, 0, 3)];
+        if (!g_connectedApiKey.empty()) {
+            saveVerifiedApiToDisk(0, g_connectedApiKey);
         }
         reopenWithStage(m_returnStageAfterModel);
     }
@@ -5268,29 +5451,28 @@ protected:
         std::string clip = readWindowsClipboardText();
         if (!clip.empty()) {
             m_inputBuffer = clip;
-            if (m_inputBuffer.size() > 180) m_inputBuffer.resize(180);
-            int det = detectProviderFromKey(m_inputBuffer, m_providerIdx);
-            if (det != m_providerIdx) {
-                g_apiProviderIndex = det;
-                m_providerIdx = det;
-            }
+            if (m_inputBuffer.size() > 220) m_inputBuffer.resize(220);
+            setApiFieldValue(m_activeApiField, m_inputBuffer);
             refreshInputLabel();
         }
     }
 
     void onClearApiClicked(CCObject*) {
         m_inputBuffer.clear();
-        setCheckmarkState(false);
+        setApiFieldValue(m_activeApiField, "");
+        if (m_activeApiField == 0) {
+            setCheckmarkState(false);
+        }
         refreshInputLabel();
     }
 
     void onVerifyAndConnectApi(CCObject*) {
-        std::string key = sanitizeApiKeyString(m_inputBuffer);
-        m_providerIdx = detectProviderFromKey(key, m_providerIdx);
-        g_apiProviderIndex = m_providerIdx;
+        if (!m_inputBuffer.empty()) {
+            setApiFieldValue(m_activeApiField, m_inputBuffer);
+        }
 
         std::string errMsg;
-        if (!verifyApiKeyWithServer(m_providerIdx, key, errMsg)) {
+        if (!verifyApiKeyWithServer(0, g_connectedApiKey, errMsg)) {
             setCheckmarkState(false);
             if (m_apiGateStatusLabel) {
                 m_apiGateStatusLabel->setString(utf8ToGDReadable(errMsg).c_str());
@@ -5300,7 +5482,7 @@ protected:
         }
 
         setCheckmarkState(true);
-        saveVerifiedApiToDisk(m_providerIdx, key);
+        saveVerifiedApiToDisk(0, g_connectedApiKey);
         reopenWithStage(PopupStage::ArtAgentMain);
     }
 
@@ -5332,40 +5514,7 @@ protected:
         refreshRightPanelTabsAndCanvas();
     }
 
-    void refreshBlockCountLabels() {
-        if (m_limitValueLabel) {
-            std::string s = g_aiAutoObjectCount
-                ? std::string("Blocks: AI Auto")
-                : fmt::format("Blocks: {}", g_objectLimit);
-            m_limitValueLabel->setString(s.c_str());
-            m_limitValueLabel->setColor(g_aiAutoObjectCount ? ccColor3B{ 115, 255, 175 } : ccColor3B{ 235, 240, 250 });
-        }
-        if (m_aiCountToggleLbl) {
-            m_aiCountToggleLbl->setString(g_aiAutoObjectCount ? "AI Blocks: ON" : "AI Blocks: OFF");
-        }
-        if (m_aiCountToggleBg) {
-            m_aiCountToggleBg->setColor(g_aiAutoObjectCount ? ccColor3B{ 28, 125, 68 } : ccColor3B{ 38, 24, 32 });
-        }
-    }
 
-    void onToggleAIAutoBlockCount(CCObject*) {
-        g_aiAutoObjectCount = !g_aiAutoObjectCount;
-        refreshBlockCountLabels();
-    }
-
-    void onLimitDec(CCObject*) {
-        g_aiAutoObjectCount = false;
-        int step = (g_objectLimit <= 100) ? 25 : ((g_objectLimit <= 500) ? 50 : ((g_objectLimit <= 2000) ? 100 : 500));
-        g_objectLimit = (std::max)(25, g_objectLimit - step);
-        refreshBlockCountLabels();
-    }
-
-    void onLimitInc(CCObject*) {
-        g_aiAutoObjectCount = false;
-        int step = (g_objectLimit < 100) ? 25 : ((g_objectLimit < 500) ? 50 : ((g_objectLimit < 2000) ? 100 : 500));
-        g_objectLimit = (std::min)(20000, g_objectLimit + step);
-        refreshBlockCountLabels();
-    }
 
     void onSelectInside(CCObject*)   { g_overhangAllowed = false; refreshRightPanelTabsAndCanvas(); }
     void onSelectOverhang(CCObject*) { g_overhangAllowed = true;  refreshRightPanelTabsAndCanvas(); }
@@ -5582,7 +5731,7 @@ protected:
                 g_autoRetryCountdown = 2.0f;
 
                 // Тихо переключаем на следующую доступную модель, чтобы обойти 503/429
-                g_selectedModelIndex[g_apiProviderIndex] = (g_selectedModelIndex[g_apiProviderIndex] + 1) % 4;
+                // Повторяем запрос на выбранный пользователем Base URL и Endpoint
                 return;
             }
 
