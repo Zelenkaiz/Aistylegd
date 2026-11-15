@@ -607,9 +607,43 @@ static std::wstring utf8ToWideASCII(std::string const& s) {
     return w;
 }
 
+static std::string decodeJsonUnicodeEscapes(std::string const& s) {
+    std::string utf8;
+    utf8.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 5 < s.size() && s[i + 1] == 'u') {
+            unsigned int cp = 0;
+            bool valid = true;
+            for (int k = 0; k < 4; ++k) {
+                char h = s[i + 2 + k];
+                cp <<= 4;
+                if (h >= '0' && h <= '9') cp |= (h - '0');
+                else if (h >= 'a' && h <= 'f') cp |= (h - 'a' + 10);
+                else if (h >= 'A' && h <= 'F') cp |= (h - 'A' + 10);
+                else { valid = false; break; }
+            }
+            if (valid) {
+                if (cp < 0x80) {
+                    utf8.push_back(static_cast<char>(cp));
+                } else if (cp < 0x800) {
+                    utf8.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+                    utf8.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+                } else {
+                    utf8.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+                    utf8.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                    utf8.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+                }
+                i += 5;
+                continue;
+            }
+        }
+        utf8.push_back(s[i]);
+    }
+    return utf8ToGDReadable(utf8);
+}
+
 static std::string extractHttpErrorDetails(std::string const& body) {
     if (body.empty()) return "";
-    // Пробуем найти "message": "..." или "detail": "..."
     for (const char* key : { "\"message\"", "\"detail\"", "\"error\"" }) {
         size_t pos = body.find(key);
         if (pos != std::string::npos) {
@@ -619,7 +653,7 @@ static std::string extractHttpErrorDetails(std::string const& body) {
                 if (q1 != std::string::npos) {
                     size_t q2 = body.find('\"', q1 + 1);
                     if (q2 != std::string::npos && q2 > q1 + 1) {
-                        std::string msg = body.substr(q1 + 1, q2 - q1 - 1);
+                        std::string msg = decodeJsonUnicodeEscapes(body.substr(q1 + 1, q2 - q1 - 1));
                         if (msg.size() > 90) msg = msg.substr(0, 87) + "...";
                         return msg;
                     }
@@ -630,11 +664,8 @@ static std::string extractHttpErrorDetails(std::string const& body) {
     if (body.find("Cloudflare") != std::string::npos || body.find("cf-ray") != std::string::npos || body.find("<html") != std::string::npos) {
         return "Blocked by Cloudflare/WAF (check Base URL or VPN)";
     }
-    std::string clean;
-    for (char c : body) {
-        if (c >= 32 && c < 127) clean.push_back(c);
-        if (clean.size() >= 80) break;
-    }
+    std::string clean = decodeJsonUnicodeEscapes(body);
+    if (clean.size() > 80) clean = clean.substr(0, 77) + "...";
     return clean;
 }
 
@@ -992,14 +1023,21 @@ static bool verifyApiKeyWithServer(int /*providerIdx*/, std::string const& rawKe
             L"Content-Type: application/json\r\n"
             L"Accept: application/json\r\n"
             L"Authorization: Bearer " + utf8ToWideASCII(key) + L"\r\n";
-        std::wstring hdrAltW =
+        std::wstring hdrXApiKeyW =
+            L"Content-Type: application/json\r\n"
+            L"Accept: application/json\r\n"
+            L"x-api-key: " + utf8ToWideASCII(key) + L"\r\n";
+        std::wstring hdrApiKeyW =
             L"Content-Type: application/json\r\n"
             L"Accept: application/json\r\n"
             L"api-key: " + utf8ToWideASCII(key) + L"\r\n";
 
         ok = performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrBearerW, testPayload, httpStatus, respBody, netErr);
         if (!ok && (httpStatus == 401 || httpStatus == 403)) {
-            ok = performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrAltW, testPayload, httpStatus, respBody, netErr);
+            ok = performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrXApiKeyW, testPayload, httpStatus, respBody, netErr);
+        }
+        if (!ok && (httpStatus == 401 || httpStatus == 403)) {
+            ok = performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrApiKeyW, testPayload, httpStatus, respBody, netErr);
         }
         if (ok && httpStatus == 200 && (respBody.find("\"choices\"") != std::string::npos || respBody.find("\"content\"") != std::string::npos || respBody.find("\"text\"") != std::string::npos)) {
             outErrorMsg.clear();
@@ -1814,6 +1852,10 @@ static bool executeSingleNeuralNetPass(
             L"Content-Type: application/json\r\n"
             L"Accept: application/json\r\n"
             L"Authorization: Bearer " + utf8ToWideASCII(g_connectedApiKey) + L"\r\n";
+        std::wstring hdrXApiW =
+            L"Content-Type: application/json\r\n"
+            L"Accept: application/json\r\n"
+            L"x-api-key: " + utf8ToWideASCII(g_connectedApiKey) + L"\r\n";
         std::wstring hdrAltW =
             L"Content-Type: application/json\r\n"
             L"Accept: application/json\r\n"
@@ -1852,8 +1894,12 @@ static bool executeSingleNeuralNetPass(
             if (performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrW, payload, httpStatus, rawResp, errText)) {
                 sentOk = true;
             } else if (httpStatus == 401 || httpStatus == 403) {
-                if (performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrAltW, payload, httpStatus, rawResp, errText)) {
+                if (performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrXApiW, payload, httpStatus, rawResp, errText)) {
                     sentOk = true;
+                } else if (httpStatus == 401 || httpStatus == 403) {
+                    if (performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrAltW, payload, httpStatus, rawResp, errText)) {
+                        sentOk = true;
+                    }
                 }
             }
         }
