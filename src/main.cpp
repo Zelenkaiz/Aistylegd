@@ -654,7 +654,7 @@ static std::string extractHttpErrorDetails(std::string const& body) {
                     size_t q2 = body.find('\"', q1 + 1);
                     if (q2 != std::string::npos && q2 > q1 + 1) {
                         std::string msg = decodeJsonUnicodeEscapes(body.substr(q1 + 1, q2 - q1 - 1));
-                        if (msg.size() > 90) msg = msg.substr(0, 87) + "...";
+                        if (msg.size() > 180) msg = msg.substr(0, 177) + "...";
                         return msg;
                     }
                 }
@@ -907,7 +907,7 @@ static bool performWinHttpRequest(
             pClose(hSession);
             // Если WinHTTP получил 403 (частая блокировка TLS-отпечатка со стороны Cloudflare/WAF на шлюзах),
             // пробуем обойти через системный curl.exe!
-            if (outHttpStatus == 403) {
+            if (outHttpStatus == 403 || outHttpStatus == 401) {
                 int curlStatus = 0;
                 std::string curlResp, curlErr;
                 if (performCurlFallbackRequest(verbW, hostW, pathW, extraHeadersW, bodyData, curlStatus, curlResp, curlErr)) {
@@ -1034,10 +1034,13 @@ static bool verifyApiKeyWithServer(int /*providerIdx*/, std::string const& rawKe
 
         ok = performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrBearerW, testPayload, httpStatus, respBody, netErr);
         if (!ok && (httpStatus == 401 || httpStatus == 403)) {
-            ok = performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrXApiKeyW, testPayload, httpStatus, respBody, netErr);
-        }
-        if (!ok && (httpStatus == 401 || httpStatus == 403)) {
-            ok = performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrApiKeyW, testPayload, httpStatus, respBody, netErr);
+            int altStatus = 0;
+            std::string altBody, altErr;
+            if (performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrXApiKeyW, testPayload, altStatus, altBody, altErr)) {
+                ok = true; httpStatus = altStatus; respBody = std::move(altBody); netErr = std::move(altErr);
+            } else if (performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrApiKeyW, testPayload, altStatus, altBody, altErr)) {
+                ok = true; httpStatus = altStatus; respBody = std::move(altBody); netErr = std::move(altErr);
+            }
         }
         if (ok && httpStatus == 200 && (respBody.find("\"choices\"") != std::string::npos || respBody.find("\"content\"") != std::string::npos || respBody.find("\"text\"") != std::string::npos)) {
             outErrorMsg.clear();
@@ -1894,12 +1897,12 @@ static bool executeSingleNeuralNetPass(
             if (performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrW, payload, httpStatus, rawResp, errText)) {
                 sentOk = true;
             } else if (httpStatus == 401 || httpStatus == 403) {
-                if (performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrXApiW, payload, httpStatus, rawResp, errText)) {
-                    sentOk = true;
-                } else if (httpStatus == 401 || httpStatus == 403) {
-                    if (performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrAltW, payload, httpStatus, rawResp, errText)) {
-                        sentOk = true;
-                    }
+                int altStatus = 0;
+                std::string altResp, altErr;
+                if (performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrXApiW, payload, altStatus, altResp, altErr)) {
+                    sentOk = true; httpStatus = altStatus; rawResp = std::move(altResp); errText = std::move(altErr);
+                } else if (performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrAltW, payload, altStatus, altResp, altErr)) {
+                    sentOk = true; httpStatus = altStatus; rawResp = std::move(altResp); errText = std::move(altErr);
                 }
             }
         }
