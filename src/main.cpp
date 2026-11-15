@@ -607,6 +607,37 @@ static std::wstring utf8ToWideASCII(std::string const& s) {
     return w;
 }
 
+static std::string extractHttpErrorDetails(std::string const& body) {
+    if (body.empty()) return "";
+    // Пробуем найти "message": "..." или "detail": "..."
+    for (const char* key : { "\"message\"", "\"detail\"", "\"error\"" }) {
+        size_t pos = body.find(key);
+        if (pos != std::string::npos) {
+            size_t colon = body.find(':', pos + std::strlen(key));
+            if (colon != std::string::npos) {
+                size_t q1 = body.find('\"', colon + 1);
+                if (q1 != std::string::npos) {
+                    size_t q2 = body.find('\"', q1 + 1);
+                    if (q2 != std::string::npos && q2 > q1 + 1) {
+                        std::string msg = body.substr(q1 + 1, q2 - q1 - 1);
+                        if (msg.size() > 90) msg = msg.substr(0, 87) + "...";
+                        return msg;
+                    }
+                }
+            }
+        }
+    }
+    if (body.find("Cloudflare") != std::string::npos || body.find("cf-ray") != std::string::npos || body.find("<html") != std::string::npos) {
+        return "Blocked by Cloudflare/WAF (check Base URL or VPN)";
+    }
+    std::string clean;
+    for (char c : body) {
+        if (c >= 32 && c < 127) clean.push_back(c);
+        if (clean.size() >= 80) break;
+    }
+    return clean;
+}
+
 // Автоматический резервный HTTPS-клиент через встроенный системный curl.exe Windows 10/11
 // (срабатывает мгновенно, если WinHTTP блокируется прокси/VPN/файрволом или TLS-сертификатами!)
 static bool performCurlFallbackRequest(
@@ -641,7 +672,7 @@ static bool performCurlFallbackRequest(
         bf.write(bodyData.data(), static_cast<std::streamsize>(bodyData.size()));
     }
 
-    std::string cmd = "curl.exe -s -S -k -L --connect-timeout 12 --max-time 45 -X " + verb;
+    std::string cmd = "curl.exe -s -S -k -L --connect-timeout 12 --max-time 45 -A \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\" -H \"Accept: application/json\" -X " + verb;
     std::istringstream hss(hdrs);
     std::string hLine;
     while (std::getline(hss, hLine)) {
@@ -706,7 +737,8 @@ static bool performCurlFallbackRequest(
         }
         if (outHttpStatus == 200) return true;
         if (outHttpStatus > 0) {
-            outErrorText = fmt::format("HTTP {}", outHttpStatus);
+            std::string det = extractHttpErrorDetails(outResponseBody);
+            outErrorText = det.empty() ? fmt::format("HTTP {}", outHttpStatus) : det;
             return false;
         }
     }
@@ -773,7 +805,7 @@ static bool performWinHttpRequest(
     // Пробуем сначала автоматический системный прокси/VPN Windows (4 = AUTOMATIC_PROXY), затем прямое соединение (1 = NO_PROXY)
     constexpr DWORD kAccessTypes[2] = { 4, 1 };
     for (DWORD accessType : kAccessTypes) {
-        HINTERNET_T hSession = pOpen(L"GDArtAgent/2.5", accessType, nullptr, nullptr, 0);
+        HINTERNET_T hSession = pOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", accessType, nullptr, nullptr, 0);
         if (!hSession) continue;
 
         if (pSetTimeouts) {
@@ -842,7 +874,27 @@ static bool performWinHttpRequest(
             pClose(hRequest);
             pClose(hConnect);
             pClose(hSession);
+            // Если WinHTTP получил 403 (частая блокировка TLS-отпечатка со стороны Cloudflare/WAF на шлюзах),
+            // пробуем обойти через системный curl.exe!
+            if (outHttpStatus == 403) {
+                int curlStatus = 0;
+                std::string curlResp, curlErr;
+                if (performCurlFallbackRequest(verbW, hostW, pathW, extraHeadersW, bodyData, curlStatus, curlResp, curlErr)) {
+                    FreeLibrary(hWinHttp);
+                    outHttpStatus = curlStatus;
+                    outResponseBody = std::move(curlResp);
+                    outErrorText.clear();
+                    return true;
+                }
+                if (curlStatus > 0) {
+                    outHttpStatus = curlStatus;
+                    outResponseBody = std::move(curlResp);
+                }
+            }
             FreeLibrary(hWinHttp);
+            if (outHttpStatus != 200) {
+                outErrorText = extractHttpErrorDetails(outResponseBody);
+            }
             return (outHttpStatus == 200);
         }
 
@@ -887,10 +939,12 @@ static std::string sanitizeApiKeyString(std::string s) {
 
 static std::string extractJsonStringField(std::string const& json, std::string const& key);
 
+// Настоящая строгая проверка API-ключа, Base URL, Endpoint и Model через реальный тестовый запрос к серверу!
+// Рандомный или нерабочий ключ ГАРАНТИРОВАННО отклоняется.
 static bool verifyApiKeyWithServer(int /*providerIdx*/, std::string const& rawKey, std::string& outErrorMsg) {
     std::string key = sanitizeApiKeyString(rawKey);
-    if (key.empty()) {
-        outErrorMsg = "Paste or enter any API key first";
+    if (key.empty() || key.size() < 8) {
+        outErrorMsg = "Key format invalid (empty or too short)";
         return false;
     }
     if (trimWhitespace(g_customBaseUrl).empty()) {
@@ -902,8 +956,66 @@ static bool verifyApiKeyWithServer(int /*providerIdx*/, std::string const& rawKe
     if (trimWhitespace(g_customModelName).empty()) {
         g_customModelName = "gpt-4o-mini";
     }
-    outErrorMsg.clear();
-    return true;
+
+    std::wstring hostW;
+    std::wstring pathW;
+    bool isGeminiNative = false;
+    resolveCustomBaseUrlAndEndpoint(g_customModelName, hostW, pathW, isGeminiNative);
+
+    int httpStatus = 0;
+    std::string respBody;
+    std::string netErr;
+    bool ok = false;
+
+    if (isGeminiNative) {
+        std::string testBody = "{\"contents\":[{\"role\":\"user\",\"parts\":[{\"text\":\"ping\"}]}],\"generationConfig\":{\"maxOutputTokens\":8}}";
+        std::wstring hdrW = L"Content-Type: application/json\r\nAccept: application/json\r\nx-goog-api-key: " + utf8ToWideASCII(key) + L"\r\n";
+        ok = performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrW, testBody, httpStatus, respBody, netErr);
+        if (!ok && (httpStatus == 401 || httpStatus == 403 || httpStatus == 400)) {
+            std::wstring pathWithKeyW = pathW;
+            if (pathWithKeyW.find(L"key=") == std::wstring::npos) {
+                pathWithKeyW += (pathWithKeyW.find(L'?') == std::wstring::npos ? L"?key=" : L"&key=") + utf8ToWideASCII(key);
+            }
+            ok = performWinHttpRequest(L"POST", hostW.c_str(), pathWithKeyW, L"Content-Type: application/json\r\nAccept: application/json\r\n", testBody, httpStatus, respBody, netErr);
+        }
+        if (ok && httpStatus == 200 && (respBody.find("\"candidates\"") != std::string::npos || respBody.find("\"text\"") != std::string::npos)) {
+            outErrorMsg.clear();
+            return true;
+        }
+    } else {
+        std::string activeModel = g_customModelName.empty() ? "gpt-4o-mini" : g_customModelName;
+        std::string testPayload = fmt::format(
+            "{{\"model\":\"{}\",\"messages\":[{{\"role\":\"user\",\"content\":\"ping\"}}],\"max_tokens\":8}}",
+            jsonEscape(activeModel)
+        );
+        std::wstring hdrBearerW =
+            L"Content-Type: application/json\r\n"
+            L"Accept: application/json\r\n"
+            L"Authorization: Bearer " + utf8ToWideASCII(key) + L"\r\n";
+        std::wstring hdrAltW =
+            L"Content-Type: application/json\r\n"
+            L"Accept: application/json\r\n"
+            L"api-key: " + utf8ToWideASCII(key) + L"\r\n";
+
+        ok = performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrBearerW, testPayload, httpStatus, respBody, netErr);
+        if (!ok && (httpStatus == 401 || httpStatus == 403)) {
+            ok = performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrAltW, testPayload, httpStatus, respBody, netErr);
+        }
+        if (ok && httpStatus == 200 && (respBody.find("\"choices\"") != std::string::npos || respBody.find("\"content\"") != std::string::npos || respBody.find("\"text\"") != std::string::npos)) {
+            outErrorMsg.clear();
+            return true;
+        }
+    }
+
+    if (httpStatus > 0) {
+        std::string det = netErr.empty() ? extractHttpErrorDetails(respBody) : netErr;
+        outErrorMsg = det.empty()
+            ? fmt::format("Rejected (HTTP {})", httpStatus)
+            : fmt::format("HTTP {}: {}", httpStatus, det);
+        return false;
+    }
+    outErrorMsg = netErr.empty() ? "Network error contacting AI server" : netErr;
+    return false;
 }
 
 static void saveVerifiedApiToDisk(int /*provIdx*/, std::string const& rawKey) {
@@ -934,8 +1046,11 @@ static void loadAndVerifySavedApiFromDisk() {
             g_customBaseUrl      = trimWhitespace(line2);
             g_customEndpointPath = trimWhitespace(line3);
             g_customModelName    = trimWhitespace(line4);
-            if (!g_connectedApiKey.empty()) {
+            std::string dummyErr;
+            if (!g_connectedApiKey.empty() && verifyApiKeyWithServer(0, g_connectedApiKey, dummyErr)) {
                 g_apiVerifiedAndConnected = true;
+            } else {
+                g_apiVerifiedAndConnected = false;
             }
         } else if (!line2.empty()) {
             // Совместимость со старым форматом конфига
@@ -1695,10 +1810,13 @@ static bool executeSingleNeuralNetPass(
             );
         }
 
-        // Передаем и Authorization: Bearer, и api-key, и x-api-key для 100% совместимости с любыми прокси и сервисами!
         std::wstring hdrW =
             L"Content-Type: application/json\r\n"
-            L"Authorization: Bearer " + utf8ToWideASCII(g_connectedApiKey) + L"\r\n"
+            L"Accept: application/json\r\n"
+            L"Authorization: Bearer " + utf8ToWideASCII(g_connectedApiKey) + L"\r\n";
+        std::wstring hdrAltW =
+            L"Content-Type: application/json\r\n"
+            L"Accept: application/json\r\n"
             L"api-key: " + utf8ToWideASCII(g_connectedApiKey) + L"\r\n";
 
         std::string activeModel = g_customModelName.empty() ? "gpt-4o-mini" : g_customModelName;
@@ -1733,6 +1851,10 @@ static bool executeSingleNeuralNetPass(
             );
             if (performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrW, payload, httpStatus, rawResp, errText)) {
                 sentOk = true;
+            } else if (httpStatus == 401 || httpStatus == 403) {
+                if (performWinHttpRequest(L"POST", hostW.c_str(), pathW, hdrAltW, payload, httpStatus, rawResp, errText)) {
+                    sentOk = true;
+                }
             }
         }
 
