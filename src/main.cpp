@@ -2406,7 +2406,8 @@ static bool executeSingleNeuralNetPass(
     // Строгое определение запрошенного игроком цвета и флагов ТОЛЬКО по текущему запросу игрока!
     std::string lp = userTurnPrompt;
     for (char& ch : lp) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-    if (lp.find("self-critique refinement pass") != std::string::npos) {
+    if (lp.find("self-critique refinement pass") != std::string::npos ||
+        lp.find("second model surgical audit pass") != std::string::npos) {
         size_t q1 = lp.find('\'');
         size_t q2 = (q1 != std::string::npos) ? lp.find('\'', q1 + 1) : std::string::npos;
         if (q1 != std::string::npos && q2 != std::string::npos && q2 > q1 + 1) {
@@ -2468,26 +2469,33 @@ static bool executeSingleNeuralNetPass(
     };
 
     auto detectRequestedTextureResolution = [&]() -> int {
-        // 1. Проверяем явное указание разрешения в чате: 128x128, 96x96, 64x64, 48x48, 32x32, 24x24, 16x16
+        // 1. Проверяем явное указание разрешения в чате: 128x128, 96x96, 64x64, 48x48, 32x32, 24x24, 16x16 и др.
         for (int resCandidate : { 128, 96, 64, 48, 32, 24, 16 }) {
             std::string s1 = fmt::format("{}x{}", resCandidate, resCandidate);
             std::string s2 = fmt::format("{}na{}", resCandidate, resCandidate);
             std::string s3 = fmt::format("{} na {}", resCandidate, resCandidate);
             std::string s4 = fmt::format("{} x {}", resCandidate, resCandidate);
+            std::string s5 = fmt::format("{}*{}", resCandidate, resCandidate);
+            std::string s6 = fmt::format("{} * {}", resCandidate, resCandidate);
+            std::string s7 = fmt::format("{} на {}", resCandidate, resCandidate);
+            std::string s8 = fmt::format("{}на{}", resCandidate, resCandidate);
+            std::string s9 = fmt::format("{} by {}", resCandidate, resCandidate);
             if (lp.find(s1) != std::string::npos || lp.find(s2) != std::string::npos ||
-                lp.find(s3) != std::string::npos || lp.find(s4) != std::string::npos) {
+                lp.find(s3) != std::string::npos || lp.find(s4) != std::string::npos ||
+                lp.find(s5) != std::string::npos || lp.find(s6) != std::string::npos ||
+                lp.find(s7) != std::string::npos || lp.find(s8) != std::string::npos ||
+                lp.find(s9) != std::string::npos) {
                 return resCandidate;
             }
         }
-        // 2. Если игрок просит максимальный/ультра реалистик или приложил референс-картинку
-        if (lp.find("128") != std::string::npos || lp.find("ultra") != std::string::npos || lp.find("maksimal") != std::string::npos) {
+        // 2. Если игрок указал одиночное число разрешения (128, 96, 64, 48, 32, 24, 16) или ультра/максимальный реалистик
+        for (int resCandidate : { 128, 96, 64, 48, 32, 24, 16 }) {
+            if (lp.find(fmt::format("{}", resCandidate)) != std::string::npos) {
+                return resCandidate;
+            }
+        }
+        if (lp.find("ultra") != std::string::npos || lp.find("maksimal") != std::string::npos) {
             return 128;
-        }
-        if (lp.find("64") != std::string::npos) {
-            return 64;
-        }
-        if (lp.find("32") != std::string::npos) {
-            return 32;
         }
         if (g_hasReferenceImage) {
             return (outRes.textureResolution >= 16) ? std::clamp(outRes.textureResolution, 16, 128) : 64;
@@ -3004,17 +3012,27 @@ static AIDecisionResult queryRealNeuralNetwork(
             serializeElementsBrief(bestRes.customElements, 48)
         );
 
+        int expectedTexRes = bestRes.textureResolution;
+        std::string expectedTexDesc = (expectedTexRes >= 16)
+            ? fmt::format("{}x{} (tex_res={})", expectedTexRes, expectedTexRes, expectedTexRes)
+            : std::string("whatever NxN format the user specified (e.g. 16x16, 24x24, 32x32, 48x48, 64x64, 96x96, 128x128) or 0 if no pixel resolution was requested");
+
         std::string reviewPrompt = fmt::format(
-            "SECOND MODEL REVIEW & TEXTURE ENHANCEMENT PASS: You are the Senior Reviewer AI ({}). "
-            "The first AI model produced the following draft for user request: '{}'.\n"
+            "SECOND MODEL SURGICAL AUDIT PASS ({}): Inspect the first model's draft for user request: '{}'.\n"
             "FIRST MODEL DRAFT: {}\n"
-            "YOUR JOB:\n"
-            "1. Inspect the draft carefully for ANY mistakes (wrong colors, wrong style, missing details, weak shading, wrong tex_res, wrong allow_overhang, or ignored user constraints).\n"
-            "2. Fix any errors and IMPROVE the visual texture quality: add richer multi-tone shading, highlights, depth, crisp micro-details in \"cell_elements\" & \"elements\", or upgrade \"tex_res\" (up to 128) if beneficial.\n"
-            "3. Keep \"action\": \"build\" and output the complete improved JSON object (using the exact same schema).",
+            "STRICT AUDIT RULES (DO NOT ADD UNREQUESTED JUNK!):\n"
+            "1. CHECK OVERHANG / PROTRUSION: Inspect how far \"elements\" stick out outside 0.0..1.0 (rx < 0 or rx > 1, ry < 0 or ry > 1, or large sx/sy). "
+            "If elements protrude too far outside the frame (or if the user did not ask for overhang), pull them back inside (rx: 0.05..0.95, ry: 0.05..0.95) and set \"allow_overhang\": false!\n"
+            "2. CHECK REQUESTED PIXEL FORMAT / TEXTURE RESOLUTION (NO FLAT SOLID BLOCKS!): Verify \"tex_res\" strictly matches the user's requested format: {}. "
+            "Do NOT force 128 if the user asked for another format like 16x16, 24x24, 32x32, 48x48, 64x64, or 96x96! "
+            "Whenever a pixel texture is requested (tex_res >= 16), if ANY surface material (foliage, moss, vines, bricks, stone, metal, etc.) was drawn as large flat 1-color blocks (sx > 0.22 or sy > 0.22), "
+            "break them into fine pixel-level clusters (sx/sy <= 0.12) with multi-tone highlights/shadows and keep \"tex_res\" set to the exact requested resolution (and \"want_pbr\": true).\n"
+            "3. DO NOT ADD EXTRA UNREQUESTED OBJECTS: Keep what the first model already built accurately, and ONLY modify/fix what violates Rule 1 or Rule 2.\n"
+            "Output ONLY the corrected JSON object using the exact same schema.",
             g_secondReviewerModelName,
             userMessage,
-            firstDraftJson
+            firstDraftJson,
+            expectedTexDesc
         );
 
         AIDecisionResult reviewedRes;
@@ -3022,6 +3040,9 @@ static AIDecisionResult queryRealNeuralNetwork(
             reviewedRes.httpSuccess &&
             reviewedRes.taskMode == AITaskMode::FullDecor &&
             (!reviewedRes.cellElements.empty() || !reviewedRes.customElements.empty() || reviewedRes.hasCustomPalette)) {
+            if (expectedTexRes >= 16 && reviewedRes.textureResolution != expectedTexRes) {
+                reviewedRes.textureResolution = expectedTexRes;
+            }
             reviewedRes.refinementPasses = bestRes.refinementPasses + 1;
             if (reviewedRes.replyText.empty()) {
                 reviewedRes.replyText = bestRes.replyText;
@@ -4324,15 +4345,26 @@ static void appendDynamicHighResAITextureCanvas(
                 float ly = -dx * sinA + dy * cosA;
                 if (std::fabs(lx) > halfWUnits || std::fabs(ly) > halfHUnits) continue;
 
+                ccColor3B texturedCol = col;
+                if (resN >= 32) {
+                    float microNoise = sampleRealisticFBM(wx * 2.4f, wy * 2.4f, styleSeed + 313) * 0.65f +
+                                       hash2DNoise(px, py, styleSeed + 911) * 0.35f;
+                    float shadeMul = 0.76f + microNoise * 0.48f;
+                    texturedCol = ccColor3B{
+                        static_cast<GLubyte>(std::clamp(static_cast<int>(std::lround(col.r * shadeMul)), 0, 255)),
+                        static_cast<GLubyte>(std::clamp(static_cast<int>(std::lround(col.g * shadeMul)), 0, 255)),
+                        static_cast<GLubyte>(std::clamp(static_cast<int>(std::lround(col.b * shadeMul)), 0, 255))
+                    };
+                }
                 ccColor3B dst = gridCol[idx];
                 if (blend) {
                     gridCol[idx] = ccColor3B{
-                        static_cast<GLubyte>((std::min)(255, static_cast<int>(dst.r + col.r * alpha * 0.75f))),
-                        static_cast<GLubyte>((std::min)(255, static_cast<int>(dst.g + col.g * alpha * 0.75f))),
-                        static_cast<GLubyte>((std::min)(255, static_cast<int>(dst.b + col.b * alpha * 0.75f)))
+                        static_cast<GLubyte>((std::min)(255, static_cast<int>(dst.r + texturedCol.r * alpha * 0.75f))),
+                        static_cast<GLubyte>((std::min)(255, static_cast<int>(dst.g + texturedCol.g * alpha * 0.75f))),
+                        static_cast<GLubyte>((std::min)(255, static_cast<int>(dst.b + texturedCol.b * alpha * 0.75f)))
                     };
                 } else {
-                    gridCol[idx] = lerpColor(dst, col, alpha);
+                    gridCol[idx] = lerpColor(dst, texturedCol, alpha);
                 }
             }
         }
@@ -4993,8 +5025,8 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                 }
             }
 
-            // 3. Прямая генерация клеточных элементов от нейросети (отключаем повторяющиеся полоски при сплошном градиенте!)
-            if (!ai.hasGradient) {
+            // 3. Прямая генерация клеточных элементов от нейросети (при tex_res >= 16 они уже попиксельно впечатаны в холст NxN!)
+            if (!ai.hasGradient && ai.textureResolution < 16) {
                 for (auto const& cel : ai.cellElements) {
                     float u = std::clamp(cel.rx, 0.01f, 0.99f);
                     float v = std::clamp(cel.ry, 0.01f, 0.99f);
@@ -5051,6 +5083,11 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         for (auto const& el : ai.customElements) {
             bool isIntentionalOverhang = (el.rx < 0.0f || el.rx > 1.0f || el.ry < 0.0f || el.ry > 1.0f);
             if (isIntentionalOverhang && !effectiveOverhang) continue;
+            // При включенной попиксельной текстуре (16x16..128x128) внутренние элементы 211 уже растеризованы
+            // с попиксельным рельефом в appendDynamicHighResAITextureCanvas — не перекрываем их плоскими прямоугольниками!
+            if (ai.textureResolution >= 16 && !isIntentionalOverhang && (el.directObjectId <= 0 || el.directObjectId == 211)) {
+                continue;
+            }
 
             float worldX = islOriginX + el.rx * islSpanW;
             float worldY = islOriginY + el.ry * islSpanH;
