@@ -5769,7 +5769,7 @@ protected:
     CCLabelBMFont* m_apiFieldLbl[4]{ nullptr, nullptr, nullptr, nullptr };
     bool m_prevKeyStates[256]{};
 
-    float m_chatThumbInitScaleY = 1.0f;
+    float m_lastChatThumbH = -1.0f;
 
     CCLabelBMFont* m_inputDisplayLabel = nullptr;
     CCLabelBMFont* m_langBadgeLabel = nullptr;
@@ -6312,15 +6312,26 @@ protected:
     }
 
     void updateChatScrollbarThumb() {
-        if (!m_chatScrollLayer || !m_chatScrollLayer->m_contentLayer || !m_chatScrollbarThumb) return;
+        if (!m_chatScrollLayer || !m_chatScrollLayer->m_contentLayer) return;
 
         float viewH = m_chatScrollLayer->getContentSize().height;
         float contentH = (std::max)(viewH, m_chatScrollLayer->m_contentLayer->getContentSize().height);
         float trackH = (std::max)(20.f, m_chatScrollTrackTopY - m_chatScrollTrackBotY);
 
-        // Размер ползунка пропорционален количеству сообщений в чате (чем больше сообщений, тем короче ползунок)
+        // Размер ползунка пропорционален количеству сообщений в чате
         float ratio = std::clamp(viewH / contentH, 0.10f, 1.0f);
         float thumbH = (std::max)(14.f, trackH * ratio);
+
+        if (!m_chatScrollbarThumb || std::fabs(thumbH - m_lastChatThumbH) > 1.0f) {
+            if (m_chatScrollbarThumb) {
+                m_chatScrollbarThumb->removeFromParentAndCleanup(true);
+                m_chatScrollbarThumb = nullptr;
+            }
+            // Генерируем новый овальный ползунок ровно под текущую высоту без растяжения
+            m_chatScrollbarThumb = createSmoothRoundedRect(5.f, thumbH, 2.5f, toColor4F(ccColor3B{ 255, 255, 255 }, 135));
+            m_lastChatThumbH = thumbH;
+            m_mainLayer->addChild(m_chatScrollbarThumb);
+        }
 
         float scrollable = (std::max)(1.0f, contentH - viewH);
         float curY = m_chatScrollLayer->m_contentLayer->getPosition().y;
@@ -6329,7 +6340,6 @@ protected:
 
         float thumbCenterY = (m_chatScrollTrackBotY + thumbH * 0.5f) + scrollFrac * (trackH - thumbH);
         m_chatScrollbarThumb->setPosition(CCPoint{ m_chatScrollTrackX, thumbCenterY });
-        m_chatScrollbarThumb->setScaleY((thumbH / 32.0f) * m_chatThumbInitScaleY);
     }
 
     void refreshChatAgreeButtonState() {
@@ -6347,23 +6357,23 @@ protected:
         auto center = CCPoint{ size.width / 2.f, size.height / 2.f };
         float leftX = center.x - 125.f;
 
-        // Кнопка "Согласен" / "Agree" оформлена точно как красное сообщение игрока в чате (справа с хвостиком Telegram!)
-        float btnW = m_russianLayout ? 56.f : 46.f;
-        float btnH = 15.f;
+        // Миниатюрная кнопка "Согласен" / "Agree" точно в стиле красного сообщения игрока в чате
+        float btnW = m_russianLayout ? 40.f : 32.f;
+        float btnH = 11.f;
         auto* btnNode = CCNode::create();
         btnNode->setContentSize(CCSize{ btnW + 8.f, btnH });
         btnNode->ignoreAnchorPointForPosition(false);
         btnNode->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
 
         auto* msgBubbleSpr = createTelegramBubbleSprite(
-            btnW, btnH, 6.f, true,
+            btnW, btnH, 4.f, true,
             ccColor3B{ 165, 32, 58 },
             ccColor3B{ 235, 68, 98 }
         );
         msgBubbleSpr->setPosition(CCPoint{ (btnW + 8.f) * 0.5f, btnH * 0.5f });
         btnNode->addChild(msgBubbleSpr);
 
-        if (auto* txtSpr = createCyrillicOrEnglishAgreeLabelSprite(m_russianLayout, 6.5f)) {
+        if (auto* txtSpr = createCyrillicOrEnglishAgreeLabelSprite(m_russianLayout, 4.8f)) {
             txtSpr->setPosition(CCPoint{ btnW * 0.5f, btnH * 0.5f });
             btnNode->addChild(txtSpr);
         }
@@ -6371,8 +6381,7 @@ protected:
         m_chatConfirmAgreeBtn = CCMenuItemSpriteExtra::create(
             btnNode, this, menu_selector(AIDecorPopup::onConfirmAgreeInChat)
         );
-        // Размещаем справа внизу чата, как сообщение игрока
-        m_chatConfirmAgreeBtn->setPosition(CCPoint{ leftX + 94.f - btnW * 0.5f, center.y - 43.f });
+        m_chatConfirmAgreeBtn->setPosition(CCPoint{ leftX + 94.f - btnW * 0.5f, center.y - 44.f });
         m_buttonMenu->addChild(m_chatConfirmAgreeBtn);
     }
 
@@ -6475,9 +6484,9 @@ protected:
         m_chatScrollbarTrack->setPosition(CCPoint{ m_chatScrollTrackX, center.y + 24.f });
         m_mainLayer->addChild(m_chatScrollbarTrack);
 
-        m_chatScrollbarThumb = createSmoothRoundedRect(4.f, 32.f, 2.0f, toColor4F(ccColor3B{ 255, 255, 255 }, 135));
+        m_chatScrollbarThumb = createSmoothRoundedRect(5.f, 32.f, 2.5f, toColor4F(ccColor3B{ 255, 255, 255 }, 135));
         m_chatScrollbarThumb->setPosition(CCPoint{ m_chatScrollTrackX, m_chatScrollTrackBotY + 16.f });
-        m_chatThumbInitScaleY = m_chatScrollbarThumb->getScaleY();
+        m_lastChatThumbH = 32.f;
         m_mainLayer->addChild(m_chatScrollbarThumb);
 
         // Скругленная полоска статуса шагов под чатом
@@ -6744,7 +6753,7 @@ protected:
                     m_contour.cellCount(), m_contour.widthUnits(), m_contour.heightUnits(),
                     g_hasReferenceImage ? g_referenceFileName : "none"
                 ),
-                34, 3
+                40, 3
             );
             blocks.push_back(std::move(intro));
         }
@@ -6758,12 +6767,12 @@ protected:
                 b.isThinkingPlaceholder = true;
                 b.lines = { "" };
             } else {
-                b.lines = wrapTextLines(msg.content, 34, 6);
+                b.lines = wrapTextLines(msg.content, 40, 8);
             }
             blocks.push_back(std::move(b));
         }
 
-        float bottomConfirmReserve = (g_hasPendingDrawingApproval && g_hasGeneratedArt) ? 20.f : 0.f;
+        float bottomConfirmReserve = (g_hasPendingDrawingApproval && g_hasGeneratedArt) ? 16.f : 0.f;
 
         float totalH = 6.f + bottomConfirmReserve;
         std::vector<float> blockHeights;
@@ -6778,12 +6787,12 @@ protected:
                 }
             }
             nonEmpty = (std::max)(1, nonEmpty);
-            // Миниатюрные размеры пузырей (~в 3 раза компактнее прежних)
-            float h = b.isThinkingPlaceholder ? 13.f : (6.f + nonEmpty * 8.5f);
-            float w = b.isThinkingPlaceholder ? 28.f : std::clamp(maxChars * 3.8f + 14.f, 34.f, 150.f);
+            // Еще в 2 раза более компактные и миниатюрные шторки сообщений
+            float h = b.isThinkingPlaceholder ? 9.5f : (4.0f + nonEmpty * 5.6f);
+            float w = b.isThinkingPlaceholder ? 21.f : std::clamp(maxChars * 2.55f + 10.f, 22.f, 118.f);
             blockHeights.push_back(h);
             blockWidths.push_back(w);
-            totalH += h + 4.f;
+            totalH += h + 3.0f;
         }
 
         float viewH = m_chatScrollLayer->getContentSize().height;
@@ -6798,38 +6807,53 @@ protected:
             float centerY = curY - h * 0.5f;
 
             // Сообщения игрока справа (красные), ответы ИИ слева (серые)
-            float bubbleCenterX = b.isUser ? (198.f - bubbleW * 0.5f) : (10.f + bubbleW * 0.5f);
+            float bubbleCenterX = b.isUser ? (196.f - bubbleW * 0.5f) : (10.f + bubbleW * 0.5f);
+
+            // Оборачиваем в CCNode с точным ContentSize, чтобы CCContentLayer в Geode никогда не отсекал шторку при скролле!
+            auto* msgNode = CCNode::create();
+            msgNode->setContentSize(CCSize{ bubbleW + 8.f, h });
+            msgNode->ignoreAnchorPointForPosition(false);
+            msgNode->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
+            msgNode->setPosition(CCPoint{ bubbleCenterX, centerY });
+            content->addChild(msgNode);
 
             ccColor3B cardCol   = b.isUser ? ccColor3B{ 165, 32, 58 } : ccColor3B{ 52, 54, 62 };
             ccColor3B borderCol = b.isUser ? ccColor3B{ 235, 68, 98 } : ccColor3B{ 88, 92, 104 };
 
-            auto* bubble = createTelegramBubbleSprite(bubbleW, h, 5.5f, b.isUser, cardCol, borderCol);
-            bubble->setPosition(CCPoint{ bubbleCenterX, centerY });
-            content->addChild(bubble);
+            auto* bubble = createTelegramBubbleSprite(bubbleW, h, 3.6f, b.isUser, cardCol, borderCol);
+            // Смещаем спрайт на +-4px, чтобы тело пузыря (без хвостика) было ровно по центру msgNode!
+            bubble->setPosition(CCPoint{ (bubbleW + 8.f) * 0.5f + (b.isUser ? 4.f : -4.f), h * 0.5f });
+            bubble->setZOrder(0);
+            msgNode->addChild(bubble);
 
             if (b.isThinkingPlaceholder) {
-                // Миниатюрные 3 круглые точки (2.8px), плавно двигающиеся вверх-вниз по очереди
-                m_thinkingDotsBaseY = centerY;
+                // Миниатюрные полупрозрачные 3 точки (1.8px) строго по центру шторки, меньше самой шторки
+                float bodyCenterX = (bubbleW + 8.f) * 0.5f;
+                float bodyCenterY = h * 0.5f;
+                m_thinkingDotsBaseY = bodyCenterY;
                 for (int d = 0; d < 3; ++d) {
-                    m_thinkingDots[d] = createSmoothRoundedRect(2.8f, 2.8f, 1.4f, toColor4F(ccColor3B{ 235, 240, 255 }, 255));
-                    m_thinkingDots[d]->setPosition(CCPoint{ bubbleCenterX + (d - 1) * 6.0f + 1.5f, centerY });
-                    content->addChild(m_thinkingDots[d]);
+                    m_thinkingDots[d] = createSmoothRoundedRect(1.8f, 1.8f, 0.9f, toColor4F(ccColor3B{ 235, 240, 255 }, 145));
+                    m_thinkingDots[d]->setPosition(CCPoint{ bodyCenterX + (d - 1) * 4.2f, bodyCenterY });
+                    m_thinkingDots[d]->setZOrder(1);
+                    msgNode->addChild(m_thinkingDots[d]);
                 }
             } else {
                 int drawnLines = 0;
-                float topTextY = curY - 7.0f;
+                float bodyCenterX = (bubbleW + 8.f) * 0.5f;
+                float topTextY = h - 4.8f;
                 for (auto const& ln : b.lines) {
                     if (ln.empty()) continue;
                     auto* lbl = CCLabelBMFont::create(ln.c_str(), "chatFont.fnt");
-                    lbl->setScale(0.28f);
+                    lbl->setScale(0.20f);
                     lbl->setColor(b.isUser ? ccColor3B{ 255, 244, 246 } : ccColor3B{ 238, 242, 248 });
-                    lbl->setPosition(CCPoint{ bubbleCenterX + (b.isUser ? -2.f : 2.f), topTextY - drawnLines * 8.5f });
-                    content->addChild(lbl);
+                    lbl->setPosition(CCPoint{ bodyCenterX, topTextY - drawnLines * 5.6f });
+                    lbl->setZOrder(1);
+                    msgNode->addChild(lbl);
                     drawnLines++;
                 }
             }
 
-            curY -= (h + 4.f);
+            curY -= (h + 3.0f);
         }
 
         content->setPosition(CCPoint{ 0.f, 0.f });
@@ -7807,9 +7831,10 @@ protected:
                 if (m_thinkingDots[d]) {
                     // Каждая из 3 точек плавно движется поочередно вверх и вниз (синусоидальная волна со сдвигом фазы)
                     float wave = std::sin(m_thinkingDotsAnimTime * 6.8f - d * 1.15f);
-                    float offsetY = wave * 1.8f;
+                    float offsetY = wave * 1.2f;
                     CCPoint curPos = m_thinkingDots[d]->getPosition();
                     m_thinkingDots[d]->setPosition(CCPoint{ curPos.x, m_thinkingDotsBaseY + offsetY });
+                    m_thinkingDots[d]->setOpacity(static_cast<GLubyte>(std::lround(115.0f + (0.5f + 0.5f * wave) * 115.0f)));
                 }
             }
         }
