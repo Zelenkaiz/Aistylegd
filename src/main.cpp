@@ -524,9 +524,11 @@ static std::string g_connectedApiKey;
 static std::string g_discoveredGeminiModel;
 
 // Настраиваемые пользователем Base URL, Endpoint и Имя модели (принимаются ЛЮБЫЕ API-ключи и прокси!)
-static std::string g_customBaseUrl      = "https://api.openai.com";
-static std::string g_customEndpointPath = "/v1/chat/completions";
-static std::string g_customModelName    = "gpt-4o-mini";
+static std::string g_customBaseUrl          = "https://api.openai.com";
+static std::string g_customEndpointPath     = "/v1/chat/completions";
+static std::string g_customModelName        = "gpt-4o-mini";
+static std::string g_secondReviewerModelName = ""; // Вторая модель для перепроверки, исправления ошибок и улучшения текстур
+static bool g_selectingSecondModel          = false;
 
 static const char* getCurrentModelID(int /*provIdx*/ = 0) {
     return g_customModelName.c_str();
@@ -1493,7 +1495,8 @@ static void saveVerifiedApiToDisk(int /*provIdx*/, std::string const& rawKey) {
         out << g_connectedApiKey << "\n"
             << g_customBaseUrl << "\n"
             << g_customEndpointPath << "\n"
-            << g_customModelName << "\n";
+            << g_customModelName << "\n"
+            << g_secondReviewerModelName << "\n";
     }
 }
 
@@ -1511,6 +1514,10 @@ static void loadAndVerifySavedApiFromDisk() {
             g_customBaseUrl      = trimWhitespace(line2);
             g_customEndpointPath = trimWhitespace(line3);
             g_customModelName    = trimWhitespace(line4);
+            std::string line5;
+            if (std::getline(in, line5)) {
+                g_secondReviewerModelName = trimWhitespace(line5);
+            }
             std::string dummyErr;
             if (!g_connectedApiKey.empty() && verifyApiKeyWithServer(0, g_connectedApiKey, dummyErr)) {
                 g_apiVerifiedAndConnected = true;
@@ -2248,17 +2255,19 @@ static bool executeSingleNeuralNetPass(
     std::string const& userTurnPrompt,
     bool includeImage,
     AIDecisionResult& outRes,
-    bool hasSelectedContour = true
+    bool hasSelectedContour = true,
+    std::string const& overrideModelName = ""
 ) {
     int httpStatus = 0;
     std::string rawResp;
     std::string errText;
     std::string assistantContent;
 
+    std::string activeModelName = overrideModelName.empty() ? g_customModelName : overrideModelName;
     std::wstring hostW;
     std::wstring pathW;
     bool isGeminiNative = false;
-    resolveCustomBaseUrlAndEndpoint(g_customModelName, hostW, pathW, isGeminiNative);
+    resolveCustomBaseUrlAndEndpoint(activeModelName, hostW, pathW, isGeminiNative);
 
     if (isGeminiNative) {
         std::string combinedPrompt = systemRule + "\n\nConversation history:\n";
@@ -2331,7 +2340,7 @@ static bool executeSingleNeuralNetPass(
             L"Accept: application/json\r\n"
             L"api-key: " + utf8ToWideASCII(g_connectedApiKey) + L"\r\n";
 
-        std::string activeModel = g_customModelName.empty() ? "gpt-4o-mini" : g_customModelName;
+        std::string activeModel = activeModelName.empty() ? "gpt-4o-mini" : g_customModelName;
         bool sentOk = false;
 
         if (includeImage && g_hasReferenceImage && !g_referenceBase64.empty()) {
@@ -2949,6 +2958,76 @@ static AIDecisionResult queryRealNeuralNetwork(
             } else {
                 break;
             }
+        }
+    }
+
+    // ВТОРАЯ МОДЕЛЬ (ПЕРЕПРОВЕРКА, ИСПРАВЛЕНИЕ ОШИБОК И УЛУЧШЕНИЕ ТЕКСТУРЫ ПОСЛЕ ПЕРВОЙ МОДЕЛИ):
+    if (bestRes.taskMode == AITaskMode::FullDecor &&
+        !g_secondReviewerModelName.empty() &&
+        g_editorSessionActive.load() &&
+        startEpoch == g_aiRequestCancelEpoch.load()) {
+
+        auto serializeElementsBrief = [](std::vector<AICustomDrawElement> const& elems, size_t maxCount) -> std::string {
+            std::ostringstream oss;
+            oss << "[";
+            size_t lim = (std::min)(elems.size(), maxCount);
+            for (size_t i = 0; i < lim; ++i) {
+                auto const& e = elems[i];
+                if (i > 0) oss << ",";
+                oss << fmt::format(
+                    "{{\"id\":{},\"rx\":{:.2f},\"ry\":{:.2f},\"sx\":{:.2f},\"sy\":{:.2f},\"rot\":{:.0f},\"r\":{},\"g\":{},\"b\":{},\"op\":{},\"blend\":{}}}",
+                    e.directObjectId, e.rx, e.ry, e.scaleX, e.scaleY, e.rot,
+                    e.color.r, e.color.g, e.color.b, e.opacity, e.blending ? "true" : "false"
+                );
+            }
+            oss << "]";
+            return oss.str();
+        };
+
+        std::string firstDraftJson = fmt::format(
+            "{{\"style_name\":\"{}\",\"plan\":\"{}\",\"tex_res\":{},\"want_pbr\":{},\"want_gradient\":{},\"want_neon\":{},\"allow_overhang\":{},"
+            "\"fill_rgb\":[{},{},{}],\"mid_rgb\":[{},{},{}],\"main_rgb\":[{},{},{}],\"outline_rgb\":[{},{},{}],\"glow_rgb\":[{},{},{}],"
+            "\"cell_elements\":{},\"elements\":{}}}",
+            jsonEscape(bestRes.styleThemeName),
+            jsonEscape(bestRes.planText),
+            bestRes.textureResolution,
+            bestRes.wantRealisticPBR ? "true" : "false",
+            bestRes.hasGradient ? "true" : "false",
+            bestRes.wantNeon ? "true" : "false",
+            bestRes.allowOverhangByAI ? "true" : "false",
+            bestRes.fillRGB.r, bestRes.fillRGB.g, bestRes.fillRGB.b,
+            bestRes.midRGB.r, bestRes.midRGB.g, bestRes.midRGB.b,
+            bestRes.mainRGB.r, bestRes.mainRGB.g, bestRes.mainRGB.b,
+            bestRes.outlineRGB.r, bestRes.outlineRGB.g, bestRes.outlineRGB.b,
+            bestRes.glowRGB.r, bestRes.glowRGB.g, bestRes.glowRGB.b,
+            serializeElementsBrief(bestRes.cellElements, 32),
+            serializeElementsBrief(bestRes.customElements, 48)
+        );
+
+        std::string reviewPrompt = fmt::format(
+            "SECOND MODEL REVIEW & TEXTURE ENHANCEMENT PASS: You are the Senior Reviewer AI ({}). "
+            "The first AI model produced the following draft for user request: '{}'.\n"
+            "FIRST MODEL DRAFT: {}\n"
+            "YOUR JOB:\n"
+            "1. Inspect the draft carefully for ANY mistakes (wrong colors, wrong style, missing details, weak shading, wrong tex_res, wrong allow_overhang, or ignored user constraints).\n"
+            "2. Fix any errors and IMPROVE the visual texture quality: add richer multi-tone shading, highlights, depth, crisp micro-details in \"cell_elements\" & \"elements\", or upgrade \"tex_res\" (up to 128) if beneficial.\n"
+            "3. Keep \"action\": \"build\" and output the complete improved JSON object (using the exact same schema).",
+            g_secondReviewerModelName,
+            userMessage,
+            firstDraftJson
+        );
+
+        AIDecisionResult reviewedRes;
+        if (executeSingleNeuralNetPass(systemRule, reviewPrompt, g_hasReferenceImage, reviewedRes, contour.hasAnySelection, g_secondReviewerModelName) &&
+            reviewedRes.httpSuccess &&
+            reviewedRes.taskMode == AITaskMode::FullDecor &&
+            (!reviewedRes.cellElements.empty() || !reviewedRes.customElements.empty() || reviewedRes.hasCustomPalette)) {
+            reviewedRes.refinementPasses = bestRes.refinementPasses + 1;
+            if (reviewedRes.replyText.empty()) {
+                reviewedRes.replyText = bestRes.replyText;
+            }
+            reviewedRes.replyText += fmt::format(" [Reviewed by {}]", g_secondReviewerModelName);
+            bestRes = std::move(reviewedRes);
         }
     }
 
@@ -6177,7 +6256,9 @@ protected:
 
             auto const& m = models[idx];
             float rowY = center.y + 36.f - slot * 44.f;
-            bool isSelected = (g_customModelName == m.id);
+            bool isSelected = g_selectingSecondModel
+                ? (g_secondReviewerModelName == m.id)
+                : (g_customModelName == m.id);
 
             ccColor3B cardColor = isSelected ? ccColor3B{ 30, 74, 52 } : ccColor3B{ 26, 18, 24 };
             ccColor3B borderCol = isSelected ? ccColor3B{ 46, 215, 105 } : ccColor3B{ 82, 42, 54 };
@@ -6223,22 +6304,37 @@ protected:
     }
 
     void setupModelSelectorWindowUI(CCPoint center) {
-        this->setTitle("CHOOSE MODEL (TEXT & CODE MODELS FROM API)");
+        this->setTitle(
+            g_selectingSecondModel
+                ? "CHOOSE 2ND REVIEWER MODEL (FIX & POLISH)"
+                : "CHOOSE MODEL (TEXT & CODE MODELS FROM API)"
+        );
+
+        if (g_selectingSecondModel) {
+            // Кнопка "-" для удаления второй модели!
+            auto* remove2ndBtn = createSmoothRoundedButton(
+                32.f, 22.f, 11.f, ccColor3B{ 165, 32, 58 }, ccColor3B{ 235, 68, 98 },
+                "-", 0.65f, ccColor3B{ 255, 255, 255 },
+                this, menu_selector(AIDecorPopup::onRemoveSecondModel)
+            );
+            remove2ndBtn->setPosition(CCPoint{ center.x + 26.f, center.y + 92.f });
+            m_buttonMenu->addChild(remove2ndBtn);
+        }
 
         auto* refreshBtn = createSmoothRoundedButton(
-            88.f, 22.f, 11.f, ccColor3B{ 44, 30, 40 }, ccColor3B{ 110, 52, 68 },
-            "Refresh API", 0.42f, ccColor3B{ 235, 225, 240 },
+            82.f, 22.f, 11.f, ccColor3B{ 44, 30, 40 }, ccColor3B{ 110, 52, 68 },
+            "Refresh API", 0.40f, ccColor3B{ 235, 225, 240 },
             this, menu_selector(AIDecorPopup::onRefreshModelsFromApi)
         );
-        refreshBtn->setPosition(CCPoint{ center.x + 82.f, center.y + 92.f });
+        refreshBtn->setPosition(CCPoint{ center.x + 90.f, center.y + 92.f });
         m_buttonMenu->addChild(refreshBtn);
 
         auto* backBtn = createSmoothRoundedButton(
-            96.f, 22.f, 11.f, ccColor3B{ 46, 52, 64 }, ccColor3B{ 92, 104, 128 },
-            "Back / Done", 0.44f, ccColor3B{ 245, 248, 255 },
+            90.f, 22.f, 11.f, ccColor3B{ 46, 52, 64 }, ccColor3B{ 92, 104, 128 },
+            "Back / Done", 0.42f, ccColor3B{ 245, 248, 255 },
             this, menu_selector(AIDecorPopup::onCloseModelSelectorWindow)
         );
-        backBtn->setPosition(CCPoint{ center.x + 182.f, center.y + 92.f });
+        backBtn->setPosition(CCPoint{ center.x + 184.f, center.y + 92.f });
         m_buttonMenu->addChild(backBtn);
 
         m_modelSelectorStatusLbl = CCLabelBMFont::create(
@@ -6396,9 +6492,9 @@ protected:
 
         // --- ВЕРХНЯЯ ПАНЕЛЬ (ВСЯ СКРУГЛЕННАЯ) ---
         auto* headerTitle = CCLabelBMFont::create("Art Agent", "chatFont.fnt");
-        headerTitle->setScale(0.58f);
+        headerTitle->setScale(0.56f);
         headerTitle->setColor(ccColor3B{ 245, 248, 255 });
-        headerTitle->setPosition(CCPoint{ center.x + 15.f, center.y + 126.f });
+        headerTitle->setPosition(CCPoint{ center.x + 58.f, center.y + 126.f });
         m_mainLayer->addChild(headerTitle);
 
         auto* balPill = createSmoothRoundedRect(106.f, 22.f, 11.f, toColor4F(ccColor3B{ 28, 18, 22 }, 230));
@@ -6421,15 +6517,29 @@ protected:
         changeApiBtn->setPosition(CCPoint{ center.x - 140.f, center.y + 126.f });
         m_buttonMenu->addChild(changeApiBtn);
 
-        std::string shortMod = fmt::format("Model: {}", getCurrentModelID(m_providerIdx));
-        if (shortMod.size() > 22) shortMod = shortMod.substr(0, 22);
+        std::string shortMod = g_secondReviewerModelName.empty()
+            ? fmt::format("Model: {}", getCurrentModelID(m_providerIdx))
+            : fmt::format("M1+2: {}", getCurrentModelID(m_providerIdx));
+        if (shortMod.size() > 19) shortMod = shortMod.substr(0, 19);
         auto* modelBtn = createSmoothRoundedButton(
-            116.f, 20.f, 10.f, ccColor3B{ 38, 24, 32 }, ccColor3B{ 96, 46, 60 },
-            shortMod.c_str(), 0.38f, ccColor3B{ 165, 230, 255 },
+            104.f, 20.f, 10.f, ccColor3B{ 38, 24, 32 }, ccColor3B{ 96, 46, 60 },
+            shortMod.c_str(), 0.37f, ccColor3B{ 165, 230, 255 },
             this, menu_selector(AIDecorPopup::onOpenModelSelectorFromMain)
         );
-        modelBtn->setPosition(CCPoint{ center.x - 65.f, center.y + 126.f });
+        modelBtn->setPosition(CCPoint{ center.x - 71.f, center.y + 126.f });
         m_buttonMenu->addChild(modelBtn);
+
+        // Кнопка "+" рядом с выбором модели для добавления/настройки второй модели-проверяющего!
+        bool has2nd = !g_secondReviewerModelName.empty();
+        auto* addSecondModelBtn = createSmoothRoundedButton(
+            22.f, 20.f, 10.f,
+            has2nd ? ccColor3B{ 34, 155, 82 } : ccColor3B{ 222, 52, 86 },
+            has2nd ? ccColor3B{ 78, 225, 132 } : ccColor3B{ 255, 95, 125 },
+            "+", 0.55f, ccColor3B{ 255, 255, 255 },
+            this, menu_selector(AIDecorPopup::onOpenSecondModelSelector)
+        );
+        addSecondModelBtn->setPosition(CCPoint{ center.x - 4.f, center.y + 126.f });
+        m_buttonMenu->addChild(addSecondModelBtn);
 
         auto* langContainer = CCNode::create();
         langContainer->setContentSize(CCSize{ 44.f, 20.f });
@@ -7280,6 +7390,7 @@ protected:
     }
 
     void onOpenModelSelectorFromGate(CCObject*) {
+        g_selectingSecondModel = false;
         if (!m_inputBuffer.empty()) {
             setApiFieldValue(m_activeApiField, m_inputBuffer);
         }
@@ -7287,10 +7398,26 @@ protected:
     }
 
     void onOpenModelSelectorFromMain(CCObject*) {
+        g_selectingSecondModel = false;
         reopenWithStage(PopupStage::ModelSelector, PopupStage::ArtAgentMain);
     }
 
+    void onOpenSecondModelSelector(CCObject*) {
+        g_selectingSecondModel = true;
+        reopenWithStage(PopupStage::ModelSelector, PopupStage::ArtAgentMain);
+    }
+
+    void onRemoveSecondModel(CCObject*) {
+        g_secondReviewerModelName.clear();
+        g_selectingSecondModel = false;
+        if (!g_connectedApiKey.empty()) {
+            saveVerifiedApiToDisk(0, g_connectedApiKey);
+        }
+        reopenWithStage(m_returnStageAfterModel);
+    }
+
     void onCloseModelSelectorWindow(CCObject*) {
+        g_selectingSecondModel = false;
         reopenWithStage(m_returnStageAfterModel);
     }
 
@@ -7298,8 +7425,13 @@ protected:
         auto models = getActiveFilteredModelList();
         int idx = g_modelSelectorScrollOffset + slotIdx;
         if (idx >= 0 && idx < static_cast<int>(models.size())) {
-            g_customModelName = models[idx].id;
+            if (g_selectingSecondModel) {
+                g_secondReviewerModelName = models[idx].id;
+            } else {
+                g_customModelName = models[idx].id;
+            }
         }
+        g_selectingSecondModel = false;
         if (!g_connectedApiKey.empty()) {
             saveVerifiedApiToDisk(0, g_connectedApiKey);
         }
