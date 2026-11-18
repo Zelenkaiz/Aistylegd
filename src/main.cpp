@@ -6,7 +6,10 @@
 #include <Geode/modify/EditorUI.hpp>
 #include <Geode/ui/Popup.hpp>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <map>
+#include <mutex>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -112,10 +115,27 @@ enum class CellSlopeKind {
     CeilingRight = 4  // Нижний скос / (заполнена левая-верхняя половина: localV >= localU)
 };
 
+// Точный бокс отдельного элемента каркаса по его реальным координатам краев (не по сетке 30x30!)
+struct ExactFrameBox {
+    float cx = 0.f;
+    float cy = 0.f;
+    float halfW = 15.f;
+    float halfH = 15.f;
+    float rotation = 0.f;
+    float minX = 0.f;
+    float maxX = 0.f;
+    float minY = 0.f;
+    float maxY = 0.f;
+    int gx = 0;
+    int gy = 0;
+    bool isSlope = false;
+};
+
 struct ContourAnalysis {
     std::set<std::pair<int, int>> rawCells;      // Только исходный каркас выделенной структуры
     std::set<std::pair<int, int>> occupiedCells; // Полностью заполненная структура (каркас + внутренность)
     std::map<std::pair<int, int>, CellSlopeKind> slopeCells; // Клетки с наклонными поверхностями (45 градусов)
+    std::vector<ExactFrameBox> exactBoxes;       // Точные мировые координаты краев каждого блока каркаса
     std::vector<SelectedSpikeInfo> spikes;
     std::vector<SelectedOrbPortalInfo> orbsAndPortals; // Орбы, дэш-орбы и порталы (декорятся ТОЛЬКО с разрешения игрока!)
     std::vector<GameObject*> solidObjects;
@@ -126,6 +146,11 @@ struct ContourAnalysis {
     float minY = 0.f;
     float maxX = 0.f;
     float maxY = 0.f;
+    // Точные мировые координаты краев каркаса (без привязки к сетке 30x30!)
+    float exactMinX = 0.f;
+    float exactMaxX = 0.f;
+    float exactMinY = 0.f;
+    float exactMaxY = 0.f;
     int minGX = 0;
     int maxGX = 0;
     int minGY = 0;
@@ -134,8 +159,20 @@ struct ContourAnalysis {
     int cellCount() const { return static_cast<int>(occupiedCells.size()); }
     int spikeCount() const { return static_cast<int>(spikes.size()); }
     int orbPortalCount() const { return static_cast<int>(orbsAndPortals.size()); }
-    int widthUnits() const { return hasAnySelection ? (std::max)(1, maxGX - minGX + 1) * 30 : 0; }
-    int heightUnits() const { return hasAnySelection ? (std::max)(1, maxGY - minGY + 1) * 30 : 0; }
+    int widthUnits() const {
+        if (!hasAnySelection) return 0;
+        if (exactMaxX > exactMinX + 0.5f) {
+            return (std::max)(1, static_cast<int>(std::lround(exactMaxX - exactMinX)));
+        }
+        return (std::max)(1, maxGX - minGX + 1) * 30;
+    }
+    int heightUnits() const {
+        if (!hasAnySelection) return 0;
+        if (exactMaxY > exactMinY + 0.5f) {
+            return (std::max)(1, static_cast<int>(std::lround(exactMaxY - exactMinY)));
+        }
+        return (std::max)(1, maxGY - minGY + 1) * 30;
+    }
 };
 
 struct GeneratedObjectSpec {
@@ -685,6 +722,35 @@ static std::string extractHttpErrorDetails(std::string const& body) {
 
 // Автоматический резервный HTTPS-клиент через встроенный системный curl.exe Windows 10/11
 // (срабатывает мгновенно, если WinHTTP блокируется прокси/VPN/файрволом или TLS-сертификатами!)
+// Глобальное управление прерыванием запросов к ИИ при выходе игрока из редактора уровней
+static std::atomic<uint64_t> g_aiRequestCancelEpoch{ 0 };
+static std::atomic<bool> g_editorSessionActive{ false };
+static std::mutex g_activeNetworkHandleMutex;
+#ifdef GEODE_IS_WINDOWS
+static void* g_activeWinHttpRequestHandle = nullptr;
+static HANDLE g_activeCurlProcessHandle = nullptr;
+#endif
+
+static void abortActiveNetworkHandlesImmediate() {
+#ifdef GEODE_IS_WINDOWS
+    std::lock_guard<std::mutex> lk(g_activeNetworkHandleMutex);
+    if (g_activeWinHttpRequestHandle) {
+        HMODULE hWinHttp = GetModuleHandleA("winhttp.dll");
+        if (hWinHttp) {
+            using FnClose = BOOL(WINAPI*)(void*);
+            if (auto pClose = reinterpret_cast<FnClose>(GetProcAddress(hWinHttp, "WinHttpCloseHandle"))) {
+                pClose(g_activeWinHttpRequestHandle);
+            }
+        }
+        g_activeWinHttpRequestHandle = nullptr;
+    }
+    if (g_activeCurlProcessHandle) {
+        TerminateProcess(g_activeCurlProcessHandle, 1);
+        g_activeCurlProcessHandle = nullptr;
+    }
+#endif
+}
+
 static bool performCurlFallbackRequest(
     const wchar_t* verbW,
     const wchar_t* hostW,
@@ -761,6 +827,10 @@ static bool performCurlFallbackRequest(
         return false;
     }
 
+    {
+        std::lock_guard<std::mutex> lk(g_activeNetworkHandleMutex);
+        g_activeCurlProcessHandle = pi.hProcess;
+    }
     std::string output;
     char buf[1024];
     DWORD readBytes = 0;
@@ -768,6 +838,12 @@ static bool performCurlFallbackRequest(
         output.append(buf, readBytes);
     }
     WaitForSingleObject(pi.hProcess, 120000);
+    {
+        std::lock_guard<std::mutex> lk(g_activeNetworkHandleMutex);
+        if (g_activeCurlProcessHandle == pi.hProcess) {
+            g_activeCurlProcessHandle = nullptr;
+        }
+    }
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     CloseHandle(hRead);
@@ -885,6 +961,10 @@ static bool performWinHttpRequest(
             pSetOption(hRequest, 31, &secFlags, sizeof(secFlags));
         }
 
+        {
+            std::lock_guard<std::mutex> lk(g_activeNetworkHandleMutex);
+            g_activeWinHttpRequestHandle = hRequest;
+        }
         LPVOID bodyPtr = bodyData.empty() ? nullptr : const_cast<char*>(bodyData.data());
         DWORD bodyLen  = static_cast<DWORD>(bodyData.size());
 
@@ -916,6 +996,10 @@ static bool performWinHttpRequest(
                 }
             }
 
+            {
+                std::lock_guard<std::mutex> lk(g_activeNetworkHandleMutex);
+                if (g_activeWinHttpRequestHandle == hRequest) g_activeWinHttpRequestHandle = nullptr;
+            }
             pClose(hRequest);
             pClose(hConnect);
             pClose(hSession);
@@ -943,6 +1027,10 @@ static bool performWinHttpRequest(
             return (outHttpStatus == 200);
         }
 
+        {
+            std::lock_guard<std::mutex> lk(g_activeNetworkHandleMutex);
+            if (g_activeWinHttpRequestHandle == hRequest) g_activeWinHttpRequestHandle = nullptr;
+        }
         pClose(hRequest);
         pClose(hConnect);
         pClose(hSession);
@@ -1071,6 +1159,325 @@ static bool verifyApiKeyWithServer(int /*providerIdx*/, std::string const& rawKe
     }
     outErrorMsg = netErr.empty() ? "Network error contacting AI server" : netErr;
     return false;
+}
+
+// ============================================================================
+// ДИНАМИЧЕСКАЯ ЗАГРУЗКА И ФИЛЬТРАЦИЯ СПИСКА МОДЕЛЕЙ ПО API (ДЛЯ ОКНА CHOOSE MODEL)
+// Запрашивает все доступные модели для введенного API-ключа и исключает модели
+// генерации изображений, видео, аудио/TTS/STT, эмбеддингов и модерации (Imagen, Veo, DALL-E, Sora и др.)
+// ============================================================================
+struct DiscoveredTextModel {
+    std::string id;
+    std::string displayName;
+    std::string badgeInfo;
+};
+
+static std::vector<DiscoveredTextModel> g_discoveredTextModels;
+static std::mutex g_discoveredModelsMutex;
+static std::atomic<bool> g_modelFetchThreadRunning{ false };
+static std::atomic<bool> g_modelFetchHasCompleted{ false };
+static std::string g_modelFetchStatusText = "Loading available text/code models from API...";
+static std::string g_lastFetchedModelsKeyAndUrl;
+static int g_modelSelectorScrollOffset = 0;
+
+static std::string toLowerAsciiStr(std::string s) {
+    for (char& c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return s;
+}
+
+// Проверяет, является ли модель генератором картинок, видео, звука, эмбеддингов или модерации (такие модели ИСКЛЮЧАЮТСЯ!)
+static bool isExcludedMediaOrNonTextModel(std::string const& rawModelId, std::string const& rawObjectJson = "") {
+    std::string id = toLowerAsciiStr(trimWhitespace(rawModelId));
+    if (id.empty() || id.size() < 2) return true;
+
+    // Исключаем модели генерации изображений (Imagen, DALL-E, GPT-Image, Flux, Stable Diffusion, Midjourney, Ideogram, Recraft, Kandinsky, Wanx и др.)
+    static constexpr const char* kExcludedSubstrings[] = {
+        "imagen", "veo", "dall-e", "dalle", "gpt-image", "chatgpt-image",
+        "sora", "midjourney", "flux", "stable-diffusion", "sdxl", "sd3",
+        "kandinsky", "playground-v", "kolors", "ideogram", "recraft", "auraflow",
+        "lumina", "hunyuan-dit", "cogview", "pixart", "omnigen", "hidream",
+        "seedream", "wanx", "qwen-image", "grok-2-image", "grok-image", "image-gen",
+        "image_generation", "text-to-image", "img2img", "inpaint", "controlnet",
+        // Исключаем модели генерации видео (Veo, Sora, Kling, Runway, Luma, Pika, Hailuo, Wan, CogVideo, Mochi, LTX, Vidu и др.)
+        "runway", "gen-2", "gen-3", "kling", "luma", "dream-machine", "pika",
+        "hailuo", "minimax-video", "wan2", "wan-2", "cogvideo", "hunyuan-video",
+        "mochi", "ltx-video", "step-video", "seedance", "vidu", "skyreels",
+        "video-", "-video", "text-to-video",
+        // Исключаем аудио / речь / TTS / STT / музыку (Whisper, TTS, Realtime-Audio, Suno, Udio, Kokoro, ElevenLabs и др.)
+        "whisper", "tts", "audio", "realtime", "transcribe", "kokoro",
+        "elevenlabs", "suno", "udio", "musicgen", "stable-audio", "fish-speech",
+        "cosyvoice", "canary", "playai", "orpheus", "speech", "voice",
+        // Исключаем эмбеддинги, реранкеры, модерацию и технические не-текстовые модели
+        "embedding", "embed", "bge-", "jina-embeddings", "rerank", "moderation",
+        "omni-moderation", "llama-guard", "prompt-guard", "shieldgemma",
+        "aqa", "babbage-002", "davinci-002", "text-ada", "text-babbage", "text-curie",
+        "computer-use", "robotics"
+    };
+
+    for (const char* bad : kExcludedSubstrings) {
+        if (id.find(bad) != std::string::npos) {
+            return true;
+        }
+    }
+
+    if (!rawObjectJson.empty()) {
+        std::string lowJson = toLowerAsciiStr(rawObjectJson);
+        if (lowJson.find("text->image") != std::string::npos ||
+            lowJson.find("text->video") != std::string::npos ||
+            lowJson.find("text->audio") != std::string::npos ||
+            lowJson.find("image->image") != std::string::npos ||
+            lowJson.find("\"type\":\"image\"") != std::string::npos ||
+            lowJson.find("\"type\": \"image\"") != std::string::npos ||
+            lowJson.find("\"type\":\"video\"") != std::string::npos ||
+            lowJson.find("\"type\": \"video\"") != std::string::npos ||
+            lowJson.find("\"type\":\"embedding\"") != std::string::npos ||
+            lowJson.find("\"type\": \"embedding\"") != std::string::npos ||
+            lowJson.find("\"type\":\"embeddings\"") != std::string::npos ||
+            lowJson.find("\"type\": \"embeddings\"") != std::string::npos ||
+            lowJson.find("\"type\":\"tts\"") != std::string::npos ||
+            lowJson.find("\"type\": \"tts\"") != std::string::npos ||
+            lowJson.find("\"type\":\"stt\"") != std::string::npos ||
+            lowJson.find("\"type\": \"stt\"") != std::string::npos ||
+            lowJson.find("\"type\":\"audio\"") != std::string::npos ||
+            lowJson.find("\"type\": \"audio\"") != std::string::npos ||
+            lowJson.find("\"type\":\"moderation\"") != std::string::npos ||
+            lowJson.find("\"type\":\"rerank\"") != std::string::npos) {
+            return true;
+        }
+        // Для нативного Gemini API: если есть поле supportedGenerationMethods, но в нем нет generateContent — исключаем!
+        if (lowJson.find("supportedgenerationmethods") != std::string::npos &&
+            lowJson.find("generatecontent") == std::string::npos) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static std::string extractTopLevelJsonStringInObject(std::string const& objJson, std::string const& keyName) {
+    std::string target = "\"" + keyName + "\"";
+    int depth = 0;
+    bool inStr = false;
+    for (size_t i = 0; i < objJson.size(); ++i) {
+        char c = objJson[i];
+        if (c == '\\' && inStr) {
+            ++i;
+            continue;
+        }
+        if (c == '\"') {
+            if (!inStr && depth == 1 && objJson.compare(i, target.size(), target) == 0) {
+                size_t colon = objJson.find(':', i + target.size());
+                if (colon != std::string::npos) {
+                    size_t v = colon + 1;
+                    while (v < objJson.size() && (objJson[v] == ' ' || objJson[v] == '\t' || objJson[v] == '\r' || objJson[v] == '\n')) ++v;
+                    if (v < objJson.size() && objJson[v] == '\"') {
+                        ++v;
+                        std::string out;
+                        while (v < objJson.size()) {
+                            char ch = objJson[v++];
+                            if (ch == '\\' && v < objJson.size()) {
+                                out.push_back(objJson[v++]);
+                            } else if (ch == '\"') {
+                                return out;
+                            } else {
+                                out.push_back(ch);
+                            }
+                        }
+                    }
+                }
+            }
+            inStr = !inStr;
+            continue;
+        }
+        if (!inStr) {
+            if (c == '{' || c == '[') ++depth;
+            else if (c == '}' || c == ']') --depth;
+        }
+    }
+    return "";
+}
+
+static std::vector<DiscoveredTextModel> parseAndFilterModelsListJson(std::string const& rawJson) {
+    std::vector<DiscoveredTextModel> out;
+    std::set<std::string> seenIds;
+
+    size_t arrayStart = rawJson.find("\"data\"");
+    if (arrayStart == std::string::npos) {
+        arrayStart = rawJson.find("\"models\"");
+    }
+    size_t scanPos = 0;
+    if (arrayStart != std::string::npos) {
+        size_t brk = rawJson.find('[', arrayStart);
+        if (brk != std::string::npos) scanPos = brk + 1;
+    }
+
+    int braceDepth = 0;
+    bool inStr = false;
+    size_t objStart = std::string::npos;
+
+    for (size_t i = scanPos; i < rawJson.size(); ++i) {
+        char c = rawJson[i];
+        if (c == '\\' && inStr) {
+            ++i;
+            continue;
+        }
+        if (c == '\"') {
+            inStr = !inStr;
+            continue;
+        }
+        if (inStr) continue;
+
+        if (c == '{') {
+            if (braceDepth == 0) {
+                objStart = i;
+            }
+            ++braceDepth;
+        } else if (c == '}') {
+            --braceDepth;
+            if (braceDepth == 0 && objStart != std::string::npos) {
+                std::string objSlice = rawJson.substr(objStart, i - objStart + 1);
+                objStart = std::string::npos;
+
+                std::string modelId = extractTopLevelJsonStringInObject(objSlice, "id");
+                if (modelId.empty()) {
+                    modelId = extractTopLevelJsonStringInObject(objSlice, "name");
+                }
+                if (modelId.rfind("models/", 0) == 0) {
+                    modelId = modelId.substr(7);
+                }
+                modelId = trimWhitespace(modelId);
+                if (modelId.empty() || seenIds.count(modelId) > 0) continue;
+
+                if (isExcludedMediaOrNonTextModel(modelId, objSlice)) {
+                    continue;
+                }
+
+                seenIds.insert(modelId);
+                std::string disp = extractTopLevelJsonStringInObject(objSlice, "displayName");
+                if (disp.empty()) disp = extractTopLevelJsonStringInObject(objSlice, "name");
+                if (disp.rfind("models/", 0) == 0) disp = disp.substr(7);
+                if (disp.empty()) disp = modelId;
+
+                DiscoveredTextModel entry;
+                entry.id = modelId;
+                entry.displayName = utf8ToGDReadable(disp);
+                entry.badgeInfo = "Text / Code & JSON model (API Verified - Media excluded)";
+                out.push_back(std::move(entry));
+            } else if (braceDepth < 0) {
+                braceDepth = 0;
+            }
+        } else if (c == ']' && braceDepth == 0 && arrayStart != std::string::npos) {
+            break;
+        }
+    }
+
+    return out;
+}
+
+static std::vector<DiscoveredTextModel> getDefaultFallbackTextModels() {
+    return {
+        { "deepseek-chat",     "DeepSeek Chat / V4",  "Fast universal text/code & JSON model" },
+        { "deepseek-v4-pro",   "DeepSeek V4 Pro",     "High-precision 1M context coding & art model" },
+        { "gemini-4-hydrogen", "Gemini 4 Hydrogen",   "Fast multimodal vision & building model" },
+        { "gpt-4o-mini",       "GPT-4o Mini / GPT-6", "Compatible with OpenAI & custom proxy servers" },
+        { "gpt-6.1-terra",     "GPT-6.1 Terra",       "Advanced spatial & code generation model" }
+    };
+}
+
+static bool fetchAvailableTextModelsFromServer(std::vector<DiscoveredTextModel>& outModels, std::string& outStatusMsg) {
+    outModels.clear();
+    std::string key = sanitizeApiKeyString(g_connectedApiKey);
+    if (key.empty()) {
+        outModels = getDefaultFallbackTextModels();
+        outStatusMsg = "Enter API Key first to query live models (showing default text/code models):";
+        return false;
+    }
+
+    std::wstring hostW;
+    std::wstring chatPathW;
+    bool isGeminiNative = false;
+    resolveCustomBaseUrlAndEndpoint(g_customModelName, hostW, chatPathW, isGeminiNative);
+
+    int httpStatus = 0;
+    std::string respBody;
+    std::string netErr;
+
+    if (isGeminiNative) {
+        std::wstring modelsPathW = L"/v1beta/models?pageSize=100";
+        std::wstring hdrW = L"Accept: application/json\r\nx-goog-api-key: " + utf8ToWideASCII(key) + L"\r\n";
+        bool ok = performWinHttpRequest(L"GET", hostW.c_str(), modelsPathW, hdrW, "", httpStatus, respBody, netErr);
+        if (!ok) {
+            std::wstring pathWithKeyW = L"/v1beta/models?pageSize=100&key=" + utf8ToWideASCII(key);
+            ok = performWinHttpRequest(L"GET", hostW.c_str(), pathWithKeyW, L"Accept: application/json\r\n", "", httpStatus, respBody, netErr);
+        }
+        if (ok && httpStatus == 200) {
+            outModels = parseAndFilterModelsListJson(respBody);
+        }
+    } else {
+        std::vector<std::wstring> candidatePaths;
+        size_t chatPos = chatPathW.find(L"/chat/completions");
+        if (chatPos != std::wstring::npos) {
+            candidatePaths.push_back(chatPathW.substr(0, chatPos) + L"/models");
+        }
+        candidatePaths.push_back(L"/v1/models");
+        candidatePaths.push_back(L"/models");
+        candidatePaths.push_back(L"/api/v1/models");
+        candidatePaths.push_back(L"/openai/v1/models");
+
+        std::wstring hdrBearerW = L"Accept: application/json\r\nAuthorization: Bearer " + utf8ToWideASCII(key) + L"\r\n";
+        std::wstring hdrXApiKeyW = L"Accept: application/json\r\nx-api-key: " + utf8ToWideASCII(key) + L"\r\n";
+
+        for (auto const& pathCandidate : candidatePaths) {
+            if (performWinHttpRequest(L"GET", hostW.c_str(), pathCandidate, hdrBearerW, "", httpStatus, respBody, netErr) && httpStatus == 200) {
+                outModels = parseAndFilterModelsListJson(respBody);
+                if (!outModels.empty()) break;
+            }
+            if ((httpStatus == 401 || httpStatus == 403) &&
+                performWinHttpRequest(L"GET", hostW.c_str(), pathCandidate, hdrXApiKeyW, "", httpStatus, respBody, netErr) && httpStatus == 200) {
+                outModels = parseAndFilterModelsListJson(respBody);
+                if (!outModels.empty()) break;
+            }
+        }
+    }
+
+    if (!outModels.empty()) {
+        outStatusMsg = fmt::format("API returned {} text/code models (Imagen/Veo/Video/Audio excluded):", outModels.size());
+        return true;
+    }
+
+    outModels = getDefaultFallbackTextModels();
+    outStatusMsg = "Server /models list unavailable; showing standard text/code models:";
+    return false;
+}
+
+static void startAsyncFetchAvailableModels(bool forceRefresh = false) {
+    if (g_modelFetchThreadRunning.load()) return;
+    std::string signature = g_connectedApiKey + "|" + g_customBaseUrl + "|" + g_customEndpointPath;
+    {
+        std::lock_guard<std::mutex> lk(g_discoveredModelsMutex);
+        if (!forceRefresh && !g_discoveredTextModels.empty() && g_lastFetchedModelsKeyAndUrl == signature) {
+            return;
+        }
+    }
+    g_modelFetchThreadRunning.store(true);
+    g_modelFetchHasCompleted.store(false);
+    g_modelFetchStatusText = "Querying API for available text/code models (filtering Imagen/Veo)...";
+
+    std::thread([signature]() {
+        std::vector<DiscoveredTextModel> fetched;
+        std::string statusMsg;
+        fetchAvailableTextModelsFromServer(fetched, statusMsg);
+        {
+            std::lock_guard<std::mutex> lk(g_discoveredModelsMutex);
+            g_discoveredTextModels = std::move(fetched);
+            g_modelFetchStatusText = statusMsg;
+            g_lastFetchedModelsKeyAndUrl = signature;
+        }
+        g_modelFetchHasCompleted.store(true);
+        g_modelFetchThreadRunning.store(false);
+    }).detach();
 }
 
 static void saveVerifiedApiToDisk(int /*provIdx*/, std::string const& rawKey) {
@@ -2263,6 +2670,19 @@ static float g_autoRetryCountdown = 0.0f;
 static int g_autoRetryAttemptCount = 0;
 static float g_floatingDotsTimer = 0.0f;
 static int g_floatingDotsPhase = 0;
+static float g_loadingShimmerTimer = 0.0f;
+
+// Немедленное прерывание любого активного запроса к ИИ при выходе пользователя из редактора уровней
+static void cancelAllActiveAIRequestsOnEditorExit() {
+    g_aiRequestCancelEpoch.fetch_add(1);
+    g_aiRequestThreadRunning = false;
+    g_aiRequestHasCompleted = false;
+    g_autoRetryTimerActive = false;
+    g_autoRetryCountdown = 0.0f;
+    g_autoRetryAttemptCount = 0;
+    g_pendingRetryPrompt.clear();
+    abortActiveNetworkHandlesImmediate();
+}
 
 // Запрос к реальной нейросети с АВТОМАТИЧЕСКИМ ЦИКЛОМ САМООЦЕНКИ И ПЕРЕДЕЛКИ ПОД РЕФЕРЕНС
 static AIDecisionResult queryRealNeuralNetwork(
@@ -2329,8 +2749,13 @@ static AIDecisionResult queryRealNeuralNetwork(
         refInfo
     );
 
+    uint64_t startEpoch = g_aiRequestCancelEpoch.load();
     AIDecisionResult bestRes;
-    if (!executeSingleNeuralNetPass(systemRule, userMessage, true, bestRes)) {
+    if (!g_editorSessionActive.load() || !executeSingleNeuralNetPass(systemRule, userMessage, true, bestRes)) {
+        return bestRes;
+    }
+    if (!g_editorSessionActive.load() || startEpoch != g_aiRequestCancelEpoch.load()) {
+        bestRes.httpSuccess = false;
         return bestRes;
     }
 
@@ -2865,9 +3290,14 @@ struct IslandBounds {
     std::set<std::pair<int, int>> cells;
     int minGX = 0, maxGX = 0;
     int minGY = 0, maxGY = 0;
+    // Точные мировые координаты краев острова каркаса (не по сетке 30x30!)
+    float exactMinX = 0.f;
+    float exactMaxX = 0.f;
+    float exactMinY = 0.f;
+    float exactMaxY = 0.f;
 };
 
-static std::vector<IslandBounds> splitIntoIslands(std::set<std::pair<int, int>> const& allCells) {
+static std::vector<IslandBounds> splitIntoIslands(std::set<std::pair<int, int>> const& allCells, std::vector<ExactFrameBox> const* exactBoxesPtr = nullptr) {
     std::vector<IslandBounds> islands;
     std::set<std::pair<int, int>> visited;
 
@@ -2902,6 +3332,33 @@ static std::vector<IslandBounds> splitIntoIslands(std::set<std::pair<int, int>> 
                     }
                 }
             }
+        }
+
+        // Вычисляем точные координаты краев острова по реальным объектам каркаса
+        bool hasExact = false;
+        if (exactBoxesPtr && !exactBoxesPtr->empty()) {
+            for (auto const& bx : *exactBoxesPtr) {
+                if (isl.cells.count({ bx.gx, bx.gy }) > 0) {
+                    if (!hasExact) {
+                        isl.exactMinX = bx.minX;
+                        isl.exactMaxX = bx.maxX;
+                        isl.exactMinY = bx.minY;
+                        isl.exactMaxY = bx.maxY;
+                        hasExact = true;
+                    } else {
+                        isl.exactMinX = (std::min)(isl.exactMinX, bx.minX);
+                        isl.exactMaxX = (std::max)(isl.exactMaxX, bx.maxX);
+                        isl.exactMinY = (std::min)(isl.exactMinY, bx.minY);
+                        isl.exactMaxY = (std::max)(isl.exactMaxY, bx.maxY);
+                    }
+                }
+            }
+        }
+        if (!hasExact) {
+            isl.exactMinX = isl.minGX * 30.0f;
+            isl.exactMaxX = (isl.maxGX + 1) * 30.0f;
+            isl.exactMinY = isl.minGY * 30.0f;
+            isl.exactMaxY = (isl.maxGY + 1) * 30.0f;
         }
         islands.push_back(std::move(isl));
     }
@@ -2971,15 +3428,332 @@ static CellSlopeKind getCellSlopeKind(ContourAnalysis const& contour, int gx, in
     return (it != contour.slopeCells.end()) ? it->second : CellSlopeKind::None;
 }
 
-static bool isWorldPointInsideExactContour(ContourAnalysis const& contour, float wx, float wy) {
+// Возвращает точные допустимые границы [outMinX, outMaxX] и [outMinY, outMaxY] по реальным краям объектов каркаса в точке (wx, wy)
+static bool getExactFrameSpanAtWorldPoint(
+    ContourAnalysis const& contour,
+    float wx,
+    float wy,
+    float& outMinX,
+    float& outMaxX,
+    float& outMinY,
+    float& outMaxY
+) {
+    if (contour.exactMaxX > contour.exactMinX + 0.1f) {
+        if (wx < contour.exactMinX - 0.05f || wx > contour.exactMaxX + 0.05f ||
+            wy < contour.exactMinY - 0.05f || wy > contour.exactMaxY + 0.05f) {
+            return false;
+        }
+    }
+
+    // 1. Проверяем, попадает ли точка напрямую внутрь одного из реальных боксов каркаса
+    bool hitRow = false;
+    float rowLeft = contour.exactMaxX;
+    float rowRight = contour.exactMinX;
+    for (auto const& bx : contour.exactBoxes) {
+        if (wy >= bx.minY - 1.5f && wy <= bx.maxY + 1.5f) {
+            rowLeft = (std::min)(rowLeft, bx.minX);
+            rowRight = (std::max)(rowRight, bx.maxX);
+            hitRow = true;
+        }
+    }
+
+    bool hitCol = false;
+    float colBot = contour.exactMaxY;
+    float colTop = contour.exactMinY;
+    for (auto const& bx : contour.exactBoxes) {
+        if (wx >= bx.minX - 1.5f && wx <= bx.maxX + 1.5f) {
+            colBot = (std::min)(colBot, bx.minY);
+            colTop = (std::max)(colTop, bx.maxY);
+            hitCol = true;
+        }
+    }
+
+    if (!hitRow) {
+        rowLeft = contour.exactMinX;
+        rowRight = contour.exactMaxX;
+    }
+    if (!hitCol) {
+        colBot = contour.exactMinY;
+        colTop = contour.exactMaxY;
+    }
+
+    if (wx < rowLeft - 0.05f || wx > rowRight + 0.05f ||
+        wy < colBot - 0.05f || wy > colTop + 0.05f) {
+        return false;
+    }
+
     int gx = static_cast<int>(std::floor(wx / 30.0f));
     int gy = static_cast<int>(std::floor(wy / 30.0f));
-    if (contour.occupiedCells.count({ gx, gy }) == 0) return false;
+    if (contour.occupiedCells.count({ gx, gy }) == 0) {
+        // Проверяем, не находится ли точка внутри реального смещенного блока каркаса
+        bool insideAnyExactBox = false;
+        for (auto const& bx : contour.exactBoxes) {
+            if (wx >= bx.minX && wx <= bx.maxX && wy >= bx.minY && wy <= bx.maxY) {
+                gx = bx.gx;
+                gy = bx.gy;
+                insideAnyExactBox = true;
+                break;
+            }
+        }
+        if (!insideAnyExactBox) return false;
+    }
+
+    outMinX = rowLeft;
+    outMaxX = rowRight;
+    outMinY = colBot;
+    outMaxY = colTop;
+
+    // Учитываем 45-градусные наклонные поверхности (Slope)
     CellSlopeKind sk = getCellSlopeKind(contour, gx, gy);
-    if (sk == CellSlopeKind::None) return true;
-    float u = (wx - gx * 30.0f) / 30.0f;
-    float v = (wy - gy * 30.0f) / 30.0f;
-    return isLocalPointInsideCellSlope(sk, u, v);
+    if (sk != CellSlopeKind::None) {
+        float cellLeft = (std::max)(rowLeft, gx * 30.0f);
+        float cellRight = (std::min)(rowRight, (gx + 1) * 30.0f);
+        float cellBot = (std::max)(colBot, gy * 30.0f);
+        float cellTop = (std::min)(colTop, (gy + 1) * 30.0f);
+        float cellW = (std::max)(1.0f, cellRight - cellLeft);
+        float cellH = (std::max)(1.0f, cellTop - cellBot);
+        float u = std::clamp((wx - cellLeft) / cellW, 0.0f, 1.0f);
+        float v = std::clamp((wy - cellBot) / cellH, 0.0f, 1.0f);
+        if (!isLocalPointInsideCellSlope(sk, u, v)) return false;
+
+        float uMin = 0.0f, uMax = 1.0f;
+        if (getSlopeHorizontalSpanAtV(sk, v, uMin, uMax)) {
+            if (sk == CellSlopeKind::RoofLeft || sk == CellSlopeKind::CeilingLeft) {
+                outMinX = (std::max)(outMinX, cellLeft + uMin * cellW);
+            }
+            if (sk == CellSlopeKind::RoofRight || sk == CellSlopeKind::CeilingRight) {
+                outMaxX = (std::min)(outMaxX, cellLeft + uMax * cellW);
+            }
+        }
+        switch (sk) {
+            case CellSlopeKind::RoofLeft:
+                outMaxY = (std::min)(outMaxY, cellBot + u * cellH);
+                break;
+            case CellSlopeKind::RoofRight:
+                outMaxY = (std::min)(outMaxY, cellBot + (1.0f - u) * cellH);
+                break;
+            case CellSlopeKind::CeilingLeft:
+                outMinY = (std::max)(outMinY, cellBot + (1.0f - u) * cellH);
+                break;
+            case CellSlopeKind::CeilingRight:
+                outMinY = (std::max)(outMinY, cellBot + u * cellH);
+                break;
+            default:
+                break;
+        }
+    }
+
+    return (outMaxX > outMinX + 0.1f && outMaxY > outMinY + 0.1f);
+}
+
+static bool isWorldPointInsideExactContour(ContourAnalysis const& contour, float wx, float wy) {
+    float minX = 0.f, maxX = 0.f, minY = 0.f, maxY = 0.f;
+    return getExactFrameSpanAtWorldPoint(contour, wx, wy, minX, maxX, minY, maxY) &&
+           wx >= minX && wx <= maxX && wy >= minY && wy <= maxY;
+}
+
+// Строго подрезает и зажимает любой внутренний блок/декор по ТОЧНЫМ координатам краев каркаса,
+// чтобы ни один пиксель или угол повернутого объекта НЕ вылезал за пределы каркаса!
+static bool clipSpecStrictlyToExactContour(
+    ContourAnalysis const& contour,
+    IslandBounds const& isl,
+    GeneratedObjectSpec& spec
+) {
+    if (!contour.hasAnySelection || contour.occupiedCells.empty()) return true;
+
+    float minX = isl.exactMinX;
+    float maxX = isl.exactMaxX;
+    float minY = isl.exactMinY;
+    float maxY = isl.exactMaxY;
+    if (!getExactFrameSpanAtWorldPoint(contour, spec.x, spec.y, minX, maxX, minY, maxY)) {
+        return false;
+    }
+    minX = (std::max)(minX, isl.exactMinX);
+    maxX = (std::min)(maxX, isl.exactMaxX);
+    minY = (std::max)(minY, isl.exactMinY);
+    maxY = (std::min)(maxY, isl.exactMaxY);
+
+    float availW = maxX - minX;
+    float availH = maxY - minY;
+    if (availW <= 0.4f || availH <= 0.4f) return false;
+
+    float rad = std::fabs(spec.rotation) * (3.14159265f / 180.0f);
+    float cosA = std::fabs(std::cos(rad));
+    float sinA = std::fabs(std::sin(rad));
+
+    float halfW = std::fabs(spec.scaleX) * 15.0f;
+    float halfH = std::fabs(spec.scaleY) * 15.0f;
+    float extX = halfW * cosA + halfH * sinA;
+    float extY = halfW * sinA + halfH * cosA;
+
+    // Если размер объекта превышает точные границы каркаса в этом месте — уменьшаем его масштаб!
+    float maxHalfSpanX = availW * 0.495f;
+    float maxHalfSpanY = availH * 0.495f;
+    if (sinA < 0.05f) {
+        if (halfW > maxHalfSpanX) {
+            halfW = maxHalfSpanX;
+            spec.scaleX = halfW / 15.0f;
+        }
+        if (halfH > maxHalfSpanY) {
+            halfH = maxHalfSpanY;
+            spec.scaleY = halfH / 15.0f;
+        }
+    } else if (cosA < 0.05f) {
+        if (halfH > maxHalfSpanX) {
+            halfH = maxHalfSpanX;
+            spec.scaleY = halfH / 15.0f;
+        }
+        if (halfW > maxHalfSpanY) {
+            halfW = maxHalfSpanY;
+            spec.scaleX = halfW / 15.0f;
+        }
+    } else {
+        float shrink = 1.0f;
+        if (extX > maxHalfSpanX && extX > 0.001f) shrink = (std::min)(shrink, maxHalfSpanX / extX);
+        if (extY > maxHalfSpanY && extY > 0.001f) shrink = (std::min)(shrink, maxHalfSpanY / extY);
+        if (shrink < 1.0f) {
+            spec.scaleX *= shrink;
+            spec.scaleY *= shrink;
+            halfW *= shrink;
+            halfH *= shrink;
+        }
+    }
+
+    extX = halfW * cosA + halfH * sinA;
+    extY = halfW * sinA + halfH * cosA;
+
+    spec.x = std::clamp(spec.x, minX + extX, maxX - extX);
+    spec.y = std::clamp(spec.y, minY + extY, maxY - extY);
+
+    // Повторная проверка в новой точке (особенно важна возле наклонных 45° граней!)
+    float minX2 = minX, maxX2 = maxX, minY2 = minY, maxY2 = maxY;
+    if (!getExactFrameSpanAtWorldPoint(contour, spec.x, spec.y, minX2, maxX2, minY2, maxY2)) {
+        return false;
+    }
+    if (spec.x - extX < minX2 - 0.2f || spec.x + extX > maxX2 + 0.2f ||
+        spec.y - extY < minY2 - 0.2f || spec.y + extY > maxY2 + 0.2f) {
+        float availW2 = (std::max)(0.4f, maxX2 - minX2);
+        float availH2 = (std::max)(0.4f, maxY2 - minY2);
+        float shrink2 = 1.0f;
+        if (extX > availW2 * 0.48f && extX > 0.001f) shrink2 = (std::min)(shrink2, (availW2 * 0.48f) / extX);
+        if (extY > availH2 * 0.48f && extY > 0.001f) shrink2 = (std::min)(shrink2, (availH2 * 0.48f) / extY);
+        spec.scaleX *= shrink2;
+        spec.scaleY *= shrink2;
+        extX *= shrink2;
+        extY *= shrink2;
+        spec.x = std::clamp(spec.x, minX2 + extX, maxX2 - extX);
+        spec.y = std::clamp(spec.y, minY2 + extY, maxY2 - extY);
+    }
+
+    return (spec.scaleX >= 0.002f && spec.scaleY >= 0.002f);
+}
+
+// ============================================================================
+// ТОЧНАЯ ГЕОМЕТРИЯ И ПОВОРОТ ШИПОВ (Spikes):
+// 1) Треугольная модель с учетом угла поворота sp.rotation и масштаба (sp.scaleX, sp.scaleY)
+// 2) Автоматическое определение ориентации шипа относительно поверхности и наклонных граней каркаса
+// ============================================================================
+static bool isWorldPointInsideRotatedSpikeTriangle(SelectedSpikeInfo const& sp, float wx, float wy) {
+    // В Cocos2d-x положительный угол rotation поворачивает по часовой стрелке:
+    // 0° = острие вверх (+Y), 90° = острие вправо (+X), 180° = острие вниз (-Y), -90°/270° = острие влево (-X)
+    float rad = sp.rotation * (3.14159265f / 180.0f);
+    float cosA = std::cos(rad);
+    float sinA = std::sin(rad);
+
+    float dx = wx - sp.x;
+    float dy = wy - sp.y;
+
+    // Обратное преобразование из мировых координат в локальные координаты шипа
+    float lx =  dx * cosA - dy * sinA;
+    float ly =  dx * sinA + dy * cosA;
+
+    float sx = (std::max)(0.2f, sp.scaleX);
+    float sy = (std::max)(0.2f, sp.scaleY);
+    float halfBaseW = 15.0f * sx;
+    float fullH = ((sp.objectId == 39 || sp.objectId == 103) ? 15.0f : 30.0f) * sy;
+    float baseY = -15.0f * sy;
+
+    float t = (ly - baseY) / (std::max)(1.0f, fullH);
+    if (t < 0.0f || t > 1.0f) return false;
+
+    float allowedHalfW = halfBaseW * (1.0f - t);
+    return std::fabs(lx) <= allowedHalfW;
+}
+
+static void resolveSpikeRotationFromSurfaceAndGeometry(SelectedSpikeInfo& sp, ContourAnalysis const& info) {
+    // Нормализуем исходный угол из редактора к [-180, 180]
+    float rot = std::fmod(sp.rotation, 360.0f);
+    if (rot > 180.0f) rot -= 360.0f;
+    if (rot <= -180.0f) rot += 360.0f;
+
+    // Учитываем FlipY / FlipX объекта в GD:
+    // Если шип отражен по вертикали (FlipY) при угле 0° -> он смотрит вниз (180°)!
+    if (sp.flipY && std::fabs(rot) < 5.0f) {
+        rot = 180.0f;
+    } else if (sp.flipY && std::fabs(std::fabs(rot) - 180.0f) < 5.0f) {
+        rot = 0.0f;
+    }
+    if (sp.flipX && std::fabs(std::fabs(rot) - 90.0f) < 5.0f) {
+        rot = -rot;
+    }
+
+    // Если угол остался 0° (по умолчанию), проверяем, к какой именно грани/поверхности каркаса прикреплен шип!
+    if (std::fabs(rot) < 1.0f && !sp.flipY && (!info.exactBoxes.empty() || !info.occupiedCells.empty())) {
+        int sgx = static_cast<int>(std::floor(sp.x / 30.0f));
+        int sgy = static_cast<int>(std::floor(sp.y / 30.0f));
+
+        // 1. Проверяем наклонные 45° грани каркаса в клетке шипа или по соседству
+        CellSlopeKind skHere  = getCellSlopeKind(info, sgx, sgy);
+        CellSlopeKind skBelow = getCellSlopeKind(info, sgx, sgy - 1);
+        CellSlopeKind skAbove = getCellSlopeKind(info, sgx, sgy + 1);
+        CellSlopeKind activeSlope = (skHere != CellSlopeKind::None) ? skHere :
+                                    ((skBelow != CellSlopeKind::None) ? skBelow : skAbove);
+
+        if (activeSlope == CellSlopeKind::RoofLeft) {
+            rot = -45.0f;
+        } else if (activeSlope == CellSlopeKind::RoofRight) {
+            rot = 45.0f;
+        } else if (activeSlope == CellSlopeKind::CeilingLeft) {
+            rot = -135.0f;
+        } else if (activeSlope == CellSlopeKind::CeilingRight) {
+            rot = 135.0f;
+        } else {
+            // 2. Проверяем наличие опоры каркаса снизу, сверху (потолок), слева и справа (стены)
+            bool hasFloorBelow   = (info.occupiedCells.count({ sgx, sgy - 1 }) > 0);
+            bool hasCeilingAbove = (info.occupiedCells.count({ sgx, sgy + 1 }) > 0);
+            bool hasWallLeft     = (info.occupiedCells.count({ sgx - 1, sgy }) > 0);
+            bool hasWallRight    = (info.occupiedCells.count({ sgx + 1, sgy }) > 0);
+
+            for (auto const& bx : info.exactBoxes) {
+                bool xOverlap = (sp.x >= bx.minX - 6.0f && sp.x <= bx.maxX + 6.0f);
+                bool yOverlap = (sp.y >= bx.minY - 6.0f && sp.y <= bx.maxY + 6.0f);
+                if (xOverlap) {
+                    float dyFloor = sp.y - bx.maxY;
+                    if (dyFloor >= -4.0f && dyFloor <= 24.0f) hasFloorBelow = true;
+                    float dyCeil = bx.minY - sp.y;
+                    if (dyCeil >= -4.0f && dyCeil <= 24.0f) hasCeilingAbove = true;
+                }
+                if (yOverlap) {
+                    float dxLeft = sp.x - bx.maxX;
+                    if (dxLeft >= -4.0f && dxLeft <= 24.0f) hasWallLeft = true;
+                    float dxRight = bx.minX - sp.x;
+                    if (dxRight >= -4.0f && dxRight <= 24.0f) hasWallRight = true;
+                }
+            }
+
+            if (!hasFloorBelow) {
+                if (hasCeilingAbove) {
+                    rot = 180.0f; // Шип висит на потолке острием вниз
+                } else if (hasWallLeft && !hasWallRight) {
+                    rot = 90.0f;  // Шип на левой стене острием вправо
+                } else if (hasWallRight && !hasWallLeft) {
+                    rot = -90.0f; // Шип на правой стене острием влево
+                }
+            }
+        }
+    }
+
+    sp.rotation = rot;
 }
 
 // Автоматическое распознавание наклонных крыш и скосов (как из объектов Slope, так и из ступенчатых диагональных крыш!)
@@ -3183,6 +3957,50 @@ static ContourAnalysis analyzeSelectedContour(EditorUIType* ui) {
                 info.rawCells.insert({ gx, gy });
                 info.occupiedCells.insert({ gx, gy });
                 info.solidObjects.push_back(obj);
+
+                // Вычисляем точные координаты краев объекта каркаса (с учетом его реального размера, масштаба и поворота!)
+                float sx = std::fabs(obj->getScaleX()) > 0.01f ? std::fabs(obj->getScaleX()) : 1.0f;
+                float sy = std::fabs(obj->getScaleY()) > 0.01f ? std::fabs(obj->getScaleY()) : 1.0f;
+                float baseHalfW = 15.0f;
+                float baseHalfH = 15.0f;
+                CCSize cs = obj->getContentSize();
+                if (cs.width > 1.5f && cs.width < 27.0f) baseHalfW = cs.width * 0.5f;
+                if (cs.height > 1.5f && cs.height < 27.0f) baseHalfH = cs.height * 0.5f;
+
+                float halfW = baseHalfW * sx;
+                float halfH = baseHalfH * sy;
+                float rad = std::fabs(obj->getRotation()) * (3.14159265f / 180.0f);
+                float cosA = std::fabs(std::cos(rad));
+                float sinA = std::fabs(std::sin(rad));
+                float extX = halfW * cosA + halfH * sinA;
+                float extY = halfW * sinA + halfH * cosA;
+
+                ExactFrameBox box;
+                box.cx = pos.x;
+                box.cy = pos.y;
+                box.halfW = halfW;
+                box.halfH = halfH;
+                box.rotation = obj->getRotation();
+                box.minX = pos.x - extX;
+                box.maxX = pos.x + extX;
+                box.minY = pos.y - extY;
+                box.maxY = pos.y + extY;
+                box.gx = gx;
+                box.gy = gy;
+                box.isSlope = isSlopeGameObject(obj);
+
+                if (info.exactBoxes.empty()) {
+                    info.exactMinX = box.minX;
+                    info.exactMaxX = box.maxX;
+                    info.exactMinY = box.minY;
+                    info.exactMaxY = box.maxY;
+                } else {
+                    info.exactMinX = (std::min)(info.exactMinX, box.minX);
+                    info.exactMaxX = (std::max)(info.exactMaxX, box.maxX);
+                    info.exactMinY = (std::min)(info.exactMinY, box.minY);
+                    info.exactMaxY = (std::max)(info.exactMaxY, box.maxY);
+                }
+                info.exactBoxes.push_back(box);
             }
         }
 
@@ -3196,6 +4014,30 @@ static ContourAnalysis analyzeSelectedContour(EditorUIType* ui) {
         }
         fillAllStructureInteriorsCompletely(info.occupiedCells);
         detectAllContourSlopes(info, explicitSlopes);
+
+        // Для заполненных внутренних клеток между реальными краями каркаса добавляем боксы, зажатые в exactMin..exactMax
+        for (auto const& [gx, gy] : info.occupiedCells) {
+            if (info.rawCells.count({ gx, gy }) > 0) continue;
+            ExactFrameBox ib;
+            ib.gx = gx;
+            ib.gy = gy;
+            ib.minX = (info.exactMaxX > info.exactMinX) ? (std::max)(info.exactMinX, gx * 30.0f) : (gx * 30.0f);
+            ib.maxX = (info.exactMaxX > info.exactMinX) ? (std::min)(info.exactMaxX, (gx + 1) * 30.0f) : ((gx + 1) * 30.0f);
+            ib.minY = (info.exactMaxY > info.exactMinY) ? (std::max)(info.exactMinY, gy * 30.0f) : (gy * 30.0f);
+            ib.maxY = (info.exactMaxY > info.exactMinY) ? (std::min)(info.exactMaxY, (gy + 1) * 30.0f) : ((gy + 1) * 30.0f);
+            if (ib.maxX > ib.minX && ib.maxY > ib.minY) {
+                ib.cx = (ib.minX + ib.maxX) * 0.5f;
+                ib.cy = (ib.minY + ib.maxY) * 0.5f;
+                ib.halfW = (ib.maxX - ib.minX) * 0.5f;
+                ib.halfH = (ib.maxY - ib.minY) * 0.5f;
+                info.exactBoxes.push_back(ib);
+            }
+        }
+
+        // Определяем точный угол поворота каждого шипа по его настройкам и геометрии поверхности каркаса
+        for (auto& sp : info.spikes) {
+            resolveSpikeRotationFromSurfaceAndGeometry(sp, info);
+        }
     }
 
     info.hasAnySelection = (!info.occupiedCells.empty() || !info.spikes.empty() || !info.orbsAndPortals.empty());
@@ -3230,6 +4072,13 @@ static ContourAnalysis analyzeSelectedContour(EditorUIType* ui) {
     for (auto const& sp : info.spikes) expandBounds(static_cast<int>(std::floor(sp.x / 30.0f)), static_cast<int>(std::floor(sp.y / 30.0f)));
     if (info.occupiedCells.empty() && info.spikes.empty()) {
         for (auto const& op : info.orbsAndPortals) expandBounds(static_cast<int>(std::floor(op.x / 30.0f)), static_cast<int>(std::floor(op.y / 30.0f)));
+    }
+
+    if (info.exactBoxes.empty()) {
+        info.exactMinX = info.minGX * 30.0f;
+        info.exactMaxX = (info.maxGX + 1) * 30.0f;
+        info.exactMinY = info.minGY * 30.0f;
+        info.exactMaxY = (info.maxGY + 1) * 30.0f;
     }
 
     return info;
@@ -3473,12 +4322,10 @@ static void appendDynamicHighResAITextureCanvas(
     int styleSeed
 ) {
     resN = std::clamp(resN, 16, 128);
-    int islCols = (std::max)(1, isl.maxGX - isl.minGX + 1);
-    int islRows = (std::max)(1, isl.maxGY - isl.minGY + 1);
-    float islOriginX = isl.minGX * 30.0f;
-    float islOriginY = isl.minGY * 30.0f;
-    float islSpanW   = islCols * 30.0f;
-    float islSpanH   = islRows * 30.0f;
+    float islOriginX = (isl.exactMaxX > isl.exactMinX + 0.5f) ? isl.exactMinX : (isl.minGX * 30.0f);
+    float islOriginY = (isl.exactMaxY > isl.exactMinY + 0.5f) ? isl.exactMinY : (isl.minGY * 30.0f);
+    float islSpanW   = (isl.exactMaxX > isl.exactMinX + 0.5f) ? (isl.exactMaxX - isl.exactMinX) : ((std::max)(1, isl.maxGX - isl.minGX + 1) * 30.0f);
+    float islSpanH   = (isl.exactMaxY > isl.exactMinY + 0.5f) ? (isl.exactMaxY - isl.exactMinY) : ((std::max)(1, isl.maxGY - isl.minGY + 1) * 30.0f);
 
     int gridW = resN;
     int gridH = resN;
@@ -3494,14 +4341,11 @@ static void appendDynamicHighResAITextureCanvas(
         int cellGY = static_cast<int>(std::floor(wy / 30.0f));
         float localV = (wy - cellGY * 30.0f) / 30.0f;
 
+        (void)cellGY;
+        (void)localV;
         for (int px = 0; px < gridW; ++px) {
             float wx = islOriginX + (px + 0.5f) * pxStepX;
-            int cellGX = static_cast<int>(std::floor(wx / 30.0f));
-            if (isl.cells.count({ cellGX, cellGY }) == 0) continue;
-
-            float localU = (wx - cellGX * 30.0f) / 30.0f;
-            CellSlopeKind sk = getCellSlopeKind(contour, cellGX, cellGY);
-            if (!isLocalPointInsideCellSlope(sk, localU, localV)) continue;
+            if (!isWorldPointInsideExactContour(contour, wx, wy)) continue;
 
             size_t idx = static_cast<size_t>(py * gridW + px);
             gridValid[idx] = 1;
@@ -3618,14 +4462,31 @@ static void appendDynamicHighResAITextureCanvas(
 
             float centerX = islOriginX + (px + w * 0.5f) * pxStepX;
             float centerY = islOriginY + (py + h * 0.5f) * pxStepY;
-            float scX = ((w * pxStepX) * 1.03f) / 30.0f;
-            float scY = ((h * pxStepY) * 1.03f) / 30.0f;
+            float scX = ((w * pxStepX) * 1.01f) / 30.0f;
+            float scY = ((h * pxStepY) * 1.01f) / 30.0f;
 
-            addSpec(
-                result, 211, centerX, centerY, scX, scY, 0.f,
-                LayerRole::InnerDetail, ColorSlot::CustomRGB, 5, 0, false,
-                255, 1, 2, c0, false
-            );
+            GeneratedObjectSpec texSpec;
+            texSpec.objectId          = 211;
+            texSpec.x                 = centerX;
+            texSpec.y                 = centerY;
+            texSpec.scaleX            = scX;
+            texSpec.scaleY            = scY;
+            texSpec.rotation          = 0.f;
+            texSpec.layerRole         = LayerRole::InnerDetail;
+            texSpec.colorSlot         = ColorSlot::CustomRGB;
+            texSpec.zOrder            = 5;
+            texSpec.priorityTier      = 0;
+            texSpec.isOverhang        = false;
+            texSpec.customOpacity     = 255;
+            texSpec.zLayerCode        = 1;
+            texSpec.editorLayerOffset = 2;
+            texSpec.customColor       = c0;
+            texSpec.customBlending    = false;
+            texSpec.noTouch           = true;
+            texSpec.noGlow            = true;
+            if (clipSpecStrictlyToExactContour(contour, isl, texSpec)) {
+                result.push_back(texSpec);
+            }
         }
     }
 }
@@ -3638,14 +4499,16 @@ static void appendSpikeDecoration(
     AIDecisionResult const& ai,
     bool spawnBaseSpikeToo = false
 ) {
-    float rad = -sp.rotation * (3.14159265f / 180.0f);
+    // В Cocos2d-x положительный угол rotation поворачивает по часовой стрелке:
+    // wx = sp.x + sx * cos(rad) + sy * sin(rad), wy = sp.y - sx * sin(rad) + sy * cos(rad)
+    float rad = sp.rotation * (3.14159265f / 180.0f);
     float cosA = std::cos(rad);
     float sinA = std::sin(rad);
 
     auto localToWorld = [&](float lx, float ly) -> std::pair<float, float> {
-        float sx = lx * sp.scaleX * (sp.flipX ? -1.f : 1.f);
-        float sy = ly * sp.scaleY * (sp.flipY ? -1.f : 1.f);
-        return { sp.x + (sx * cosA - sy * sinA), sp.y + (sx * sinA + sy * cosA) };
+        float sx = lx * (std::max)(0.2f, sp.scaleX);
+        float sy = ly * (std::max)(0.2f, sp.scaleY);
+        return { sp.x + (sx * cosA + sy * sinA), sp.y + (-sx * sinA + sy * cosA) };
     };
 
     if (spawnBaseSpikeToo) {
@@ -3873,7 +4736,7 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         return result;
     }
 
-    auto islands = splitIntoIslands(contour.occupiedCells);
+    auto islands = splitIntoIslands(contour.occupiedCells, &contour.exactBoxes);
 
     if (ai.taskMode == AITaskMode::Only3D) {
         for (auto const& isl : islands) {
@@ -3932,22 +4795,76 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         return result;
     }
 
-    float spanH = static_cast<float>((std::max)(1, contour.maxGY - contour.minGY + 1)) * 30.f;
-    float originY = contour.minGY * 30.f;
+    float spanH = (contour.exactMaxY > contour.exactMinY + 0.5f)
+        ? (contour.exactMaxY - contour.exactMinY)
+        : static_cast<float>((std::max)(1, contour.maxGY - contour.minGY + 1)) * 30.f;
+    float originY = (contour.exactMaxY > contour.exactMinY + 0.5f)
+        ? contour.exactMinY
+        : (contour.minGY * 30.f);
 
     for (auto const& isl : islands) {
         int islCols = isl.maxGX - isl.minGX + 1;
         int islRows = isl.maxGY - isl.minGY + 1;
+        float islOriginX = (isl.exactMaxX > isl.exactMinX + 0.5f) ? isl.exactMinX : (isl.minGX * 30.f);
+        float islOriginY = (isl.exactMaxY > isl.exactMinY + 0.5f) ? isl.exactMinY : (isl.minGY * 30.f);
+        float islSpanW   = (isl.exactMaxX > isl.exactMinX + 0.5f) ? (isl.exactMaxX - isl.exactMinX) : (static_cast<float>((std::max)(1, islCols)) * 30.f);
+        float islSpanH   = (isl.exactMaxY > isl.exactMinY + 0.5f) ? (isl.exactMaxY - isl.exactMinY) : (static_cast<float>((std::max)(1, islRows)) * 30.f);
 
-        // 1. Если запрошена высокоточная текстура NxN (например 32x32, 64x64 или 128x128) или реалистик/референс —
-        //    строим холст ИИ выбранного разрешения (до 128x128!) со сшивкой 2D Greedy Meshing!
+        auto addClippedSpec = [&](
+            int objectId, float x, float y, float scaleX, float scaleY, float rotation,
+            LayerRole layerRole, ColorSlot colorSlot, int zOrder, int priorityTier,
+            bool isOverhang, GLubyte opacity, int zLayerCode, int editorLayerOffset,
+            ccColor3B customCol, bool customBlend
+        ) {
+            GeneratedObjectSpec s;
+            s.objectId          = objectId;
+            s.x                 = x;
+            s.y                 = y;
+            s.scaleX            = scaleX;
+            s.scaleY            = scaleY;
+            s.rotation          = rotation;
+            s.layerRole         = layerRole;
+            s.colorSlot         = colorSlot;
+            s.zOrder            = zOrder;
+            s.zLayerCode        = zLayerCode;
+            s.editorLayerOffset = editorLayerOffset;
+            s.priorityTier      = priorityTier;
+            s.isOverhang        = isOverhang;
+            s.customColor       = customCol;
+            s.customOpacity     = opacity;
+            s.customBlending    = customBlend;
+            s.noTouch           = true;
+            s.noGlow            = true;
+            if (!isOverhang) {
+                if (!clipSpecStrictlyToExactContour(contour, isl, s)) return;
+            }
+            result.push_back(s);
+        };
+
+        // 1. Если запрошена высокоточная текстура NxN (до 128x128) — строим холст ИИ строго внутри точных границ каркаса!
         if (!ai.appendMode && ai.textureResolution >= 16) {
             appendDynamicHighResAITextureCanvas(result, contour, isl, ai, ai.textureResolution, styleSeed);
         }
 
         for (auto const& [gx, gy] : isl.cells) {
-            float cx = gx * 30.f + 15.f;
-            float cy = gy * 30.f + 15.f;
+            // Определяем точные границы клетки (gx, gy) по реальным боксам каркаса (не вылезая за exactMin..exactMax!)
+            float cellLeft  = (std::max)(islOriginX, gx * 30.f);
+            float cellRight = (std::min)(islOriginX + islSpanW, (gx + 1) * 30.f);
+            float cellBot   = (std::max)(islOriginY, gy * 30.f);
+            float cellTop   = (std::min)(islOriginY + islSpanH, (gy + 1) * 30.f);
+            for (auto const& bx : contour.exactBoxes) {
+                if (bx.gx == gx && bx.gy == gy) {
+                    cellLeft  = bx.minX;
+                    cellRight = bx.maxX;
+                    cellBot   = bx.minY;
+                    cellTop   = bx.maxY;
+                    break;
+                }
+            }
+            float cellW = (std::max)(1.0f, cellRight - cellLeft);
+            float cellH = (std::max)(1.0f, cellTop - cellBot);
+            float cx = (cellLeft + cellRight) * 0.5f;
+            float cy = (cellBot + cellTop) * 0.5f;
 
             bool topOpen    = (contour.occupiedCells.count({ gx, gy + 1 }) == 0);
             bool bottomOpen = (contour.occupiedCells.count({ gx, gy - 1 }) == 0);
@@ -3955,7 +4872,7 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
             bool rightOpen  = (contour.occupiedCells.count({ gx + 1, gy }) == 0);
             CellSlopeKind slopeKind = getCellSlopeKind(contour, gx, gy);
 
-            // 2. Базовая подложка клетки (с учетом 45° наклонных скатов)
+            // 2. Базовая подложка клетки (строго в пределах точных координат краев каркаса!)
             if (!ai.appendMode && ai.textureResolution < 16) {
                 if (slopeKind != CellSlopeKind::None) {
                     constexpr int kSlopeBands = 8;
@@ -3963,27 +4880,27 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                         float lv = (sb + 0.5f) / static_cast<float>(kSlopeBands);
                         float uMin = 0.0f, uMax = 1.0f;
                         if (!getSlopeHorizontalSpanAtV(slopeKind, lv, uMin, uMax)) continue;
-                        float bandX = (cx - 15.0f) + (uMin + uMax) * 0.5f * 30.0f;
-                        float bandY = (cy - 15.0f) + lv * 30.0f;
+                        float bandX = cellLeft + (uMin + uMax) * 0.5f * cellW;
+                        float bandY = cellBot + lv * cellH;
                         ccColor3B bCol = ai.hasGradient
                             ? lerpColor(ai.gradBotRGB, ai.gradTopRGB, std::clamp((bandY - originY) / spanH, 0.0f, 1.0f))
                             : ai.fillRGB;
-                        addSpec(result, 211, bandX, bandY, (uMax - uMin), 1.05f / kSlopeBands, 0.f, LayerRole::Fill, ColorSlot::CustomRGB, 1, 0, false, 255, -3, 0, bCol, false);
+                        addClippedSpec(211, bandX, bandY, (uMax - uMin) * (cellW / 30.f), (1.05f / kSlopeBands) * (cellH / 30.f), 0.f, LayerRole::Fill, ColorSlot::CustomRGB, 1, 0, false, 255, -3, 0, bCol, false);
                     }
                 } else if (ai.hasGradient) {
                     for (int band = 0; band < 4; ++band) {
                         float bandFrac = (band + 0.5f) / 4.0f;
-                        float bandY = (cy - 15.f) + bandFrac * 30.f;
+                        float bandY = cellBot + bandFrac * cellH;
                         float globalT = std::clamp((bandY - originY) / spanH, 0.0f, 1.0f);
                         ccColor3B bandCol = lerpColor(ai.gradBotRGB, ai.gradTopRGB, globalT);
-                        addSpec(result, 211, cx, bandY, 1.00f, 0.27f, 0.f, LayerRole::Fill, ColorSlot::CustomRGB, 1 + band, 0, false, 255, -3, 0, bandCol, false);
+                        addClippedSpec(211, cx, bandY, cellW / 30.f, 0.27f * (cellH / 30.f), 0.f, LayerRole::Fill, ColorSlot::CustomRGB, 1 + band, 0, false, 255, -3, 0, bandCol, false);
                     }
                 } else {
-                    addSpec(result, 211, cx, cy, 1.00f, 1.00f, 0.f, LayerRole::Fill, ColorSlot::CustomRGB, 1, 0, false, 255, -3, 0, ai.fillRGB, false);
+                    addClippedSpec(211, cx, cy, cellW / 30.f, cellH / 30.f, 0.f, LayerRole::Fill, ColorSlot::CustomRGB, 1, 0, false, 255, -3, 0, ai.fillRGB, false);
                 }
             }
 
-            // 3. Прямая генерация клеточных элементов от самой нейросети (cell_elements — никаких заготовленных шаблонов!)
+            // 3. Прямая генерация клеточных элементов от самой нейросети (строго подрезанная по точным краям каркаса!)
             for (auto const& cel : ai.cellElements) {
                 float u = std::clamp(cel.rx, 0.01f, 0.99f);
                 float v = std::clamp(cel.ry, 0.01f, 0.99f);
@@ -3991,10 +4908,10 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
 
                 GeneratedObjectSpec cs;
                 cs.objectId               = resolveAIElementObjectID(cel, cat, true);
-                cs.x                      = (cx - 15.f) + u * 30.f;
-                cs.y                      = (cy - 15.f) + v * 30.f;
-                cs.scaleX                 = std::clamp(cel.scaleX, 0.002f, 2.5f);
-                cs.scaleY                 = std::clamp(cel.scaleY, 0.002f, 2.5f);
+                cs.x                      = cellLeft + u * cellW;
+                cs.y                      = cellBot  + v * cellH;
+                cs.scaleX                 = std::clamp(cel.scaleX, 0.002f, 2.5f) * (cellW / 30.f);
+                cs.scaleY                 = std::clamp(cel.scaleY, 0.002f, 2.5f) * (cellH / 30.f);
                 cs.rotation               = cel.rot;
                 cs.layerRole              = LayerRole::InnerDetail;
                 cs.editorLayerOffset      = std::clamp(cel.editorLayerOff, 1, 5);
@@ -4011,21 +4928,23 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                 cs.priorityTier           = 0;
                 cs.noTouch                = true;
                 cs.noGlow                 = true;
-                result.push_back(cs);
+                if (clipSpecStrictlyToExactContour(contour, isl, cs)) {
+                    result.push_back(cs);
+                }
             }
 
-            // 4. Тонкая обводка по внешнему контуру и 45° скатам
+            // 4. Тонкая обводка по точным внешним краям и 45° скатам
             if (!ai.appendMode) {
                 bool glowBorder = ai.wantNeon;
                 if (slopeKind == CellSlopeKind::RoofLeft || slopeKind == CellSlopeKind::CeilingRight) {
-                    addSpec(result, 211, cx, cy, 1.414f, 0.025f, -45.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 11, 0, false, 200, 3, 3, ai.outlineRGB, glowBorder);
+                    addSpec(result, 211, cx, cy, 1.414f * (cellW / 30.f), 0.025f, -45.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 11, 0, false, 200, 3, 3, ai.outlineRGB, glowBorder);
                 } else if (slopeKind == CellSlopeKind::RoofRight || slopeKind == CellSlopeKind::CeilingLeft) {
-                    addSpec(result, 211, cx, cy, 1.414f, 0.025f, 45.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 11, 0, false, 200, 3, 3, ai.outlineRGB, glowBorder);
+                    addSpec(result, 211, cx, cy, 1.414f * (cellW / 30.f), 0.025f, 45.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 11, 0, false, 200, 3, 3, ai.outlineRGB, glowBorder);
                 } else {
-                    if (topOpen)    addSpec(result, 211, cx, cy + 14.68f, 1.00f, 0.022f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 10, 0, false, 195, 3, 3, ai.outlineRGB, glowBorder);
-                    if (leftOpen)   addSpec(result, 211, cx - 14.68f, cy, 0.022f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 10, 0, false, 185, 3, 3, ai.outlineRGB, glowBorder);
-                    if (rightOpen)  addSpec(result, 211, cx + 14.68f, cy, 0.022f, 1.00f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 10, 0, false, 185, 3, 3, ai.outlineRGB, glowBorder);
-                    if (bottomOpen && gy > 0) addSpec(result, 211, cx, cy - 14.68f, 1.00f, 0.022f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 10, 0, false, 175, 3, 3, ai.outlineRGB, glowBorder);
+                    if (topOpen)    addClippedSpec(211, cx, cellTop - 0.35f, cellW / 30.f, 0.022f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 10, 0, false, 195, 3, 3, ai.outlineRGB, glowBorder);
+                    if (leftOpen)   addClippedSpec(211, cellLeft + 0.35f, cy, 0.022f, cellH / 30.f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 10, 0, false, 185, 3, 3, ai.outlineRGB, glowBorder);
+                    if (rightOpen)  addClippedSpec(211, cellRight - 0.35f, cy, 0.022f, cellH / 30.f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 10, 0, false, 185, 3, 3, ai.outlineRGB, glowBorder);
+                    if (bottomOpen && gy > 0) addClippedSpec(211, cx, cellBot + 0.35f, cellW / 30.f, 0.022f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 10, 0, false, 175, 3, 3, ai.outlineRGB, glowBorder);
                 }
                 if (ai.wantNeon && slopeKind == CellSlopeKind::None) {
                     appendOneSidedEdgeNeon(result, cx, cy, topOpen, bottomOpen, leftOpen, rightOpen, allowOverhang, ai.glowRGB);
@@ -4033,12 +4952,7 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
             }
         }
 
-        // 5. Прямая генерация свободных макро-элементов от самой нейросети на каждом парте (elements — любые объекты, узоры и выступы без шаблонов!)
-        float islOriginX = isl.minGX * 30.f;
-        float islOriginY = isl.minGY * 30.f;
-        float islSpanW   = static_cast<float>((std::max)(1, islCols)) * 30.f;
-        float islSpanH   = static_cast<float>((std::max)(1, islRows)) * 30.f;
-
+        // 5. Прямая генерация свободных макро-элементов от самой нейросети (строго внутри точных краев каркаса, если не Overhang!)
         for (auto const& el : ai.customElements) {
             bool isIntentionalOverhang = (el.rx < 0.0f || el.rx > 1.0f || el.ry < 0.0f || el.ry > 1.0f);
             if (isIntentionalOverhang && !allowOverhang) continue;
@@ -4089,6 +5003,9 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
             cs.isOverhang             = isIntentionalOverhang;
             cs.noTouch                = !isSpikeObjectID(cs.objectId);
             cs.noGlow                 = true;
+            if (!isIntentionalOverhang) {
+                if (!clipSpecStrictlyToExactContour(contour, isl, cs)) continue;
+            }
             result.push_back(cs);
         }
     }
@@ -4448,6 +5365,209 @@ static CCMenuItemSpriteExtra* createSolidButton(
     return CCMenuItemSpriteExtra::create(bg, target, selector);
 }
 
+// Скругленная кнопка (pill/rounded) для плашки текущей модели, кнопок выбора модели и отправки сообщения
+static CCMenuItemSpriteExtra* createSmoothRoundedButton(
+    float width,
+    float height,
+    float radius,
+    ccColor3B bgColor,
+    ccColor3B borderColor,
+    const char* text,
+    float textScale,
+    ccColor3B textColor,
+    CCObject* target,
+    SEL_MenuHandler selector
+) {
+    auto* container = CCNode::create();
+    container->setContentSize(CCSize{ width, height });
+    container->ignoreAnchorPointForPosition(false);
+    container->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
+
+    auto* borderSpr = createSmoothRoundedRect(width + 2.f, height + 2.f, radius + 1.f, toColor4F(borderColor, 255));
+    borderSpr->setPosition(CCPoint{ width * 0.5f, height * 0.5f });
+    container->addChild(borderSpr);
+
+    auto* bgSpr = createSmoothRoundedRect(width, height, radius, toColor4F(bgColor, 255));
+    bgSpr->setPosition(CCPoint{ width * 0.5f, height * 0.5f });
+    container->addChild(bgSpr);
+
+    if (text && text[0] != '\0') {
+        auto* lbl = CCLabelBMFont::create(text, "chatFont.fnt");
+        lbl->setScale(textScale);
+        lbl->setColor(textColor);
+        lbl->setPosition(CCPoint{ width * 0.5f, height * 0.5f });
+        container->addChild(lbl);
+    }
+
+    return CCMenuItemSpriteExtra::create(container, target, selector);
+}
+
+// Создает четкий треугольный спрайт шипа для предпросмотра (с поддержкой любого угла поворота rotation!)
+static CCSprite* createTriangleSpikePreviewSprite(float width, float height, ccColor3B color, GLubyte opacity = 255) {
+    int texW = std::clamp(static_cast<int>(std::lround(width * 3.0f)), 12, 192);
+    int texH = std::clamp(static_cast<int>(std::lround(height * 3.0f)), 12, 192);
+    std::vector<uint8_t> rgba(static_cast<size_t>(texW * texH * 4), 0);
+
+    for (int py = 0; py < texH; ++py) {
+        // py = 0 — верх текстуры (острие шипа), py = texH - 1 — основание шипа
+        float tFromTip = (py + 0.5f) / static_cast<float>(texH);
+        float halfSpan = tFromTip * (texW * 0.5f);
+        float centerX = texW * 0.5f;
+        for (int px = 0; px < texW; ++px) {
+            float dx = std::fabs((px + 0.5f) - centerX);
+            float dist = dx - halfSpan;
+            if (dist >= 0.75f) continue;
+            float cov = std::clamp(0.5f - dist / 1.5f, 0.f, 1.f);
+            uint8_t a8 = static_cast<uint8_t>(std::lround(opacity * cov));
+            if (a8 == 0) continue;
+            size_t idx = static_cast<size_t>((py * texW + px) * 4);
+            rgba[idx + 0] = color.r;
+            rgba[idx + 1] = color.g;
+            rgba[idx + 2] = color.b;
+            rgba[idx + 3] = a8;
+        }
+    }
+
+    auto* tex = new CCTexture2D();
+    if (tex && tex->initWithData(rgba.data(), kCCTexture2DPixelFormat_RGBA8888, texW, texH, CCSize{ static_cast<float>(texW), static_cast<float>(texH) })) {
+        tex->autorelease();
+        if (auto* spr = CCSprite::createWithTexture(tex)) {
+            CCSize cs = spr->getContentSize();
+            spr->setScaleX(width / (cs.width > 0.01f ? cs.width : static_cast<float>(texW)));
+            spr->setScaleY(height / (cs.height > 0.01f ? cs.height : static_cast<float>(texH)));
+            return spr;
+        }
+    } else {
+        CC_SAFE_DELETE(tex);
+    }
+    return CCSprite::create();
+}
+
+// Рендерит настоящую кириллическую надпись "✓ Согласен" (при RUS) или "✓ Agree" (при ENG)
+// напрямую в RGBA8888 текстуру (не зависит от ограничений chatFont.fnt в GD!)
+static CCSprite* createCyrillicOrEnglishAgreeLabelSprite(bool isRussian, float targetHeight = 11.0f) {
+    // 8x10 пиксельные глифы высокой четкости для "✓ Согласен" и "✓ Agree"
+    struct Glyph8x10 {
+        uint8_t rows[10];
+    };
+    static constexpr Glyph8x10 kGlyphCheck = {{
+        0b00000000, 0b00000001, 0b00000011, 0b00000110, 0b11001100,
+        0b01111000, 0b00110000, 0b00000000, 0b00000000, 0b00000000
+    }};
+    // 'С'
+    static constexpr Glyph8x10 kRus_S_Cap = {{
+        0b00111100, 0b01100110, 0b11000000, 0b11000000, 0b11000000,
+        0b11000000, 0b11000000, 0b01100110, 0b00111100, 0b00000000
+    }};
+    // 'о'
+    static constexpr Glyph8x10 kRus_o = {{
+        0b00000000, 0b00000000, 0b00111100, 0b01100110, 0b11000011,
+        0b11000011, 0b01100110, 0b00111100, 0b00000000, 0b00000000
+    }};
+    // 'г'
+    static constexpr Glyph8x10 kRus_g = {{
+        0b00000000, 0b00000000, 0b11111110, 0b11000010, 0b11000000,
+        0b11000000, 0b11000000, 0b11000000, 0b00000000, 0b00000000
+    }};
+    // 'л'
+    static constexpr Glyph8x10 kRus_l = {{
+        0b00000000, 0b00000000, 0b00111111, 0b01100011, 0b01100011,
+        0b01100011, 0b11000011, 0b11000011, 0b00000000, 0b00000000
+    }};
+    // 'а'
+    static constexpr Glyph8x10 kRus_a = {{
+        0b00000000, 0b00000000, 0b00111100, 0b00000110, 0b00111110,
+        0b01100110, 0b01100110, 0b00111111, 0b00000000, 0b00000000
+    }};
+    // 'с'
+    static constexpr Glyph8x10 kRus_s = {{
+        0b00000000, 0b00000000, 0b00111100, 0b01100110, 0b11000000,
+        0b11000000, 0b01100110, 0b00111100, 0b00000000, 0b00000000
+    }};
+    // 'е'
+    static constexpr Glyph8x10 kRus_e = {{
+        0b00000000, 0b00000000, 0b00111100, 0b01100110, 0b11111111,
+        0b11000000, 0b01100110, 0b00111100, 0b00000000, 0b00000000
+    }};
+    // 'н'
+    static constexpr Glyph8x10 kRus_n = {{
+        0b00000000, 0b00000000, 0b11000011, 0b11000011, 0b11111111,
+        0b11000011, 0b11000011, 0b11000011, 0b00000000, 0b00000000
+    }};
+    // 'A'
+    static constexpr Glyph8x10 kEng_A = {{
+        0b00111100, 0b01100110, 0b11000011, 0b11000011, 0b11111111,
+        0b11000011, 0b11000011, 0b11000011, 0b00000000, 0b00000000
+    }};
+    // 'g'
+    static constexpr Glyph8x10 kEng_g = {{
+        0b00000000, 0b00000000, 0b00111110, 0b01100110, 0b01100110,
+        0b00111110, 0b00000110, 0b01100110, 0b00111100, 0b00000000
+    }};
+    // 'r'
+    static constexpr Glyph8x10 kEng_r = {{
+        0b00000000, 0b00000000, 0b11011100, 0b11100110, 0b11000000,
+        0b11000000, 0b11000000, 0b11000000, 0b00000000, 0b00000000
+    }};
+    // ' '
+    static constexpr Glyph8x10 kSpace = {{ 0,0,0,0,0,0,0,0,0,0 }};
+
+    std::vector<Glyph8x10> seq;
+    if (isRussian) {
+        seq = { kGlyphCheck, kSpace, kRus_S_Cap, kRus_o, kRus_g, kRus_l, kRus_a, kRus_s, kRus_e, kRus_n };
+    } else {
+        seq = { kGlyphCheck, kSpace, kEng_A, kEng_g, kEng_r, kRus_e, kRus_e };
+    }
+
+    int scale = 3;
+    int charAdvance = 9;
+    int gridW = static_cast<int>(seq.size()) * charAdvance + 2;
+    int gridH = 12;
+    int texW = gridW * scale;
+    int texH = gridH * scale;
+
+    std::vector<uint8_t> rgba(static_cast<size_t>(texW * texH * 4), 0);
+    for (size_t ci = 0; ci < seq.size(); ++ci) {
+        int baseX = static_cast<int>(ci) * charAdvance + 1;
+        for (int gy = 0; gy < 10; ++gy) {
+            uint8_t rowBits = seq[ci].rows[gy];
+            for (int gx = 0; gx < 8; ++gx) {
+                if ((rowBits & (1 << (7 - gx))) == 0) continue;
+                for (int sy = 0; sy < scale; ++sy) {
+                    for (int sx = 0; sx < scale; ++sx) {
+                        int px = (baseX + gx) * scale + sx;
+                        int py = (gy + 1) * scale + sy;
+                        if (px < 0 || px >= texW || py < 0 || py >= texH) continue;
+                        size_t idx = static_cast<size_t>((py * texW + px) * 4);
+                        rgba[idx + 0] = 255;
+                        rgba[idx + 1] = 255;
+                        rgba[idx + 2] = 255;
+                        rgba[idx + 3] = 255;
+                    }
+                }
+            }
+        }
+    }
+
+    auto* tex = new CCTexture2D();
+    if (tex && tex->initWithData(rgba.data(), kCCTexture2DPixelFormat_RGBA8888, texW, texH, CCSize{ static_cast<float>(texW), static_cast<float>(texH) })) {
+        tex->autorelease();
+        if (auto* spr = CCSprite::createWithTexture(tex)) {
+            CCSize cs = spr->getContentSize();
+            float curH = (cs.height > 0.01f) ? cs.height : static_cast<float>(texH);
+            float curW = (cs.width > 0.01f) ? cs.width : static_cast<float>(texW);
+            float sc = targetHeight / curH;
+            spr->setScaleX(sc);
+            spr->setScaleY(sc);
+            (void)curW;
+            return spr;
+        }
+    } else {
+        CC_SAFE_DELETE(tex);
+    }
+    return CCSprite::create();
+}
+
 // ============================================================================
 // ГЛАВНОЕ ОКНО МОДА (3 ЭКРАНА: API Gate / Art Agent Main / AI Model Selector)
 // ============================================================================
@@ -4463,7 +5583,7 @@ protected:
     bool m_russianLayout = true;
     int m_providerIdx = 0;
     int m_activeApiField = 0; // 0 = API Key, 1 = Base URL, 2 = Endpoint, 3 = Model Name
-    int m_previewTab = 0; // 0 = Shape, 1 = Drawing, 2 = In GD
+    int m_previewTab = 0;     // 0 = Shape, 1 = Drawing, 2 = In GD (предпросмотр без мгновенного спавна!)
     std::string m_inputBuffer;
     CCLayerColor* m_apiFieldBg[4]{ nullptr, nullptr, nullptr, nullptr };
     CCLabelBMFont* m_apiFieldLbl[4]{ nullptr, nullptr, nullptr, nullptr };
@@ -4475,23 +5595,29 @@ protected:
     CCLayerColor* m_checkBoxBg = nullptr;
     CCNode* m_checkTickContainer = nullptr;
 
-    // Прокручиваемый ИИ-чат для чтения старых и новых сообщений
+    // Элементы окна динамического выбора текстовых/кодовых моделей (Choose Model)
+    CCLabelBMFont* m_modelSelectorStatusLbl = nullptr;
+    CCLabelBMFont* m_modelSelectorPageLbl = nullptr;
+    CCNode* m_modelRowsContainer = nullptr;
+
+    // Прокручиваемый ИИ-чат и кнопка подтверждения ("✓ Согласен" / "✓ Agree") внутри чата
     geode::ScrollLayer* m_chatScrollLayer = nullptr;
+    CCMenuItemSpriteExtra* m_chatConfirmAgreeBtn = nullptr;
     CCLabelBMFont* m_stepPlanLabel = nullptr;
     CCLabelBMFont* m_stepDrawingLabel = nullptr;
     CCLabelBMFont* m_stepPlaceLabel = nullptr;
 
-    // Правая панель Art Agent (Shape | Drawing | In GD)
+    // Правая панель Art Agent (Shape | Drawing | In GD) + Shimmer-анимация загрузки на области выделения
     CCLayerColor* m_tabShapeBg = nullptr;
     CCLayerColor* m_tabDrawingBg = nullptr;
     CCLayerColor* m_tabInGDBg = nullptr;
     CCMenuItemSpriteExtra* m_shapeFillToggleBtn = nullptr;
     CCLabelBMFont* m_shapeFillToggleLbl = nullptr;
-    CCLayerColor* m_aiCountToggleBg = nullptr;
-    CCLabelBMFont* m_aiCountToggleLbl = nullptr;
+    CCSprite* m_selectionShimmerOverlay = nullptr;
+    CCSprite* m_selectionShimmerBand = nullptr;
+    CCPoint m_selectionBoxCenter{ 0.f, 0.f };
     CCNode* m_previewCanvasContent = nullptr;
     CCLabelBMFont* m_previewSubInfoLabel = nullptr;
-    CCLabelBMFont* m_limitValueLabel = nullptr;
     CCLayerColor* m_insideTabBg = nullptr;
     CCLayerColor* m_overhangTabBg = nullptr;
 
@@ -4530,7 +5656,7 @@ protected:
         auto size = m_mainLayer->getContentSize();
         auto center = CCPoint{ size.width / 2.f, size.height / 2.f };
 
-        // 1. Возвращаем мягкое многослойное СВЕЧЕНИЕ (ореол) вокруг округленного каркаса меню!
+        // 1. Мягкое многослойное СВЕЧЕНИЕ (ореол) вокруг округленного каркаса меню
         auto* frameGlowOuter = createSmoothRoundedRect(
             size.width + 18.f, size.height + 18.f, 34.f,
             toColor4F(ccColor3B{ 155, 22, 38 }, 55)
@@ -4547,7 +5673,7 @@ protected:
         frameGlowMid->setZOrder(-5);
         m_mainLayer->addChild(frameGlowMid);
 
-        // 2. Ярко выраженный ОКРУГЛЕННЫЙ каркас меню (радиус 26px) со светящимся кантом
+        // 2. Округленный каркас меню (радиус 26px) со светящимся кантом
         auto* outerRoundedFrame = createSmoothRoundedRect(
             size.width + 2.f, size.height + 2.f, 26.f,
             toColor4F(ccColor3B{ 235, 55, 82 }, 255)
@@ -4564,8 +5690,7 @@ protected:
         innerRoundedShell->setZOrder(-3);
         m_mainLayer->addChild(innerRoundedShell);
 
-        // 3. Скругленная градиентная красно-черная подложка (image_b5b63a.png),
-        //    лежащая строго на каркасе меню под всеми кнопками (без прямых углов 90 градусов!)
+        // 3. Скругленная градиентная красно-черная подложка
         auto* frameGradient = createSmoothGradientRoundedRect(
             size.width - 10.f, size.height - 10.f, 22.f,
             toColor4F(ccColor3B{ 78, 9, 14 }, 255),
@@ -4664,7 +5789,7 @@ protected:
         for (int i = 0; i < 4; ++i) {
             bool active = (m_activeApiField == i);
             if (m_apiFieldBg[i]) {
-                m_apiFieldBg[i]->setColor(active ? ccColor3B{ 44, 76, 108 } : ccColor3B{ 36, 26, 32 });
+                m_apiFieldBg[i]->setColor(active ? ccColor3B{ 58, 34, 46 } : ccColor3B{ 36, 26, 32 });
             }
             if (m_apiFieldLbl[i]) {
                 std::string val = (active && !m_inputBuffer.empty()) ? m_inputBuffer : getApiFieldValue(i);
@@ -4675,7 +5800,7 @@ protected:
                 if (val.size() > 24) val = val.substr(0, 21) + "...";
                 std::string fullTxt = fmt::format("{}: {}", kFieldTitles[i], val);
                 m_apiFieldLbl[i]->setString(fullTxt.c_str());
-                m_apiFieldLbl[i]->setColor(active ? ccColor3B{ 135, 235, 255 } : ccColor3B{ 235, 240, 250 });
+                m_apiFieldLbl[i]->setColor(active ? ccColor3B{ 255, 195, 215 } : ccColor3B{ 235, 240, 250 });
             }
         }
     }
@@ -4696,8 +5821,8 @@ protected:
         this->setTitle("ART AGENT — UNIVERSAL API, BASE URL & ENDPOINT");
 
         if (g_apiVerifiedAndConnected) {
-            auto* backBtn = createSolidButton(
-                76.f, 22.f, ccColor3B{ 46, 50, 62 },
+            auto* backBtn = createSmoothRoundedButton(
+                76.f, 22.f, 11.f, ccColor3B{ 46, 50, 62 }, ccColor3B{ 88, 52, 64 },
                 "Back", 0.48f, ccColor3B{ 235, 240, 250 },
                 this, menu_selector(AIDecorPopup::onBackToArtAgent)
             );
@@ -4720,7 +5845,6 @@ protected:
         m_apiGateStatusLabel->setPosition(CCPoint{ center.x + 8.f, center.y + 72.f });
         m_mainLayer->addChild(m_apiGateStatusLabel);
 
-        // 4 кликабельных поля: [0: API Key] [1: Base URL] / [2: Endpoint] [3: Model]
         auto createFieldBox = [&](int idx, CCPoint pos, SEL_MenuHandler cb) {
             m_apiFieldBg[idx] = createSolidPanel(208.f, 26.f, ccColor3B{ 36, 26, 32 }, 255);
             auto* border = createSolidPanel(210.f, 28.f, ccColor3B{ 88, 52, 64 }, 255);
@@ -4743,18 +5867,19 @@ protected:
         createFieldBox(2, CCPoint{ center.x - 108.f, center.y + 6.f },  menu_selector(AIDecorPopup::onSelectApiField2));
         createFieldBox(3, CCPoint{ center.x + 108.f, center.y + 6.f },  menu_selector(AIDecorPopup::onSelectApiField3));
 
-        auto* presetListBtn = createSolidButton(
-            180.f, 18.f, ccColor3B{ 44, 32, 42 },
-            "Choose Model from List...", 0.38f, ccColor3B{ 175, 230, 255 },
+        // Скругленная кнопка открытия списка моделей (Choose Model)
+        auto* presetListBtn = createSmoothRoundedButton(
+            188.f, 20.f, 10.f, ccColor3B{ 44, 28, 38 }, ccColor3B{ 112, 52, 68 },
+            "Choose Model from List...", 0.38f, ccColor3B{ 245, 225, 235 },
             this, menu_selector(AIDecorPopup::onOpenModelSelectorFromGate)
         );
         presetListBtn->setPosition(CCPoint{ center.x, center.y - 22.f });
         m_buttonMenu->addChild(presetListBtn);
 
-        // Округленная строка ввода для выбранного поля (API Key / Base URL / Endpoint / Model)
-        auto* inputGlow = createSmoothRoundedRect(448.f, 38.f, 19.f, toColor4F(ccColor3B{ 95, 165, 225 }, 140));
-        inputGlow->setPosition(CCPoint{ center.x, center.y - 58.f });
-        m_mainLayer->addChild(inputGlow);
+        // Округленная строка ввода БЕЗ синей обводки
+        auto* inputBorder = createSmoothRoundedRect(446.f, 36.f, 18.f, toColor4F(ccColor3B{ 68, 32, 42 }, 255));
+        inputBorder->setPosition(CCPoint{ center.x, center.y - 58.f });
+        m_mainLayer->addChild(inputBorder);
 
         auto* inputBg = createSmoothRoundedRect(444.f, 34.f, 17.f, toColor4F(ccColor3B{ 14, 12, 16 }, 255));
         inputBg->setPosition(CCPoint{ center.x, center.y - 58.f });
@@ -4795,39 +5920,49 @@ protected:
     }
 
     // ========================================================================
-    // ЭКРАН 2: ВЫБОР МОДЕЛИ (или быстрых шаблонов Base URL + Endpoint)
+    // ЭКРАН 2: ДИНАМИЧЕСКИЙ ВЫБОР ТЕКСТОВОЙ/КОДОВОЙ МОДЕЛИ ПО API (Choose Model)
+    // Исключает все модели генерации картинок и видео (Imagen, Veo, DALL-E, Sora и др.)
     // ========================================================================
-    void setupModelSelectorWindowUI(CCPoint center) {
-        this->setTitle("VIBOR MODELI II (ILI VVEDITE SVOYU V POLE MODEL)");
+    std::vector<DiscoveredTextModel> getActiveFilteredModelList() const {
+        std::lock_guard<std::mutex> lk(g_discoveredModelsMutex);
+        if (!g_discoveredTextModels.empty()) {
+            return g_discoveredTextModels;
+        }
+        return getDefaultFallbackTextModels();
+    }
 
-        auto* backBtn = createSolidButton(
-            110.f, 24.f, ccColor3B{ 46, 52, 64 },
-            "Nazad / Done", 0.48f, ccColor3B{ 245, 248, 255 },
-            this, menu_selector(AIDecorPopup::onCloseModelSelectorWindow)
-        );
-        backBtn->setPosition(CCPoint{ center.x + 155.f, center.y + 88.f });
-        m_buttonMenu->addChild(backBtn);
+    void rebuildModelSelectorRows() {
+        if (!m_modelRowsContainer) return;
+        m_modelRowsContainer->removeAllChildrenWithCleanup(true);
 
-        auto* subInfo = CCLabelBMFont::create(
-            "Nazhmite na model nizhe ili vvedite lyubuyu svoyu model v okne API:",
-            "chatFont.fnt"
-        );
-        subInfo->setScale(0.44f);
-        subInfo->setColor(ccColor3B{ 195, 185, 190 });
-        subInfo->setPosition(CCPoint{ center.x - 45.f, center.y + 88.f });
-        m_mainLayer->addChild(subInfo);
+        // Удаляем старые динамические кнопки выбора моделей из m_buttonMenu (теги 7100..7103)
+        for (int slot = 0; slot < 4; ++slot) {
+            if (auto* oldItem = m_buttonMenu->getChildByTag(7100 + slot)) {
+                oldItem->removeFromParentAndCleanup(true);
+            }
+        }
 
-        struct PresetModelOption {
-            const char* modelId;
-            const char* title;
-            const char* desc;
-        };
-        static constexpr PresetModelOption kPresets[4] = {
-            { "deepseek-chat",     "DeepSeek Chat / V4",  "Universal fast model for custom JSON & building" },
-            { "deepseek-v4-pro",   "DeepSeek V4 Pro",     "High-precision 1M context coding & art model" },
-            { "gemini-4-hydrogen", "Gemini 4 Hydrogen",   "Fast multimodal vision & building model" },
-            { "gpt-4o-mini",       "GPT-4o Mini / GPT-6", "Compatible with OpenAI & custom proxy servers" }
-        };
+        auto models = getActiveFilteredModelList();
+        int totalModels = static_cast<int>(models.size());
+        int maxOffset = (std::max)(0, totalModels - 4);
+        g_modelSelectorScrollOffset = std::clamp(g_modelSelectorScrollOffset, 0, maxOffset);
+
+        if (m_modelSelectorStatusLbl) {
+            std::lock_guard<std::mutex> lk(g_discoveredModelsMutex);
+            m_modelSelectorStatusLbl->setString(g_modelFetchStatusText.c_str());
+        }
+        if (m_modelSelectorPageLbl) {
+            std::string pageTxt = fmt::format(
+                "Showing {}-{} of {}",
+                totalModels > 0 ? (g_modelSelectorScrollOffset + 1) : 0,
+                (std::min)(totalModels, g_modelSelectorScrollOffset + 4),
+                totalModels
+            );
+            m_modelSelectorPageLbl->setString(pageTxt.c_str());
+        }
+
+        auto size = m_mainLayer->getContentSize();
+        auto center = CCPoint{ size.width / 2.f, size.height / 2.f };
 
         SEL_MenuHandler const modelCallbacks[4] = {
             menu_selector(AIDecorPopup::onPickModel0),
@@ -4836,48 +5971,192 @@ protected:
             menu_selector(AIDecorPopup::onPickModel3)
         };
 
-        for (int i = 0; i < 4; ++i) {
-            float rowY = center.y + 38.f - i * 44.f;
-            bool isSelected = (g_customModelName == kPresets[i].modelId);
+        for (int slot = 0; slot < 4; ++slot) {
+            int idx = g_modelSelectorScrollOffset + slot;
+            if (idx >= totalModels) break;
 
-            ccColor3B cardColor = isSelected ? ccColor3B{ 34, 72, 52 } : ccColor3B{ 26, 20, 24 };
-            auto* rowBg = createSolidPanel(430.f, 36.f, cardColor, 255);
-            auto* rowBorder = createSolidPanel(
-                432.f, 38.f,
-                isSelected ? ccColor3B{ 46, 215, 105 } : ccColor3B{ 72, 44, 52 },
-                255
-            );
-            rowBorder->setPosition(CCPoint{ 215.f, 18.f });
-            rowBorder->setZOrder(-1);
-            rowBg->addChild(rowBorder);
+            auto const& m = models[idx];
+            float rowY = center.y + 36.f - slot * 44.f;
+            bool isSelected = (g_customModelName == m.id);
+
+            ccColor3B cardColor = isSelected ? ccColor3B{ 30, 74, 52 } : ccColor3B{ 26, 18, 24 };
+            ccColor3B borderCol = isSelected ? ccColor3B{ 46, 215, 105 } : ccColor3B{ 82, 42, 54 };
+
+            auto* rowContainer = CCNode::create();
+            rowContainer->setContentSize(CCSize{ 404.f, 36.f });
+            rowContainer->ignoreAnchorPointForPosition(false);
+            rowContainer->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
+
+            auto* rowBorder = createSmoothRoundedRect(406.f, 38.f, 12.f, toColor4F(borderCol, 255));
+            rowBorder->setPosition(CCPoint{ 202.f, 18.f });
+            rowContainer->addChild(rowBorder);
+
+            auto* rowBg = createSmoothRoundedRect(404.f, 36.f, 11.f, toColor4F(cardColor, 255));
+            rowBg->setPosition(CCPoint{ 202.f, 18.f });
+            rowContainer->addChild(rowBg);
 
             std::string titleLine = fmt::format(
                 "{}{}  [{}]",
                 isSelected ? "[ACTIVE] " : "",
-                kPresets[i].title,
-                kPresets[i].modelId
+                m.displayName,
+                m.id
             );
+            if (titleLine.size() > 56) titleLine = titleLine.substr(0, 53) + "...";
+
             auto* titleLbl = CCLabelBMFont::create(titleLine.c_str(), "chatFont.fnt");
-            titleLbl->setScale(0.48f);
+            titleLbl->setScale(0.45f);
             titleLbl->setColor(isSelected ? ccColor3B{ 125, 255, 165 } : ccColor3B{ 240, 245, 255 });
-            titleLbl->setPosition(CCPoint{ 215.f, 24.f });
-            rowBg->addChild(titleLbl);
+            titleLbl->setPosition(CCPoint{ 202.f, 24.f });
+            rowContainer->addChild(titleLbl);
 
-            auto* descLbl = CCLabelBMFont::create(kPresets[i].desc, "chatFont.fnt");
-            descLbl->setScale(0.40f);
+            auto* descLbl = CCLabelBMFont::create(m.badgeInfo.c_str(), "chatFont.fnt");
+            descLbl->setScale(0.37f);
             descLbl->setColor(ccColor3B{ 185, 180, 190 });
-            descLbl->setPosition(CCPoint{ 215.f, 10.f });
-            rowBg->addChild(descLbl);
+            descLbl->setPosition(CCPoint{ 202.f, 10.f });
+            rowContainer->addChild(descLbl);
 
-            auto* itemBtn = CCMenuItemSpriteExtra::create(rowBg, this, modelCallbacks[i]);
-            itemBtn->setPosition(CCPoint{ center.x, rowY });
+            auto* itemBtn = CCMenuItemSpriteExtra::create(rowContainer, this, modelCallbacks[slot]);
+            itemBtn->setTag(7100 + slot);
+            itemBtn->setPosition(CCPoint{ center.x - 12.f, rowY });
             m_buttonMenu->addChild(itemBtn);
         }
+    }
+
+    void setupModelSelectorWindowUI(CCPoint center) {
+        this->setTitle("CHOOSE MODEL (TEXT & CODE MODELS FROM API)");
+
+        auto* refreshBtn = createSmoothRoundedButton(
+            88.f, 22.f, 11.f, ccColor3B{ 44, 30, 40 }, ccColor3B{ 110, 52, 68 },
+            "Refresh API", 0.42f, ccColor3B{ 235, 225, 240 },
+            this, menu_selector(AIDecorPopup::onRefreshModelsFromApi)
+        );
+        refreshBtn->setPosition(CCPoint{ center.x + 82.f, center.y + 92.f });
+        m_buttonMenu->addChild(refreshBtn);
+
+        auto* backBtn = createSmoothRoundedButton(
+            96.f, 22.f, 11.f, ccColor3B{ 46, 52, 64 }, ccColor3B{ 92, 104, 128 },
+            "Back / Done", 0.44f, ccColor3B{ 245, 248, 255 },
+            this, menu_selector(AIDecorPopup::onCloseModelSelectorWindow)
+        );
+        backBtn->setPosition(CCPoint{ center.x + 182.f, center.y + 92.f });
+        m_buttonMenu->addChild(backBtn);
+
+        m_modelSelectorStatusLbl = CCLabelBMFont::create(
+            g_modelFetchStatusText.c_str(),
+            "chatFont.fnt"
+        );
+        m_modelSelectorStatusLbl->setScale(0.40f);
+        m_modelSelectorStatusLbl->setColor(ccColor3B{ 215, 200, 210 });
+        m_modelSelectorStatusLbl->setPosition(CCPoint{ center.x - 82.f, center.y + 96.f });
+        m_mainLayer->addChild(m_modelSelectorStatusLbl);
+
+        m_modelSelectorPageLbl = CCLabelBMFont::create("", "chatFont.fnt");
+        m_modelSelectorPageLbl->setScale(0.36f);
+        m_modelSelectorPageLbl->setColor(ccColor3B{ 165, 225, 255 });
+        m_modelSelectorPageLbl->setPosition(CCPoint{ center.x - 82.f, center.y + 82.f });
+        m_mainLayer->addChild(m_modelSelectorPageLbl);
+
+        // Кнопки прокрутки списка моделей вверх [^] и вниз [v]
+        auto* upBtn = createSmoothRoundedButton(
+            24.f, 36.f, 10.f, ccColor3B{ 44, 28, 36 }, ccColor3B{ 98, 48, 62 },
+            "^", 0.55f, ccColor3B{ 245, 248, 255 },
+            this, menu_selector(AIDecorPopup::onScrollModelListUp)
+        );
+        upBtn->setPosition(CCPoint{ center.x + 214.f, center.y + 18.f });
+        m_buttonMenu->addChild(upBtn);
+
+        auto* downBtn = createSmoothRoundedButton(
+            24.f, 36.f, 10.f, ccColor3B{ 44, 28, 36 }, ccColor3B{ 98, 48, 62 },
+            "v", 0.50f, ccColor3B{ 245, 248, 255 },
+            this, menu_selector(AIDecorPopup::onScrollModelListDown)
+        );
+        downBtn->setPosition(CCPoint{ center.x + 214.f, center.y - 62.f });
+        m_buttonMenu->addChild(downBtn);
+
+        m_modelRowsContainer = CCNode::create();
+        m_mainLayer->addChild(m_modelRowsContainer);
+
+        // Запускаем фоновый запрос к API за всеми доступными для ключа текстовыми/кодовыми моделями
+        startAsyncFetchAvailableModels(false);
+        rebuildModelSelectorRows();
+    }
+
+    void onRefreshModelsFromApi(CCObject*) {
+        startAsyncFetchAvailableModels(true);
+        if (m_modelSelectorStatusLbl) {
+            m_modelSelectorStatusLbl->setString("Querying API /models (filtering out Imagen/Veo/Video)...");
+        }
+    }
+
+    void onScrollModelListUp(CCObject*) {
+        g_modelSelectorScrollOffset = (std::max)(0, g_modelSelectorScrollOffset - 1);
+        rebuildModelSelectorRows();
+    }
+
+    void onScrollModelListDown(CCObject*) {
+        auto models = getActiveFilteredModelList();
+        int maxOff = (std::max)(0, static_cast<int>(models.size()) - 4);
+        g_modelSelectorScrollOffset = (std::min)(maxOff, g_modelSelectorScrollOffset + 1);
+        rebuildModelSelectorRows();
     }
 
     // ========================================================================
     // ЭКРАН 3: ГЛАВНЫЙ ИНТЕРФЕЙС "ART AGENT" С ПРОКРУЧИВАЕМЫМ ИИ-ЧАТОМ
     // ========================================================================
+    void refreshChatAgreeButtonState() {
+        if (!m_buttonMenu) return;
+        if (m_chatConfirmAgreeBtn) {
+            m_chatConfirmAgreeBtn->removeFromParentAndCleanup(true);
+            m_chatConfirmAgreeBtn = nullptr;
+        }
+
+        if (m_stage != PopupStage::ArtAgentMain || !g_hasPendingDrawingApproval || !g_hasGeneratedArt) {
+            return;
+        }
+
+        auto size = m_mainLayer->getContentSize();
+        auto center = CCPoint{ size.width / 2.f, size.height / 2.f };
+        float leftX = center.x - 125.f;
+
+        // Создаем скругленную кнопку подтверждения в чате ("✓ Согласен" на RUS / "✓ Agree" на ENG)
+        float btnW = 132.f;
+        float btnH = 22.f;
+        auto* btnNode = CCNode::create();
+        btnNode->setContentSize(CCSize{ btnW, btnH });
+        btnNode->ignoreAnchorPointForPosition(false);
+        btnNode->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
+
+        auto* borderSpr = createSmoothRoundedRect(btnW + 2.f, btnH + 2.f, 12.f, toColor4F(ccColor3B{ 115, 255, 165 }, 255));
+        borderSpr->setPosition(CCPoint{ btnW * 0.5f, btnH * 0.5f });
+        btnNode->addChild(borderSpr);
+
+        auto* bgSpr = createSmoothGradientRoundedRect(
+            btnW, btnH, 11.f,
+            toColor4F(ccColor3B{ 42, 196, 102 }, 255),
+            toColor4F(ccColor3B{ 24, 138, 68 }, 255)
+        );
+        bgSpr->setPosition(CCPoint{ btnW * 0.5f, btnH * 0.5f });
+        btnNode->addChild(bgSpr);
+
+        if (auto* txtSpr = createCyrillicOrEnglishAgreeLabelSprite(m_russianLayout, 10.5f)) {
+            txtSpr->setPosition(CCPoint{ btnW * 0.5f, btnH * 0.5f });
+            btnNode->addChild(txtSpr);
+        }
+
+        m_chatConfirmAgreeBtn = CCMenuItemSpriteExtra::create(
+            btnNode, this, menu_selector(AIDecorPopup::onConfirmAgreeInChat)
+        );
+        // Размещаем кнопку подтверждения прямо внутри нижней части окна чата
+        m_chatConfirmAgreeBtn->setPosition(CCPoint{ leftX - 10.f, center.y - 38.f });
+        m_buttonMenu->addChild(m_chatConfirmAgreeBtn);
+    }
+
+    void onConfirmAgreeInChat(CCObject*) {
+        if (g_hasPendingDrawingApproval && g_hasGeneratedArt) {
+            approveAndPlaceCurrentDrawingInGD(false);
+        }
+    }
+
     void setupArtAgentMainUI(CCPoint center) {
         this->setTitle("");
 
@@ -4888,7 +6167,7 @@ protected:
         headerTitle->setPosition(CCPoint{ center.x + 15.f, center.y + 126.f });
         m_mainLayer->addChild(headerTitle);
 
-        auto* balPill = createSolidPanel(106.f, 22.f, ccColor3B{ 28, 18, 22 }, 220);
+        auto* balPill = createSmoothRoundedRect(106.f, 22.f, 11.f, toColor4F(ccColor3B{ 28, 18, 22 }, 230));
         balPill->setPosition(CCPoint{ center.x - 182.f, center.y + 126.f });
         m_mainLayer->addChild(balPill);
 
@@ -4901,31 +6180,38 @@ protected:
         apiTagLbl->setPosition(CCPoint{ center.x - 184.f, center.y + 126.f });
         m_mainLayer->addChild(apiTagLbl);
 
-        auto* changeApiBtn = createSolidButton(
-            24.f, 20.f, ccColor3B{ 222, 52, 86 },
+        auto* changeApiBtn = createSmoothRoundedButton(
+            24.f, 20.f, 10.f, ccColor3B{ 222, 52, 86 }, ccColor3B{ 255, 95, 125 },
             "+", 0.55f, ccColor3B{ 255, 255, 255 },
             this, menu_selector(AIDecorPopup::onOpenApiGate)
         );
         changeApiBtn->setPosition(CCPoint{ center.x - 140.f, center.y + 126.f });
         m_buttonMenu->addChild(changeApiBtn);
 
+        // СКРУГЛЕННАЯ кнопка/плашка отображения текущей выбранной модели (Choose Model)
         std::string shortMod = fmt::format("Model: {}", getCurrentModelID(m_providerIdx));
         if (shortMod.size() > 22) shortMod = shortMod.substr(0, 22);
-        auto* modelBtn = createSolidButton(
-            114.f, 20.f, ccColor3B{ 38, 26, 32 },
+        auto* modelBtn = createSmoothRoundedButton(
+            116.f, 20.f, 10.f, ccColor3B{ 38, 24, 32 }, ccColor3B{ 96, 46, 60 },
             shortMod.c_str(), 0.38f, ccColor3B{ 165, 230, 255 },
             this, menu_selector(AIDecorPopup::onOpenModelSelectorFromMain)
         );
         modelBtn->setPosition(CCPoint{ center.x - 65.f, center.y + 126.f });
         m_buttonMenu->addChild(modelBtn);
 
-        auto* langBg = createSolidPanel(44.f, 20.f, ccColor3B{ 38, 26, 32 }, 255);
-        m_langBadgeLabel = CCLabelBMFont::create("RUS", "chatFont.fnt");
+        auto* langContainer = CCNode::create();
+        langContainer->setContentSize(CCSize{ 44.f, 20.f });
+        langContainer->ignoreAnchorPointForPosition(false);
+        langContainer->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
+        auto* langBg = createSmoothRoundedRect(44.f, 20.f, 10.f, toColor4F(ccColor3B{ 38, 26, 32 }, 255));
+        langBg->setPosition(CCPoint{ 22.f, 10.f });
+        langContainer->addChild(langBg);
+        m_langBadgeLabel = CCLabelBMFont::create(m_russianLayout ? "RUS" : "ENG", "chatFont.fnt");
         m_langBadgeLabel->setScale(0.45f);
         m_langBadgeLabel->setColor(ccColor3B{ 240, 245, 255 });
         m_langBadgeLabel->setPosition(CCPoint{ 22.f, 10.f });
-        langBg->addChild(m_langBadgeLabel);
-        auto* langBtn = CCMenuItemSpriteExtra::create(langBg, this, menu_selector(AIDecorPopup::onToggleLanguage));
+        langContainer->addChild(m_langBadgeLabel);
+        auto* langBtn = CCMenuItemSpriteExtra::create(langContainer, this, menu_selector(AIDecorPopup::onToggleLanguage));
         langBtn->setPosition(CCPoint{ center.x + 186.f, center.y + 126.f });
         m_buttonMenu->addChild(langBtn);
 
@@ -4939,11 +6225,10 @@ protected:
         m_mainLayer->addChild(midDivider);
 
         // ====================================================================
-        // ЛЕВАЯ КОЛОНКА: Прокручиваемый ИИ-чат + Компактный статус + Округленная строка ввода
+        // ЛЕВАЯ КОЛОНКА: Прокручиваемый ИИ-чат + Статус + Единая круглая строка ввода с кнопкой отправки
         // ====================================================================
         float leftX = center.x - 125.f;
 
-        // Сглаженная округленная подложка ленты прокручиваемого чата
         auto* chatBoxBorder = createSmoothRoundedRect(206.f, 160.f, 13.f, toColor4F(ccColor3B{ 68, 26, 34 }, 255));
         chatBoxBorder->setPosition(CCPoint{ leftX - 10.f, center.y + 24.f });
         m_mainLayer->addChild(chatBoxBorder);
@@ -4952,14 +6237,12 @@ protected:
         chatBoxBg->setPosition(CCPoint{ leftX - 10.f, center.y + 24.f });
         m_mainLayer->addChild(chatBoxBg);
 
-        // Настоящий прокручиваемый geode::ScrollLayer (поддерживает колесико мыши и перетаскивание!)
         m_chatScrollLayer = geode::ScrollLayer::create(CCSize{ 196.f, 150.f }, true, true);
         m_chatScrollLayer->ignoreAnchorPointForPosition(false);
         m_chatScrollLayer->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
         m_chatScrollLayer->setPosition(CCPoint{ leftX - 10.f, center.y + 24.f });
         m_mainLayer->addChild(m_chatScrollLayer);
 
-        // Прямоугольные кнопки прокрутки вверх [^] и вниз [v] справа от чата
         auto* scrollUpBtn = createSolidButton(
             18.f, 22.f, ccColor3B{ 44, 28, 34 },
             "^", 0.52f, ccColor3B{ 245, 248, 255 },
@@ -4999,7 +6282,6 @@ protected:
         m_stepPlaceLabel->setPosition(CCPoint{ leftX + 72.f, center.y - 66.f });
         m_mainLayer->addChild(m_stepPlaceLabel);
 
-        // Быстрые прямоугольные кнопки-примеры (For example)
         auto addExampleChip = [&](const char* label, CCPoint pos, SEL_MenuHandler cb) {
             auto* btn = createSolidButton(
                 52.f, 15.f, ccColor3B{ 36, 24, 30 },
@@ -5015,41 +6297,37 @@ protected:
         addExampleChip("New Style",   CCPoint{ leftX + 28.f, center.y - 88.f }, menu_selector(AIDecorPopup::onPresetUniqueNewStyle));
         addExampleChip("Build Ref",   CCPoint{ leftX + 84.f, center.y - 88.f }, menu_selector(AIDecorPopup::onPresetBuildFromRef));
 
-        // По-настоящему сглаженная округленная строка ввода сообщения ИИ (pill) со свечением
-        auto* inputSoftHalo = createSmoothRoundedRect(202.f, 34.f, 17.f, toColor4F(ccColor3B{ 105, 195, 255 }, 95));
-        inputSoftHalo->setPosition(CCPoint{ leftX - 15.f, center.y - 116.f });
-        m_mainLayer->addChild(inputSoftHalo);
+        // СТРОКА ВВОДА СООБЩЕНИЯ БЕЗ СИНЕЙ ОБВОДКИ + ВИЗУАЛЬНО ОБЪЕДИНЕННАЯ КРУГЛАЯ КНОПКА ОТПРАВКИ ВНУТРИ КАПСУЛЫ!
+        auto* inputPillBorder = createSmoothRoundedRect(224.f, 30.f, 15.f, toColor4F(ccColor3B{ 64, 28, 38 }, 255));
+        inputPillBorder->setPosition(CCPoint{ leftX, center.y - 116.f });
+        m_mainLayer->addChild(inputPillBorder);
 
-        auto* inputGlowOuter = createSmoothRoundedRect(196.f, 30.f, 15.f, toColor4F(ccColor3B{ 145, 220, 255 }, 235));
-        inputGlowOuter->setPosition(CCPoint{ leftX - 15.f, center.y - 116.f });
-        m_mainLayer->addChild(inputGlowOuter);
-
-        auto* inputPillBg = createSmoothRoundedRect(192.f, 26.f, 13.f, toColor4F(ccColor3B{ 18, 15, 20 }, 255));
-        inputPillBg->setPosition(CCPoint{ leftX - 15.f, center.y - 116.f });
+        auto* inputPillBg = createSmoothRoundedRect(222.f, 28.f, 14.f, toColor4F(ccColor3B{ 18, 14, 18 }, 255));
+        inputPillBg->setPosition(CCPoint{ leftX, center.y - 116.f });
         m_mainLayer->addChild(inputPillBg);
 
         m_inputDisplayLabel = CCLabelBMFont::create("", "chatFont.fnt");
-        m_inputDisplayLabel->setScale(0.44f);
-        m_inputDisplayLabel->setPosition(CCPoint{ leftX - 15.f, center.y - 116.f });
+        m_inputDisplayLabel->setScale(0.43f);
+        m_inputDisplayLabel->setPosition(CCPoint{ leftX - 13.f, center.y - 116.f });
         m_mainLayer->addChild(m_inputDisplayLabel);
         refreshInputLabel();
 
-        // Прямоугольная кнопка отправки [>]
-        auto* sendBtn = createSolidButton(
-            26.f, 24.f, ccColor3B{ 215, 48, 80 },
-            ">", 0.52f, ccColor3B{ 255, 255, 255 },
+        // Круглая/капсульная кнопка отправки [>], визуально встроенная внутрь правой части строки ввода (чуть меньше по размеру: 22x22 внутри 28px капсулы!)
+        auto* sendBtn = createSmoothRoundedButton(
+            22.f, 22.f, 11.f, ccColor3B{ 215, 48, 80 }, ccColor3B{ 245, 82, 112 },
+            ">", 0.48f, ccColor3B{ 255, 255, 255 },
             this, menu_selector(AIDecorPopup::onSendToNeuralNet)
         );
-        sendBtn->setPosition(CCPoint{ leftX + 98.f, center.y - 116.f });
+        sendBtn->setPosition(CCPoint{ leftX + 97.f, center.y - 116.f });
         m_buttonMenu->addChild(sendBtn);
 
-        // Заполняем ленту чата историей сообщений
         rebuildChatScrollFeed();
 
         // ====================================================================
-        // ПРАВАЯ КОЛОНКА: Вкладки [Shape | Drawing | In GD] + Синее превью + Limit + Keep
+        // ПРАВАЯ КОЛОНКА: Вкладки [Shape | Drawing | In GD] + Синее превью с Shimmer-анимацией
         // ====================================================================
         float rightX = center.x + 120.f;
+        m_selectionBoxCenter = CCPoint{ rightX, center.y + 10.f };
 
         auto* tabBarBg = createSolidPanel(224.f, 22.f, ccColor3B{ 22, 16, 20 }, 240);
         tabBarBg->setPosition(CCPoint{ rightX, center.y + 92.f });
@@ -5072,20 +6350,40 @@ protected:
         createTabButton("In GD",   CCPoint{ rightX + 73.f, center.y + 92.f }, menu_selector(AIDecorPopup::onTabInGD),    m_tabInGDBg);
 
         auto* canvasBg = createSolidPanel(224.f, 128.f, ccColor3B{ 18, 92, 212 }, 255);
-        canvasBg->setPosition(CCPoint{ rightX, center.y + 10.f });
+        canvasBg->setPosition(m_selectionBoxCenter);
         m_mainLayer->addChild(canvasBg);
 
         auto* selectionFrame = createSolidPanel(166.f, 108.f, ccColor3B{ 95, 195, 255 }, 120);
-        selectionFrame->setPosition(CCPoint{ rightX, center.y + 10.f });
+        selectionFrame->setPosition(m_selectionBoxCenter);
         m_mainLayer->addChild(selectionFrame);
 
         auto* selectionInner = createSolidPanel(162.f, 104.f, ccColor3B{ 18, 92, 212 }, 255);
-        selectionInner->setPosition(CCPoint{ rightX, center.y + 10.f });
+        selectionInner->setPosition(m_selectionBoxCenter);
         m_mainLayer->addChild(selectionInner);
 
         m_previewCanvasContent = CCNode::create();
-        m_previewCanvasContent->setPosition(CCPoint{ rightX, center.y + 10.f });
+        m_previewCanvasContent->setPosition(m_selectionBoxCenter);
         m_mainLayer->addChild(m_previewCanvasContent);
+
+        // Полупрозрачный прямоугольник выделения с плавным белым переливом (shimmer/пульсация) во время генерации ИИ!
+        m_selectionShimmerOverlay = createSmoothRoundedRect(
+            164.f, 106.f, 6.f,
+            toColor4F(ccColor3B{ 255, 255, 255 }, 95)
+        );
+        m_selectionShimmerOverlay->setPosition(m_selectionBoxCenter);
+        m_selectionShimmerOverlay->setZOrder(15);
+        m_selectionShimmerOverlay->setVisible(false);
+        m_mainLayer->addChild(m_selectionShimmerOverlay);
+
+        m_selectionShimmerBand = createSmoothGradientRoundedRect(
+            38.f, 104.f, 8.f,
+            toColor4F(ccColor3B{ 255, 255, 255 }, 165),
+            toColor4F(ccColor3B{ 235, 245, 255 }, 45)
+        );
+        m_selectionShimmerBand->setPosition(m_selectionBoxCenter);
+        m_selectionShimmerBand->setZOrder(16);
+        m_selectionShimmerBand->setVisible(false);
+        m_mainLayer->addChild(m_selectionShimmerBand);
 
         // Кнопка во вкладке Shape: переключает показ "Только каркас" <-> "100% Заполнение структуры"
         auto* fillBtnBg = createSolidPanel(78.f, 15.f, ccColor3B{ 26, 38, 68 }, 240);
@@ -5157,7 +6455,7 @@ protected:
     }
 
     // ========================================================================
-    // Перестроение прокручиваемой ленты ИИ-чата со всеми старыми сообщениями
+    // Перестроение прокручиваемой ленты ИИ-чата + кнопка подтверждения в чате
     // ========================================================================
     void rebuildChatScrollFeed() {
         if (!m_chatScrollLayer || !m_chatScrollLayer->m_contentLayer) return;
@@ -5171,13 +6469,12 @@ protected:
         };
         std::vector<ChatBubbleBlock> blocks;
 
-        // Приветственное сообщение в самом начале истории
         {
             ChatBubbleBlock intro;
             intro.isUser = false;
             intro.lines = wrapTextLines(
                 fmt::format(
-                    "Agent: {} blocks ({}x{}). Ref: {}. I build 100% custom layered art (no 3D presets) & self-verify match!",
+                    "Agent: {} blocks ({}x{}). Ref: {}. I build 100% custom layered art & exact edges!",
                     m_contour.cellCount(), m_contour.widthUnits(), m_contour.heightUnits(),
                     g_hasReferenceImage ? g_referenceFileName : "none (click '+ Ref Image')"
                 ),
@@ -5186,7 +6483,6 @@ protected:
             blocks.push_back(std::move(intro));
         }
 
-        // Все старые и новые сообщения из истории диалога g_chatHistory
         for (auto const& msg : g_chatHistory) {
             ChatBubbleBlock b;
             b.isUser = (msg.role == "user");
@@ -5195,8 +6491,10 @@ protected:
             blocks.push_back(std::move(b));
         }
 
-        // Считаем суммарную высоту всех пузырей сообщений
-        float totalH = 8.f;
+        // Если ИИ завершил генерацию в Drawing и ждет подтверждения в чате — оставляем место внизу ленты под кнопку "Согласен" / "Agree"
+        float bottomConfirmReserve = (g_hasPendingDrawingApproval && g_hasGeneratedArt) ? 30.f : 0.f;
+
+        float totalH = 8.f + bottomConfirmReserve;
         std::vector<float> blockHeights;
         for (auto const& b : blocks) {
             int nonEmpty = 0;
@@ -5239,8 +6537,8 @@ protected:
             curY -= (h + 6.f);
         }
 
-        // Прокручиваем ленту к самому новому сообщению внизу
         content->setPosition(CCPoint{ 0.f, 0.f });
+        refreshChatAgreeButtonState();
     }
 
     void onScrollChatUp(CCObject*) {
@@ -5255,44 +6553,103 @@ protected:
 
     void onToggleShapeFillPreview(CCObject*) {
         g_showFilledInShapeTab = !g_showFilledInShapeTab;
-        if (m_shapeFillToggleLbl) {
-            m_shapeFillToggleLbl->setString(g_showFilledInShapeTab ? "Mode: Filled" : "Show Fill");
-        }
         refreshRightPanelTabsAndCanvas();
     }
 
-    // Создает четкий монолитный силуэт для вкладки Shape с идеальными 45-градусными наклонными скатами (как на image_7827a2.png!)
+    // Вычисляет точные мировые границы области предпросмотра (включая точные края каркаса, повернутые шипы и орбы)
+    void getExactPreviewWorldBounds(float& outMinX, float& outMaxX, float& outMinY, float& outMaxY) const {
+        if (m_contour.exactMaxX > m_contour.exactMinX + 0.5f) {
+            outMinX = m_contour.exactMinX;
+            outMaxX = m_contour.exactMaxX;
+            outMinY = m_contour.exactMinY;
+            outMaxY = m_contour.exactMaxY;
+        } else {
+            outMinX = m_contour.minGX * 30.0f;
+            outMaxX = (m_contour.maxGX + 1) * 30.0f;
+            outMinY = m_contour.minGY * 30.0f;
+            outMaxY = (m_contour.maxGY + 1) * 30.0f;
+        }
+
+        for (auto const& sp : m_contour.spikes) {
+            float r = 16.0f * (std::max)(sp.scaleX, sp.scaleY);
+            outMinX = (std::min)(outMinX, sp.x - r);
+            outMaxX = (std::max)(outMaxX, sp.x + r);
+            outMinY = (std::min)(outMinY, sp.y - r);
+            outMaxY = (std::max)(outMaxY, sp.y + r);
+        }
+        for (auto const& op : m_contour.orbsAndPortals) {
+            float r = (op.isPortal ? 28.0f : 16.0f) * (std::max)(op.scaleX, op.scaleY);
+            outMinX = (std::min)(outMinX, op.x - r);
+            outMaxX = (std::max)(outMaxX, op.x + r);
+            outMinY = (std::min)(outMinY, op.y - r);
+            outMaxY = (std::max)(outMaxY, op.y + r);
+        }
+    }
+
+    // Создает четкий силуэт во вкладке Shape по ТОЧНЫМ координатам краев каркаса + треугольные повернутые шипы!
     CCSprite* createExactShapeSilhouetteSprite(float targetW, float targetH) {
-        int cols = (std::max)(1, m_contour.maxGX - m_contour.minGX + 1);
-        int rows = (std::max)(1, m_contour.maxGY - m_contour.minGY + 1);
-        int SubPx = 24;
-        int texW = std::clamp(cols * SubPx, 48, 512);
-        int texH = std::clamp(rows * SubPx, 48, 512);
+        float worldMinX = 0.f, worldMaxX = 30.f, worldMinY = 0.f, worldMaxY = 30.f;
+        getExactPreviewWorldBounds(worldMinX, worldMaxX, worldMinY, worldMaxY);
+        float worldSpanW = (std::max)(15.0f, worldMaxX - worldMinX);
+        float worldSpanH = (std::max)(15.0f, worldMaxY - worldMinY);
+
+        int texW = std::clamp(static_cast<int>(std::lround(worldSpanW * 0.85f)), 96, 512);
+        int texH = std::clamp(static_cast<int>(std::lround(worldSpanH * 0.85f)), 96, 512);
 
         std::vector<uint8_t> rgba(static_cast<size_t>(texW * texH * 4), 0);
-        auto const& activeCells = g_showFilledInShapeTab
-            ? m_contour.occupiedCells
-            : (m_contour.rawCells.empty() ? m_contour.occupiedCells : m_contour.rawCells);
 
         for (int py = 0; py < texH; ++py) {
             float v = 1.0f - (py + 0.5f) / static_cast<float>(texH);
-            int gy = m_contour.minGY + std::clamp(static_cast<int>(v * rows), 0, rows - 1);
-            float localV = std::fmod(v * rows, 1.0f);
+            float wy = worldMinY + v * worldSpanH;
 
             for (int px = 0; px < texW; ++px) {
                 float u = (px + 0.5f) / static_cast<float>(texW);
-                int gx = m_contour.minGX + std::clamp(static_cast<int>(u * cols), 0, cols - 1);
-                float localU = std::fmod(u * cols, 1.0f);
+                float wx = worldMinX + u * worldSpanW;
 
-                if (activeCells.count({ gx, gy }) == 0) continue;
-                CellSlopeKind sk = getCellSlopeKind(m_contour, gx, gy);
-                if (!isLocalPointInsideCellSlope(sk, localU, localV)) continue;
+                // 1. Проверяем попадание в треугольник любого шипа (с учетом его точного угла поворота sp.rotation!)
+                bool hitSpike = false;
+                for (auto const& sp : m_contour.spikes) {
+                    if (isWorldPointInsideRotatedSpikeTriangle(sp, wx, wy)) {
+                        hitSpike = true;
+                        break;
+                    }
+                }
+                if (hitSpike) {
+                    size_t idx = static_cast<size_t>((py * texW + px) * 4);
+                    rgba[idx + 0] = 255;
+                    rgba[idx + 1] = 212;
+                    rgba[idx + 2] = 224;
+                    rgba[idx + 3] = 255;
+                    continue;
+                }
 
-                size_t idx = static_cast<size_t>((py * texW + px) * 4);
-                rgba[idx + 0] = 244;
-                rgba[idx + 1] = 247;
-                rgba[idx + 2] = 255;
-                rgba[idx + 3] = 255;
+                // 2. Проверяем попадание в точные края каркаса (или заполненной структуры)
+                bool hitFrame = false;
+                if (g_showFilledInShapeTab) {
+                    hitFrame = isWorldPointInsideExactContour(m_contour, wx, wy);
+                } else {
+                    for (auto const& bx : m_contour.exactBoxes) {
+                        if (m_contour.rawCells.empty() || m_contour.rawCells.count({ bx.gx, bx.gy }) > 0) {
+                            if (wx >= bx.minX && wx <= bx.maxX && wy >= bx.minY && wy <= bx.maxY) {
+                                CellSlopeKind sk = getCellSlopeKind(m_contour, bx.gx, bx.gy);
+                                float lu = (wx - bx.minX) / (std::max)(1.0f, bx.maxX - bx.minX);
+                                float lv = (wy - bx.minY) / (std::max)(1.0f, bx.maxY - bx.minY);
+                                if (isLocalPointInsideCellSlope(sk, lu, lv)) {
+                                    hitFrame = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (hitFrame) {
+                    size_t idx = static_cast<size_t>((py * texW + px) * 4);
+                    rgba[idx + 0] = 244;
+                    rgba[idx + 1] = 247;
+                    rgba[idx + 2] = 255;
+                    rgba[idx + 3] = 255;
+                }
             }
         }
 
@@ -5320,51 +6677,40 @@ protected:
         return nullptr;
     }
 
-    // Создает идеальный попиксельный CCSprite 1024x1024-стиля для вкладки Drawing, обрезанный строго по силуэту и 45° скатам (image_7827a9.jpg)!
+    // Создает попиксельный CCSprite для вкладки Drawing строго по точным краям каркаса и повернутым треугольникам шипов!
     CCSprite* createPixelArtDrawingPreviewSprite(float targetW, float targetH) {
-        int cols = (std::max)(1, m_contour.maxGX - m_contour.minGX + 1);
-        int rows = (std::max)(1, m_contour.maxGY - m_contour.minGY + 1);
-        int SubPx = 24; // 24x24 пикселей на каждую клетку для фотореалистичной четкости в Drawing!
-        int texW = std::clamp(cols * SubPx, 48, 512);
-        int texH = std::clamp(rows * SubPx, 48, 512);
+        float worldMinX = 0.f, worldMaxX = 30.f, worldMinY = 0.f, worldMaxY = 30.f;
+        getExactPreviewWorldBounds(worldMinX, worldMaxX, worldMinY, worldMaxY);
+        float worldSpanW = (std::max)(15.0f, worldMaxX - worldMinX);
+        float worldSpanH = (std::max)(15.0f, worldMaxY - worldMinY);
 
-        std::vector<uint8_t> rgba(static_cast<size_t>(texW * texH * 4), 0);
-
-        float worldMinX = m_contour.minGX * 30.f;
-        float worldMinY = m_contour.minGY * 30.f;
-        float worldSpanW = cols * 30.f;
-        float worldSpanH = rows * 30.f;
+        int cols = (std::max)(1, static_cast<int>(std::lround(worldSpanW / 30.0f)));
+        int rows = (std::max)(1, static_cast<int>(std::lround(worldSpanH / 30.0f)));
 
         AIDecisionResult previewAI = g_hasGeneratedArt ? g_lastAIDecisionForEditor : AIDecisionResult{};
         int reqRes = (previewAI.textureResolution >= 16) ? std::clamp(previewAI.textureResolution, 16, 128) : 64;
-        texW = std::clamp(cols * (reqRes / (std::max)(1, cols)), reqRes, 512);
-        texH = std::clamp(rows * (reqRes / (std::max)(1, rows)), reqRes, 512);
-        rgba.assign(static_cast<size_t>(texW * texH * 4), 0);
+        int texW = std::clamp(cols * (reqRes / (std::max)(1, cols)), reqRes, 512);
+        int texH = std::clamp(rows * (reqRes / (std::max)(1, rows)), reqRes, 512);
+        std::vector<uint8_t> rgba(static_cast<size_t>(texW * texH * 4), 0);
         int styleSeed = static_cast<int>(previewAI.fillRGB.r * 73 + previewAI.mainRGB.g * 151 + g_variantIndex * 997);
 
-        // 1. Попиксельно рендерим высокодетализированный материал с точным соблюдением 45-градусных скатов крыши!
         for (int py = 0; py < texH; ++py) {
             float v = 1.0f - (py + 0.5f) / static_cast<float>(texH);
-            int gy = m_contour.minGY + std::clamp(static_cast<int>(v * rows), 0, rows - 1);
-            float localV = std::fmod(v * rows, 1.0f);
+            float wy = worldMinY + v * worldSpanH;
+            int gy = static_cast<int>(std::floor(wy / 30.0f));
+            float localV = (wy - gy * 30.0f) / 30.0f;
 
             for (int px = 0; px < texW; ++px) {
                 float u = (px + 0.5f) / static_cast<float>(texW);
-                int gx = m_contour.minGX + std::clamp(static_cast<int>(u * cols), 0, cols - 1);
-                float localU = std::fmod(u * cols, 1.0f);
-
                 float wx = worldMinX + u * worldSpanW;
-                float wy = worldMinY + v * worldSpanH;
+                int gx = static_cast<int>(std::floor(wx / 30.0f));
+                float localU = (wx - gx * 30.0f) / 30.0f;
 
-                bool inBlockCell = (!m_contour.hasAnySelection) ||
-                                   (m_contour.occupiedCells.count({ gx, gy }) > 0 &&
-                                    isLocalPointInsideCellSlope(getCellSlopeKind(m_contour, gx, gy), localU, localV));
+                bool inBlockCell = (!m_contour.hasAnySelection) || isWorldPointInsideExactContour(m_contour, wx, wy);
                 bool inSpikeTriangle = false;
                 if (!inBlockCell) {
                     for (auto const& sp : m_contour.spikes) {
-                        float dx = (wx - sp.x) / (15.0f * (std::max)(0.2f, sp.scaleX));
-                        float dy = (wy - sp.y + 15.0f) / (30.0f * (std::max)(0.2f, sp.scaleY));
-                        if (dy >= 0.0f && dy <= 1.0f && std::fabs(dx) <= (1.0f - dy)) {
+                        if (isWorldPointInsideRotatedSpikeTriangle(sp, wx, wy)) {
                             inSpikeTriangle = true;
                             break;
                         }
@@ -5391,9 +6737,8 @@ protected:
             }
         }
 
-        // 2. Поверх накладываем ВСЕ микро-пиксельные и архитектурные детали от ИИ (с точным учетом угла поворота s.rotation и Blending!)
-        float pxPerBlockX = texW / static_cast<float>(cols);
-        float pxPerBlockY = texH / static_cast<float>(rows);
+        float pxPerUnitX = texW / worldSpanW;
+        float pxPerUnitY = texH / worldSpanH;
 
         for (auto const& s : g_lastPreviewSpecs) {
             if (s.layerRole == LayerRole::Fill) continue;
@@ -5401,8 +6746,8 @@ protected:
             float v = (s.y - worldMinY) / worldSpanH;
             float centerPx = u * texW;
             float centerPy = (1.0f - v) * texH;
-            float halfW = (std::max)(0.7f, s.scaleX * pxPerBlockX * 0.5f);
-            float halfH = (std::max)(0.7f, s.scaleY * pxPerBlockY * 0.5f);
+            float halfW = (std::max)(0.7f, s.scaleX * 15.0f * pxPerUnitX);
+            float halfH = (std::max)(0.7f, s.scaleY * 15.0f * pxPerUnitY);
 
             ccColor3B col = (s.colorSlot == ColorSlot::CustomRGB)
                 ? s.customColor
@@ -5413,6 +6758,7 @@ protected:
             float cosA = std::cos(rad);
             float sinA = std::sin(rad);
             int boundR = static_cast<int>(std::ceil(std::sqrt(halfW * halfW + halfH * halfH))) + 1;
+            bool isSpikeSpec = isSpikeObjectID(s.objectId);
 
             int pyMin = (std::max)(0, static_cast<int>(std::floor(centerPy - boundR)));
             int pyMax = (std::min)(texH - 1, static_cast<int>(std::ceil(centerPy + boundR)));
@@ -5425,7 +6771,13 @@ protected:
                     float dx = (px + 0.5f) - centerPx;
                     float localX =  dx * cosA + dy * sinA;
                     float localY = -dx * sinA + dy * cosA;
-                    if (std::fabs(localX) > halfW || std::fabs(localY) > halfH) continue;
+                    if (isSpikeSpec) {
+                        // В экранных координатах текстуры ось Y направлена вниз (-halfH = вершина, +halfH = основание)
+                        float tFromTip = (localY + halfH) / (std::max)(1.0f, 2.0f * halfH);
+                        if (tFromTip < 0.0f || tFromTip > 1.0f || std::fabs(localX) > halfW * tFromTip) continue;
+                    } else {
+                        if (std::fabs(localX) > halfW || std::fabs(localY) > halfH) continue;
+                    }
 
                     size_t idx = static_cast<size_t>((py * texW + px) * 4);
                     if (rgba[idx + 3] == 0 && !s.isOverhang) continue;
@@ -5486,20 +6838,21 @@ protected:
         if (!m_previewCanvasContent) return;
 
         CCPoint canvasPos = m_previewCanvasContent->getPosition();
-        m_previewCanvasContent->setScale(0.f);
+        m_previewCanvasContent->removeAllChildrenWithCleanup(true);
+        m_previewCanvasContent->removeFromParentAndCleanup(true);
         m_previewCanvasContent = CCNode::create();
         m_previewCanvasContent->setPosition(canvasPos);
         m_mainLayer->addChild(m_previewCanvasContent);
 
-        int cols = (std::max)(1, m_contour.maxGX - m_contour.minGX + 1);
-        int rows = (std::max)(1, m_contour.maxGY - m_contour.minGY + 1);
-        float cellPx = (std::min)(142.f / cols, 96.f / rows);
-        cellPx = std::clamp(cellPx, 6.f, 26.f);
+        float worldMinX = 0.f, worldMaxX = 30.f, worldMinY = 0.f, worldMaxY = 30.f;
+        getExactPreviewWorldBounds(worldMinX, worldMaxX, worldMinY, worldMaxY);
+        float worldSpanW = (std::max)(30.0f, worldMaxX - worldMinX);
+        float worldSpanH = (std::max)(30.0f, worldMaxY - worldMinY);
 
-        float totalW = cols * cellPx;
-        float totalH = rows * cellPx;
-        float startX = -totalW * 0.5f + cellPx * 0.5f;
-        float startY = -totalH * 0.5f + cellPx * 0.5f;
+        float scaleRatio = (std::min)(146.f / worldSpanW, 96.f / worldSpanH);
+        float totalW = worldSpanW * scaleRatio;
+        float totalH = worldSpanH * scaleRatio;
+        float cellPx = 30.0f * scaleRatio;
 
         if (m_previewTab == 0) {
             if (!m_contour.hasAnySelection) {
@@ -5510,48 +6863,56 @@ protected:
                 m_previewCanvasContent->addChild(emptyLbl);
                 return;
             }
-            // ВКЛАДКА SHAPE: Монолитный белый силуэт с идеальными 45° скатами (image_7827a2.png)!
+            // ВКЛАДКА SHAPE: Точный силуэт по реальным краям каркаса + треугольные повернутые шипы!
             if (auto* shapeSpr = createExactShapeSilhouetteSprite(totalW, totalH)) {
                 shapeSpr->setPosition(CCPoint{ 0.f, 0.f });
                 m_previewCanvasContent->addChild(shapeSpr);
             }
-            for (auto const& sp : m_contour.spikes) {
-                int sgx = static_cast<int>(std::floor(sp.x / 30.0f));
-                int sgy = static_cast<int>(std::floor(sp.y / 30.0f));
-                float px = startX + (sgx - m_contour.minGX) * cellPx;
-                float py = startY + (sgy - m_contour.minGY) * cellPx;
-                for (int t = 0; t < 5; ++t) {
-                    float frac = (t + 0.5f) / 5.0f;
-                    float w = (1.0f - frac * 0.85f) * (cellPx - 1.f);
-                    float h = (cellPx / 5.0f) + 0.4f;
-                    auto* triBand = createSolidPanel(w, h, ccColor3B{ 255, 215, 225 }, 255);
-                    triBand->setPosition(CCPoint{ px, py - cellPx * 0.5f + frac * cellPx });
-                    m_previewCanvasContent->addChild(triBand);
-                }
-            }
             for (auto const& op : m_contour.orbsAndPortals) {
-                int ogx = static_cast<int>(std::floor(op.x / 30.0f));
-                int ogy = static_cast<int>(std::floor(op.y / 30.0f));
-                float px = startX + (ogx - m_contour.minGX) * cellPx;
-                float py = startY + (ogy - m_contour.minGY) * cellPx;
+                float px = -totalW * 0.5f + (op.x - worldMinX) * scaleRatio;
+                float py = -totalH * 0.5f + (op.y - worldMinY) * scaleRatio;
                 float w = (op.isPortal ? 0.55f : 0.72f) * cellPx;
                 float h = (op.isPortal ? 1.65f : 0.72f) * cellPx;
-                auto* orbSpr = createSolidPanel(w, h, ccColor3B{ 120, 255, 195 }, 255);
+                auto* orbSpr = createSmoothRoundedRect(w, h, (std::min)(w, h) * 0.45f, toColor4F(ccColor3B{ 120, 255, 195 }, 255));
+                orbSpr->setRotation(op.rotation);
                 orbSpr->setPosition(CCPoint{ px, py });
                 m_previewCanvasContent->addChild(orbSpr);
             }
         } else if (m_previewTab == 1 && (g_hasGeneratedArt || g_hasReferenceImage)) {
-            // ВКЛАДКА DRAWING: Попиксельный 1024x1024-стиль внутри точного силуэта с 45° скатами (image_7827a9.jpg)!
+            // ВКЛАДКА DRAWING: Попиксельный рендер внутри точных границ каркаса и треугольных шипов!
             if (auto* artSpr = createPixelArtDrawingPreviewSprite(totalW, totalH)) {
                 artSpr->setPosition(CCPoint{ 0.f, 0.f });
                 m_previewCanvasContent->addChild(artSpr);
             }
         } else {
-            // ВКЛАДКА IN GD
-            float worldMinX = m_contour.minGX * 30.f;
-            float worldMinY = m_contour.minGY * 30.f;
-            float scaleRatio = cellPx / 30.f;
+            // ВКЛАДКА IN GD: РЕЖИМ ПРЕДПРОСМОТРА (НЕ спавнит объекты сразу на уровень, а показывает как будет выглядеть итог в GD!)
+            // 1. Отрисовываем сетку редактора GD внутри окна предпросмотра
+            for (float gx = std::ceil(worldMinX / 30.f) * 30.f; gx <= worldMaxX; gx += 30.f) {
+                float lx = -totalW * 0.5f + (gx - worldMinX) * scaleRatio;
+                auto* vLine = createSolidPanel(0.8f, totalH, ccColor3B{ 45, 125, 235 }, 90);
+                vLine->setPosition(CCPoint{ lx, 0.f });
+                m_previewCanvasContent->addChild(vLine);
+            }
+            for (float gy = std::ceil(worldMinY / 30.f) * 30.f; gy <= worldMaxY; gy += 30.f) {
+                float ly = -totalH * 0.5f + (gy - worldMinY) * scaleRatio;
+                auto* hLine = createSolidPanel(totalW, 0.8f, ccColor3B{ 45, 125, 235 }, 90);
+                hLine->setPosition(CCPoint{ 0.f, ly });
+                m_previewCanvasContent->addChild(hLine);
+            }
 
+            // 2. Отрисовываем базовые шипы каркаса правильной треугольной формой с их реальным поворотом
+            for (auto const& sp : m_contour.spikes) {
+                float px = -totalW * 0.5f + (sp.x - worldMinX) * scaleRatio;
+                float py = -totalH * 0.5f + (sp.y - worldMinY) * scaleRatio;
+                float w = (std::max)(3.f, 30.f * sp.scaleX * scaleRatio);
+                float h = (std::max)(3.f, ((sp.objectId == 39 || sp.objectId == 103) ? 15.f : 30.f) * sp.scaleY * scaleRatio);
+                auto* triSpr = createTriangleSpikePreviewSprite(w, h, g_lastPreviewPalette.slotColors[static_cast<int>(ColorSlot::DarkFill)], 255);
+                triSpr->setRotation(sp.rotation);
+                triSpr->setPosition(CCPoint{ px, py });
+                m_previewCanvasContent->addChild(triSpr);
+            }
+
+            // 3. Отрисовываем все сгенерированные объекты предпросмотра (блоки и треугольные шипы)
             size_t shownCount = 0;
             for (auto const& s : g_lastPreviewSpecs) {
                 if (++shownCount > 6000) break;
@@ -5559,16 +6920,23 @@ protected:
                 float px = -totalW * 0.5f + (s.x - worldMinX) * scaleRatio;
                 float py = -totalH * 0.5f + (s.y - worldMinY) * scaleRatio;
 
-                float w = std::clamp(s.scaleX * cellPx, 0.5f, cellPx * 1.5f);
-                float h = std::clamp(s.scaleY * cellPx, 0.5f, cellPx * 1.5f);
+                float w = std::clamp(s.scaleX * cellPx, 0.5f, cellPx * 2.5f);
+                float h = std::clamp(s.scaleY * cellPx, 0.5f, cellPx * 2.5f);
                 ccColor3B col = (s.colorSlot == ColorSlot::CustomRGB)
                     ? s.customColor
                     : g_lastPreviewPalette.slotColors[std::clamp(static_cast<int>(s.colorSlot), 0, 5)];
 
-                auto* detSpr = createSolidPanel(w, h, col, s.customOpacity);
-                detSpr->setRotation(s.rotation);
-                detSpr->setPosition(CCPoint{ px, py });
-                m_previewCanvasContent->addChild(detSpr);
+                if (isSpikeObjectID(s.objectId)) {
+                    auto* spSpr = createTriangleSpikePreviewSprite((std::max)(2.5f, w), (std::max)(2.5f, h), col, s.customOpacity);
+                    spSpr->setRotation(s.rotation);
+                    spSpr->setPosition(CCPoint{ px, py });
+                    m_previewCanvasContent->addChild(spSpr);
+                } else {
+                    auto* detSpr = createSolidPanel(w, h, col, s.customOpacity);
+                    detSpr->setRotation(s.rotation);
+                    detSpr->setPosition(CCPoint{ px, py });
+                    m_previewCanvasContent->addChild(detSpr);
+                }
             }
         }
     }
@@ -5590,7 +6958,7 @@ protected:
             m_inputDisplayLabel->setColor(ccColor3B{ 150, 145, 160 });
         } else {
             std::string shown = m_inputBuffer;
-            size_t maxLen = (m_stage == PopupStage::ApiGate) ? 54 : 28;
+            size_t maxLen = (m_stage == PopupStage::ApiGate) ? 54 : 26;
             if (shown.size() > maxLen) {
                 shown = "..." + shown.substr(shown.size() - (maxLen - 3));
             }
@@ -5631,13 +6999,11 @@ protected:
     }
 
     void selectModelSlot(int slotIdx) {
-        static constexpr const char* kPresetIds[4] = {
-            "deepseek-chat",
-            "deepseek-v4-pro",
-            "gemini-4-hydrogen",
-            "gpt-4o-mini"
-        };
-        g_customModelName = kPresetIds[std::clamp(slotIdx, 0, 3)];
+        auto models = getActiveFilteredModelList();
+        int idx = g_modelSelectorScrollOffset + slotIdx;
+        if (idx >= 0 && idx < static_cast<int>(models.size())) {
+            g_customModelName = models[idx].id;
+        }
         if (!g_connectedApiKey.empty()) {
             saveVerifiedApiToDisk(0, g_connectedApiKey);
         }
@@ -5685,6 +7051,7 @@ protected:
 
         setCheckmarkState(true);
         saveVerifiedApiToDisk(0, g_connectedApiKey);
+        startAsyncFetchAvailableModels(true);
         reopenWithStage(PopupStage::ArtAgentMain);
     }
 
@@ -5703,27 +7070,32 @@ protected:
         if (m_langBadgeLabel) {
             m_langBadgeLabel->setString(m_russianLayout ? "RUS" : "ENG");
         }
+        // Автоматически обновляем текст кнопки подтверждения в чате ("✓ Согласен" <-> "✓ Agree")!
+        refreshChatAgreeButtonState();
     }
 
     void onTabShape(CCObject*)   { m_previewTab = 0; refreshRightPanelTabsAndCanvas(); }
     void onTabDrawing(CCObject*) { m_previewTab = 1; refreshRightPanelTabsAndCanvas(); }
+
+    // При нажатии на кнопку «In GD» мод НЕ спавнит реальные объекты сразу на уровень,
+    // а переключает экран в режим предпросмотра In GD!
     void onTabInGD(CCObject*) {
-        if (g_hasPendingDrawingApproval && g_hasGeneratedArt) {
-            approveAndPlaceCurrentDrawingInGD(false);
-            return;
-        }
         m_previewTab = 2;
         refreshRightPanelTabsAndCanvas();
+        if (g_hasPendingDrawingApproval && g_hasGeneratedArt && m_previewSubInfoLabel) {
+            m_previewSubInfoLabel->setString(
+                m_russianLayout
+                    ? "In GD Preview! Click 'Soglasen' in chat to place objects into level"
+                    : "In GD Preview! Click 'Agree' in chat to place objects into level"
+            );
+        }
     }
-
-
 
     void onSelectInside(CCObject*)   { g_overhangAllowed = false; refreshRightPanelTabsAndCanvas(); }
     void onSelectOverhang(CCObject*) { g_overhangAllowed = true;  refreshRightPanelTabsAndCanvas(); }
 
     void onAttachReferenceImage(CCObject*) {
         std::string clipStatus;
-        // 1. Сначала мгновенно проверяем, не скопировал ли игрок картинку или путь в буфер обмена (Ctrl+C)
         if (tryLoadReferenceImageFromClipboard(clipStatus)) {
             g_chatHistory.push_back({ "assistant", "Reference loaded from clipboard: " + g_referenceFileName + "! Click 'Build Ref' or write a prompt." });
             if (m_stepPlanLabel) m_stepPlanLabel->setString("Ref: loaded");
@@ -5731,7 +7103,6 @@ protected:
             refreshRightPanelTabsAndCanvas();
             return;
         }
-        // 2. Запускаем окно выбора файла в отдельном потоке (игра НЕ зависает, окно легко закрывается!)
         startAsyncReferenceImageDialog();
         if (m_stepPlanLabel) m_stepPlanLabel->setString("Ref: picking...");
     }
@@ -5780,7 +7151,16 @@ protected:
 
     void onKeepClicked(CCObject*) {
         if (g_hasPendingDrawingApproval && g_hasGeneratedArt) {
-            approveAndPlaceCurrentDrawingInGD(true);
+            // Переключаем на предпросмотр In GD и подсказываем нажать кнопку подтверждения в чате
+            m_previewTab = 2;
+            refreshRightPanelTabsAndCanvas();
+            if (m_previewSubInfoLabel) {
+                m_previewSubInfoLabel->setString(
+                    m_russianLayout
+                        ? "Preview In GD! Click 'Soglasen' button in chat to spawn objects"
+                        : "Preview In GD! Click 'Agree' button in chat to spawn objects"
+                );
+            }
             return;
         }
         this->onClose(nullptr);
@@ -5788,8 +7168,11 @@ protected:
 
     void launchAsyncAIWorker(std::string const& promptToRun) {
         if (g_aiRequestThreadRunning) return;
+        if (!g_editorSessionActive.load()) return;
+
         g_aiRequestThreadRunning = true;
         g_aiRequestHasCompleted = false;
+        uint64_t myEpoch = g_aiRequestCancelEpoch.fetch_add(1) + 1;
 
         ContourAnalysis contourCopy = m_contour;
         EditorTabCatalog catalogCopy = loadEditorTabCatalog(m_editorUI);
@@ -5797,7 +7180,11 @@ protected:
         bool ovhCopy = g_overhangAllowed;
         int varCopy = g_variantIndex;
 
-        std::thread([promptToRun, contourCopy, catalogCopy, limCopy, ovhCopy, varCopy]() {
+        std::thread([promptToRun, contourCopy, catalogCopy, limCopy, ovhCopy, varCopy, myEpoch]() {
+            if (!g_editorSessionActive.load() || myEpoch != g_aiRequestCancelEpoch.load()) {
+                g_aiRequestThreadRunning = false;
+                return;
+            }
             AIDecisionResult res = queryRealNeuralNetwork(
                 promptToRun,
                 contourCopy,
@@ -5806,6 +7193,11 @@ protected:
                 ovhCopy,
                 varCopy
             );
+            // Если пользователь вышел из редактора во время генерации — отбрасываем результат!
+            if (!g_editorSessionActive.load() || myEpoch != g_aiRequestCancelEpoch.load()) {
+                g_aiRequestThreadRunning = false;
+                return;
+            }
             g_aiThreadResult = std::move(res);
             g_aiRequestHasCompleted = true;
             g_aiRequestThreadRunning = false;
@@ -5817,7 +7209,7 @@ protected:
         for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         s = trimWhitespace(s);
         return (s == "da" || s == "ok" || s == "yes" || s == "go" || s == "stav" ||
-                s == "postav" || s == "soglasen" || s == "keep" || s == "norm" ||
+                s == "postav" || s == "soglasen" || s == "agree" || s == "keep" || s == "norm" ||
                 s == "horosho" || s == "krasivo" || s == "idealno" || s == "+");
     }
 
@@ -5848,7 +7240,7 @@ protected:
         );
         g_hasPendingDrawingApproval = false;
         g_previewAlreadyPlacedInEditor = true;
-        m_previewTab = 2; // Переключаем на вкладку In GD
+        m_previewTab = 2; // Показываем вкладку In GD
         refreshRightPanelTabsAndCanvas();
 
         if (m_stepPlaceLabel) {
@@ -5865,7 +7257,7 @@ protected:
 
         g_chatHistory.push_back({
             "assistant",
-            fmt::format("Approved! Placed {} objects into the level (Layers L{}..L{}).", summary.createdCount, summary.firstLayer, summary.firstLayer + 5)
+            fmt::format("Confirmed! Spawned {} real objects into the level editor (Layers L{}..L{}).", summary.createdCount, summary.firstLayer, summary.firstLayer + 5)
         });
         rebuildChatScrollFeed();
 
@@ -5879,7 +7271,6 @@ protected:
 
         std::string promptText = trimWhitespace(m_inputBuffer);
 
-        // Если в Drawing уже готов рисунок и игрок написал в чат "да / ок / согласен / ставь" — сразу ставим в уровень!
         if (g_hasPendingDrawingApproval && !promptText.empty() && isUserApprovalMessage(promptText)) {
             m_inputBuffer.clear();
             refreshInputLabel();
@@ -5888,8 +7279,6 @@ protected:
             return;
         }
 
-        // Если игрок написал короткое "переделай / нет / заново" без нового описания — переделываем прошлый запрос,
-        // а если написал новый стиль (например "сделай стиль неон") — выполняем ТОЛЬКО новый запрос без примешивания старого!
         if (g_hasPendingDrawingApproval && !promptText.empty() && isUserRedoMessage(promptText) && promptText.size() <= 14) {
             g_variantIndex++;
             promptText = g_lastBuildPrompt.empty() ? "make a better design" : g_lastBuildPrompt;
@@ -5905,13 +7294,16 @@ protected:
         m_inputBuffer.clear();
         refreshInputLabel();
 
-        // Запоминаем написанное сообщение для авто-повтора раз в 2 секунды при сбое!
+        g_hasPendingDrawingApproval = false;
+        refreshChatAgreeButtonState();
+
         g_pendingRetryPrompt = promptText;
         g_autoRetryTimerActive = false;
         g_autoRetryAttemptCount = 0;
 
         g_floatingDotsTimer = 0.0f;
         g_floatingDotsPhase = 0;
+        g_loadingShimmerTimer = 0.0f;
 
         g_chatHistory.push_back({ "user", promptText });
         g_chatHistory.push_back({ "assistant", " .  " });
@@ -5927,18 +7319,12 @@ protected:
         if (!ai.httpSuccess) {
             g_autoRetryAttemptCount++;
 
-            // Если прошло меньше 10 попыток — НЕ показываем ошибку игроку!
-            // Оставляем только плавающие 3 точки и переотправляем сообщение через 2 секунды
             if (g_autoRetryAttemptCount < 10) {
                 g_autoRetryTimerActive = true;
                 g_autoRetryCountdown = 2.0f;
-
-                // Тихо переключаем на следующую доступную модель, чтобы обойти 503/429
-                // Повторяем запрос на выбранный пользователем Base URL и Endpoint
                 return;
             }
 
-            // Только если за 10 попыток так и не получилось загрузить ответ — показываем ошибку!
             g_autoRetryTimerActive = false;
             g_autoRetryAttemptCount = 0;
 
@@ -5955,7 +7341,6 @@ protected:
             return;
         }
 
-        // УСПЕХ! Выключаем таймер авто-повтора и обновляем ответ ИИ в чате
         g_autoRetryTimerActive = false;
         g_autoRetryAttemptCount = 0;
 
@@ -5976,8 +7361,10 @@ protected:
         if (ai.taskMode == AITaskMode::UndoLast) {
             int rem = clearLastPlacedObjects();
             g_hasGeneratedArt = false;
+            g_hasPendingDrawingApproval = false;
             m_previewTab = 0;
             refreshRightPanelTabsAndCanvas();
+            refreshChatAgreeButtonState();
             if (m_stepPlaceLabel) {
                 std::string uStr = fmt::format("Undo: -{}", rem);
                 m_stepPlaceLabel->setString(uStr.c_str());
@@ -5999,12 +7386,9 @@ protected:
             rng
         );
 
-        // ИИ СНАЧАЛА показывает готовую попиксельную работу во вкладке Drawing (БЕЗ спавна в уровень!),
-        // чтобы игрок сам оценил результат и либо согласился (Keep / In GD / 'da'), либо сказал переделать!
         g_lastAIDecisionForEditor = ai;
         g_lastAddedSpecs = specs;
         if (ai.appendMode && !g_lastPreviewSpecs.empty()) {
-            // ДОБАВЛЯЕМ новые объекты к уже существующей постройке (старое НЕ удаляется!)
             g_lastPreviewSpecs.insert(g_lastPreviewSpecs.end(), specs.begin(), specs.end());
         } else {
             g_lastPreviewSpecs = specs;
@@ -6018,9 +7402,9 @@ protected:
         refreshRightPanelTabsAndCanvas();
 
         if (!g_chatHistory.empty() && g_chatHistory.back().role == "assistant") {
-            g_chatHistory.back().content += " -> Check 'Drawing'! Click 'Keep' (or write 'da') to place in GD, or 'Another variant' (or write 'peredelay') to redo!";
-            rebuildChatScrollFeed();
+            g_chatHistory.back().content += " -> Ready in 'Drawing' & 'In GD' preview! Click the confirmation button below in chat to place into the level!";
         }
+        rebuildChatScrollFeed();
 
         if (m_stepPlanLabel) {
             std::string pStr = fmt::format("Match: {}%", ai.selfMatchScore);
@@ -6030,12 +7414,12 @@ protected:
             m_stepDrawingLabel->setString("Draw: ready!");
         }
         if (m_stepPlaceLabel) {
-            m_stepPlaceLabel->setString("Wait approve");
+            m_stepPlaceLabel->setString("Wait confirm");
         }
         if (m_previewSubInfoLabel) {
             int shownRes = (ai.textureResolution >= 16) ? ai.textureResolution : 64;
             std::string subStr = fmt::format(
-                "{}x{} px | {} objs | Click 'Keep' to place in GD or 'Another variant' to redo",
+                "{}x{} px | {} objs | Click 'Soglasen / Agree' in chat to build in GD",
                 shownRes, shownRes, g_lastPreviewSpecs.size()
             );
             m_previewSubInfoLabel->setString(subStr.c_str());
@@ -6043,7 +7427,21 @@ protected:
     }
 
     void updateKeyboardAndLock(float dt) {
+        // Если игрок вышел из редактора уровней — немедленно прерываем все запросы к ИИ!
+        if (!m_editorUI || !m_editorUI->m_editorLayer || !g_editorSessionActive.load()) {
+            cancelAllActiveAIRequestsOnEditorExit();
+            return;
+        }
+
         restoreLockedContourPositions();
+
+        // Проверяем завершение загрузки списка текстовых/кодовых моделей по API
+        if (g_modelFetchHasCompleted.load()) {
+            g_modelFetchHasCompleted.store(false);
+            if (m_stage == PopupStage::ModelSelector) {
+                rebuildModelSelectorRows();
+            }
+        }
 
         // 1. Проверяем завершение фонового запроса к ИИ
         if (g_aiRequestHasCompleted) {
@@ -6051,8 +7449,31 @@ protected:
             handleCompletedAIResult(g_aiThreadResult);
         }
 
-        // 2. Анимация плавающих 3 точек в чате, пока сообщение грузится или тихо переотправляется (до 10 попыток)
-        if (g_aiRequestThreadRunning || g_autoRetryTimerActive) {
+        // 2. Анимация плавного белого перелива (Shimmer / пульсации) на области выделения + плавающие точки в чате во время генерации
+        bool isGeneratingNow = (g_aiRequestThreadRunning || g_autoRetryTimerActive);
+        if (m_selectionShimmerOverlay && m_selectionShimmerBand) {
+            if (isGeneratingNow) {
+                g_loadingShimmerTimer += dt;
+                m_selectionShimmerOverlay->setVisible(true);
+                m_selectionShimmerBand->setVisible(true);
+
+                float pulse = 0.5f + 0.5f * std::sin(g_loadingShimmerTimer * 4.5f);
+                GLubyte pulseAlpha = static_cast<GLubyte>(std::clamp(45.0f + pulse * 95.0f, 35.0f, 145.0f));
+                m_selectionShimmerOverlay->setOpacity(pulseAlpha);
+
+                // Плавное скольжение белой световой полосы (shimmer wave) слева направо внутри области выделения
+                float sweepFrac = std::fmod(g_loadingShimmerTimer * 0.85f, 1.0f);
+                float offsetX = -62.0f + sweepFrac * 124.0f;
+                float edgeFade = std::sin(sweepFrac * 3.14159265f);
+                m_selectionShimmerBand->setPosition(CCPoint{ m_selectionBoxCenter.x + offsetX, m_selectionBoxCenter.y });
+                m_selectionShimmerBand->setOpacity(static_cast<GLubyte>(std::clamp(edgeFade * 175.0f, 20.0f, 175.0f)));
+            } else {
+                m_selectionShimmerOverlay->setVisible(false);
+                m_selectionShimmerBand->setVisible(false);
+            }
+        }
+
+        if (isGeneratingNow) {
             g_floatingDotsTimer += dt;
             if (g_floatingDotsTimer >= 0.32f) {
                 g_floatingDotsTimer = 0.0f;
@@ -6101,19 +7522,26 @@ protected:
             }
         }
 
-        if (m_stage == PopupStage::ModelSelector) return;
-
 #ifdef GEODE_IS_WINDOWS
-        bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-        bool ctrlDown  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-        bool altDown   = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-
         auto wasJustPressed = [&](int vk) -> bool {
             bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
             bool just = down && !m_prevKeyStates[vk];
             m_prevKeyStates[vk] = down;
             return just;
         };
+
+        if (m_stage == PopupStage::ModelSelector) {
+            if (wasJustPressed(VK_UP) || wasJustPressed(VK_PRIOR)) {
+                onScrollModelListUp(nullptr);
+            } else if (wasJustPressed(VK_DOWN) || wasJustPressed(VK_NEXT)) {
+                onScrollModelListDown(nullptr);
+            }
+            return;
+        }
+
+        bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        bool ctrlDown  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        bool altDown   = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
 
         if (altDown && wasJustPressed(VK_SHIFT)) {
             onToggleLanguage(nullptr);
@@ -6223,17 +7651,32 @@ public:
 };
 
 // ============================================================================
-// Открытие и закрытие окна Art Agent по нажатию Правого Alt (VK_RMENU)
+// Открытие и закрытие окна Art Agent по нажатию Правого Alt (VK_RMENU) +
+// автоматическое прерывание генерации при выходе из редактора уровней!
 // ============================================================================
 class $modify(AIDecorEditorUI, EditorUI) {
     struct Fields {
         bool m_rightAltWasDown = false;
+        ~Fields() {
+            g_editorSessionActive.store(false);
+            cancelAllActiveAIRequestsOnEditorExit();
+        }
     };
 
     bool init(LevelEditorLayer* editorLayer) {
         if (!EditorUI::init(editorLayer)) return false;
+        g_editorSessionActive.store(true);
         this->schedule(schedule_selector(AIDecorEditorUI::checkRightAltKey), 0.0f);
         return true;
+    }
+
+    void onExit() {
+        g_editorSessionActive.store(false);
+        cancelAllActiveAIRequestsOnEditorExit();
+        if (g_activePopup) {
+            g_activePopup = nullptr;
+        }
+        EditorUI::onExit();
     }
 
     void checkRightAltKey(float) {
@@ -6254,6 +7697,7 @@ class $modify(AIDecorEditorUI, EditorUI) {
             return;
         }
 
+        g_editorSessionActive.store(true);
         ContourAnalysis contour = analyzeSelectedContour(this);
         if (auto* popup = AIDecorPopup::create(this, std::move(contour), PopupStage::ArtAgentMain)) {
             popup->show();
