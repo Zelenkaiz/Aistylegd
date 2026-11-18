@@ -35,3 +35,4 @@ if (TARGET GeodeBindings)
 endif()
 
 setup_geode_mod(${PROJECT_NAME})
+add_compile_definitions(_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH)
