@@ -5654,8 +5654,8 @@ static CCSprite* createTelegramBubbleSprite(
             if (dist >= 1.0f) continue;
 
             float cov = std::clamp(0.5f - dist / 1.5f, 0.f, 1.f);
-            bool isBorder = (dist > -2.0f);
-            ccColor3B c = isBorder ? borderColor : bgColor;
+            (void)borderColor;
+            ccColor3B c = bgColor;
             uint8_t a8 = static_cast<uint8_t>(std::lround(cov * 255.f));
             if (a8 == 0) continue;
 
@@ -6358,8 +6358,8 @@ protected:
         float leftX = center.x - 125.f;
 
         // Миниатюрная кнопка "Согласен" / "Agree" точно в стиле красного сообщения игрока в чате
-        float btnW = m_russianLayout ? 40.f : 32.f;
-        float btnH = 11.f;
+        float btnW = m_russianLayout ? 48.f : 38.f;
+        float btnH = 13.f;
         auto* btnNode = CCNode::create();
         btnNode->setContentSize(CCSize{ btnW + 8.f, btnH });
         btnNode->ignoreAnchorPointForPosition(false);
@@ -6373,7 +6373,7 @@ protected:
         msgBubbleSpr->setPosition(CCPoint{ (btnW + 8.f) * 0.5f, btnH * 0.5f });
         btnNode->addChild(msgBubbleSpr);
 
-        if (auto* txtSpr = createCyrillicOrEnglishAgreeLabelSprite(m_russianLayout, 4.8f)) {
+        if (auto* txtSpr = createCyrillicOrEnglishAgreeLabelSprite(m_russianLayout, 6.2f)) {
             txtSpr->setPosition(CCPoint{ btnW * 0.5f, btnH * 0.5f });
             btnNode->addChild(txtSpr);
         }
@@ -6753,7 +6753,7 @@ protected:
                     m_contour.cellCount(), m_contour.widthUnits(), m_contour.heightUnits(),
                     g_hasReferenceImage ? g_referenceFileName : "none"
                 ),
-                40, 3
+                34, 3
             );
             blocks.push_back(std::move(intro));
         }
@@ -6767,7 +6767,7 @@ protected:
                 b.isThinkingPlaceholder = true;
                 b.lines = { "" };
             } else {
-                b.lines = wrapTextLines(msg.content, 40, 8);
+                b.lines = wrapTextLines(msg.content, 34, 8);
             }
             blocks.push_back(std::move(b));
         }
@@ -6787,9 +6787,9 @@ protected:
                 }
             }
             nonEmpty = (std::max)(1, nonEmpty);
-            // Еще в 2 раза более компактные и миниатюрные шторки сообщений
-            float h = b.isThinkingPlaceholder ? 9.5f : (4.0f + nonEmpty * 5.6f);
-            float w = b.isThinkingPlaceholder ? 21.f : std::clamp(maxChars * 2.55f + 10.f, 22.f, 118.f);
+            // Компактные миниатюрные шторки с четким читаемым текстом (и мини-шторка для 3 точек)
+            float h = b.isThinkingPlaceholder ? 10.0f : (5.5f + nonEmpty * 8.2f);
+            float w = b.isThinkingPlaceholder ? 22.0f : std::clamp(maxChars * 3.55f + 14.f, 30.f, 146.f);
             blockHeights.push_back(h);
             blockWidths.push_back(w);
             totalH += h + 3.0f;
@@ -6840,13 +6840,13 @@ protected:
             } else {
                 int drawnLines = 0;
                 float bodyCenterX = (bubbleW + 8.f) * 0.5f;
-                float topTextY = h - 4.8f;
+                float topTextY = h - 6.8f;
                 for (auto const& ln : b.lines) {
                     if (ln.empty()) continue;
                     auto* lbl = CCLabelBMFont::create(ln.c_str(), "chatFont.fnt");
-                    lbl->setScale(0.20f);
-                    lbl->setColor(b.isUser ? ccColor3B{ 255, 244, 246 } : ccColor3B{ 238, 242, 248 });
-                    lbl->setPosition(CCPoint{ bodyCenterX, topTextY - drawnLines * 5.6f });
+                    lbl->setScale(0.32f);
+                    lbl->setColor(b.isUser ? ccColor3B{ 255, 246, 248 } : ccColor3B{ 242, 246, 252 });
+                    lbl->setPosition(CCPoint{ bodyCenterX, topTextY - drawnLines * 8.2f });
                     lbl->setZOrder(1);
                     msgNode->addChild(lbl);
                     drawnLines++;
