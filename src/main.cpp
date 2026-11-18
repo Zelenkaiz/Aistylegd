@@ -263,6 +263,7 @@ struct AIDecisionResult {
     bool allowOrbsAndPortals = false;   // Разрешение трогать орбы, дэш-орбы и порталы
     bool wantCustomOrbTexture = false;  // Кастомная текстура внутри орбов ТОЛЬКО по явной просьбе (иначе на орбах только неон!)
     bool wantBackground = false;        // Создание заднего фона (BG), только если явно попросили фон/небо/задник
+    bool allowOverhangByAI = false;     // ИИ сам решает, делать ли декор за каркасом (Overhang), или по просьбе игрока!
     bool appendMode = false;            // Режим ДОБАВЛЕНИЯ к существующей постройке (не удаляет старый декор!)
     int textureResolution = 0;          // Разрешение текстуры ИИ по запросу: 0 (чистые векторы ИИ) или 16..128 (вплоть до 128x128!)
     float freeSizeBlocksW = 0.0f;       // Ширина объекта/фона в блоках (выбирается самим ИИ или указывается игроком, когда ничего не выделено)
@@ -2561,6 +2562,16 @@ static bool executeSingleNeuralNetPass(
         outRes.allowOrbsAndPortals = hasOrbPortalWord;
         outRes.wantCustomOrbTexture = hasCustomOrbTexWord;
         outRes.wantBackground      = hasBgWord || outRes.wantBackground;
+        bool askOverhang = (lp.find("za karkas") != std::string::npos || lp.find("overhang") != std::string::npos ||
+                            lp.find("snaruzh") != std::string::npos || lp.find("vystup") != std::string::npos ||
+                            lp.find("vylez") != std::string::npos || lp.find("vne ") != std::string::npos);
+        bool forbidOverhang = (lp.find("tolko vnutr") != std::string::npos || lp.find("ne vyhod") != std::string::npos ||
+                               lp.find("bez vystup") != std::string::npos || lp.find("inside") != std::string::npos);
+        if (forbidOverhang) {
+            outRes.allowOverhangByAI = false;
+        } else if (askOverhang) {
+            outRes.allowOverhangByAI = true;
+        }
 
         // Проверяем, написал ли сам игрок в чат желаемое количество блоков/объектов
         outRes.suggestedCount = 0;
@@ -2753,6 +2764,7 @@ static bool executeSingleNeuralNetPass(
         outRes.wantCustomSpikes      = extractJsonBoolField(innerJson, "want_custom_spikes", false);
         outRes.allowOrbsAndPortals   = extractJsonBoolField(innerJson, "decorate_orbs_portals", false);
         outRes.wantBackground        = extractJsonBoolField(innerJson, "want_background", false);
+        outRes.allowOverhangByAI     = extractJsonBoolField(innerJson, "allow_overhang", false);
         outRes.appendMode        = extractJsonBoolField(innerJson, "append_mode", false);
         outRes.textureResolution = std::clamp(extractJsonIntField(innerJson, "tex_res", 0), 0, 128);
         float aiSizeW = extractJsonFloatField(innerJson, "size_w", 0.0f);
@@ -2865,7 +2877,7 @@ static AIDecisionResult queryRealNeuralNetwork(
         "\"match_score\": 99, "
         "\"size_w\": 5, \"size_h\": 5, "
         "\"fill_rgb\": [r,g,b], \"mid_rgb\": [r,g,b], \"main_rgb\": [r,g,b], \"outline_rgb\": [r,g,b], \"glow_rgb\": [r,g,b], \"grad_top\": [r,g,b], \"grad_bot\": [r,g,b], \"plaster_rgb\": [r,g,b], \"mortar_rgb\": [r,g,b], "
-        "\"tex_res\": 0..128, \"append_mode\": false, \"want_pbr\": false, \"want_gradient\": false, \"want_neon\": false, \"want_custom_spikes\": false, \"decorate_orbs_portals\": false, \"want_background\": false, "
+        "\"tex_res\": 0..128, \"append_mode\": false, \"want_pbr\": false, \"want_gradient\": false, \"want_neon\": false, \"want_custom_spikes\": false, \"decorate_orbs_portals\": false, \"want_background\": false, \"allow_overhang\": false, "
         "\"move_x\": 0, \"move_y\": 0, \"rotate_deg\": 0, \"scale_x\": 1.0, \"scale_y\": 1.0, \"duplicate_count\": 0, \"duplicate_dx\": 0, \"duplicate_dy\": 0, \"delete_selected\": false, \"recolor_only\": false, "
         "\"cell_elements\": [{{\"id\":211,\"rx\":0.0..1.0,\"ry\":0.0..1.0,\"sx\":0.005..1.2,\"sy\":0.005..1.2,\"rot\":0..360,\"r\":0..255,\"g\":0..255,\"b\":0..255,\"op\":1..255,\"blend\":false,\"el\":1..5,\"zl\":-3..9,\"z\":-10..60}}], "
         "\"elements\": [{{\"id\":211,\"rx\":-1.0..2.0,\"ry\":-1.0..2.0,\"sx\":0.005..20.0,\"sy\":0.005..20.0,\"rot\":0..360,\"r\":0..255,\"g\":0..255,\"b\":0..255,\"op\":1..255,\"blend\":false,\"el\":1..5,\"zl\":-3..9,\"z\":-10..80}}], "
@@ -3564,185 +3576,23 @@ static CellSlopeKind getCellSlopeKind(ContourAnalysis const& contour, int gx, in
     return (it != contour.slopeCells.end()) ? it->second : CellSlopeKind::None;
 }
 
-// Возвращает точные допустимые границы [outMinX, outMaxX] и [outMinY, outMaxY] по реальным краям объектов каркаса в точке (wx, wy)
-static bool getExactFrameSpanAtWorldPoint(
-    ContourAnalysis const& contour,
-    float wx,
-    float wy,
-    float& outMinX,
-    float& outMaxX,
-    float& outMinY,
-    float& outMaxY
-) {
-    if (contour.exactBoxes.empty()) return false;
-
-    // 1. Ищем бокс каркаса, содержащий точку (wx, wy) с небольшим допуском
-    int hitIdx = -1;
-    for (size_t i = 0; i < contour.exactBoxes.size(); ++i) {
-        auto const& bx = contour.exactBoxes[i];
-        if (wx >= bx.minX - 0.8f && wx <= bx.maxX + 0.8f &&
-            wy >= bx.minY - 0.8f && wy <= bx.maxY + 0.8f) {
-            hitIdx = static_cast<int>(i);
-            break;
-        }
-    }
-    if (hitIdx < 0) return false;
-
-    auto const& seedBox = contour.exactBoxes[hitIdx];
-
-    // 2. Расширяем непрерывный горизонтальный интервал [rowLeft, rowRight] по соприкасающимся боксам на высоте wy
-    float rowLeft  = seedBox.minX;
-    float rowRight = seedBox.maxX;
-    bool expandedX = true;
-    while (expandedX) {
-        expandedX = false;
-        for (auto const& bx : contour.exactBoxes) {
-            if (wy < bx.minY - 1.0f || wy > bx.maxY + 1.0f) continue;
-            if (bx.maxX >= rowLeft - 2.0f && bx.minX <= rowRight + 2.0f) {
-                if (bx.minX < rowLeft - 0.05f)  { rowLeft  = bx.minX; expandedX = true; }
-                if (bx.maxX > rowRight + 0.05f) { rowRight = bx.maxX; expandedX = true; }
-            }
-        }
-    }
-
-    // 3. Расширяем непрерывный вертикальный интервал [colBot, colTop] по соприкасающимся боксам на координате wx
-    float colBot = seedBox.minY;
-    float colTop = seedBox.maxY;
-    bool expandedY = true;
-    while (expandedY) {
-        expandedY = false;
-        for (auto const& bx : contour.exactBoxes) {
-            if (wx < bx.minX - 1.0f || wx > bx.maxX + 1.0f) continue;
-            if (bx.maxY >= colBot - 2.0f && bx.minY <= colTop + 2.0f) {
-                if (bx.minY < colBot - 0.05f) { colBot = bx.minY; expandedY = true; }
-                if (bx.maxY > colTop + 0.05f) { colTop = bx.maxY; expandedY = true; }
-            }
-        }
-    }
-
-    outMinX = rowLeft;
-    outMaxX = rowRight;
-    outMinY = colBot;
-    outMaxY = colTop;
-
-    // 4. Учитываем 45-градусные наклонные поверхности (Slope) внутри конкретного бокса seedBox
-    CellSlopeKind sk = getCellSlopeKind(contour, seedBox.gx, seedBox.gy);
-    if (sk != CellSlopeKind::None) {
-        float cellLeft  = seedBox.minX;
-        float cellRight = seedBox.maxX;
-        float cellBot   = seedBox.minY;
-        float cellTop   = seedBox.maxY;
-        float cellW = (std::max)(1.0f, cellRight - cellLeft);
-        float cellH = (std::max)(1.0f, cellTop - cellBot);
-        float u = std::clamp((wx - cellLeft) / cellW, 0.0f, 1.0f);
-        float v = std::clamp((wy - cellBot) / cellH, 0.0f, 1.0f);
-        if (!isLocalPointInsideCellSlope(sk, u, v)) return false;
-
-        float uMin = 0.0f, uMax = 1.0f;
-        if (getSlopeHorizontalSpanAtV(sk, v, uMin, uMax)) {
-            if (sk == CellSlopeKind::RoofLeft || sk == CellSlopeKind::CeilingLeft) {
-                outMinX = (std::max)(outMinX, cellLeft + uMin * cellW);
-            }
-            if (sk == CellSlopeKind::RoofRight || sk == CellSlopeKind::CeilingRight) {
-                outMaxX = (std::min)(outMaxX, cellLeft + uMax * cellW);
-            }
-        }
-        switch (sk) {
-            case CellSlopeKind::RoofLeft:
-                outMaxY = (std::min)(outMaxY, cellBot + u * cellH);
-                break;
-            case CellSlopeKind::RoofRight:
-                outMaxY = (std::min)(outMaxY, cellBot + (1.0f - u) * cellH);
-                break;
-            case CellSlopeKind::CeilingLeft:
-                outMinY = (std::max)(outMinY, cellBot + (1.0f - u) * cellH);
-                break;
-            case CellSlopeKind::CeilingRight:
-                outMinY = (std::max)(outMinY, cellBot + u * cellH);
-                break;
-            default:
-                break;
-        }
-    }
-
-    return (outMaxX > outMinX + 0.1f && outMaxY > outMinY + 0.1f);
-}
-
 static bool isWorldPointInsideExactContour(ContourAnalysis const& contour, float wx, float wy) {
-    float minX = 0.f, maxX = 0.f, minY = 0.f, maxY = 0.f;
-    return getExactFrameSpanAtWorldPoint(contour, wx, wy, minX, maxX, minY, maxY) &&
-           wx >= minX - 0.1f && wx <= maxX + 0.1f && wy >= minY - 0.1f && wy <= maxY + 0.1f;
+    int gx = static_cast<int>(std::floor(wx / 30.0f));
+    int gy = static_cast<int>(std::floor(wy / 30.0f));
+    if (contour.occupiedCells.count({ gx, gy }) == 0) return false;
+    CellSlopeKind sk = getCellSlopeKind(contour, gx, gy);
+    if (sk == CellSlopeKind::None) return true;
+    float u = (wx - gx * 30.0f) / 30.0f;
+    float v = (wy - gy * 30.0f) / 30.0f;
+    return isLocalPointInsideCellSlope(sk, u, v);
 }
 
-// Строго подрезает и зажимает любой внутренний блок/декор по ТОЧНЫМ координатам краев каркаса,
-// не смещая блоки на чужую сетку и не оставляя щелей!
 static bool clipSpecStrictlyToExactContour(
-    ContourAnalysis const& contour,
-    IslandBounds const& isl,
-    GeneratedObjectSpec& spec
+    ContourAnalysis const& /*contour*/,
+    IslandBounds const& /*isl*/,
+    GeneratedObjectSpec& /*spec*/
 ) {
-    if (!contour.hasAnySelection || contour.exactBoxes.empty()) return true;
-
-    float minX = isl.exactMinX;
-    float maxX = isl.exactMaxX;
-    float minY = isl.exactMinY;
-    float maxY = isl.exactMaxY;
-    if (!getExactFrameSpanAtWorldPoint(contour, spec.x, spec.y, minX, maxX, minY, maxY)) {
-        return false;
-    }
-
-    float availW = maxX - minX;
-    float availH = maxY - minY;
-    if (availW <= 0.4f || availH <= 0.4f) return false;
-
-    float rad = std::fabs(spec.rotation) * (3.14159265f / 180.0f);
-    float cosA = std::fabs(std::cos(rad));
-    float sinA = std::fabs(std::sin(rad));
-
-    float halfW = std::fabs(spec.scaleX) * 15.0f;
-    float halfH = std::fabs(spec.scaleY) * 15.0f;
-    float extX = halfW * cosA + halfH * sinA;
-    float extY = halfW * sinA + halfH * cosA;
-
-    float maxHalfSpanX = availW * 0.50f;
-    float maxHalfSpanY = availH * 0.50f;
-    if (sinA < 0.05f) {
-        if (halfW > maxHalfSpanX) {
-            halfW = maxHalfSpanX;
-            spec.scaleX = halfW / 15.0f;
-        }
-        if (halfH > maxHalfSpanY) {
-            halfH = maxHalfSpanY;
-            spec.scaleY = halfH / 15.0f;
-        }
-    } else if (cosA < 0.05f) {
-        if (halfH > maxHalfSpanX) {
-            halfH = maxHalfSpanX;
-            spec.scaleY = halfH / 15.0f;
-        }
-        if (halfW > maxHalfSpanY) {
-            halfW = maxHalfSpanY;
-            spec.scaleX = halfW / 15.0f;
-        }
-    } else {
-        float shrink = 1.0f;
-        if (extX > maxHalfSpanX && extX > 0.001f) shrink = (std::min)(shrink, maxHalfSpanX / extX);
-        if (extY > maxHalfSpanY && extY > 0.001f) shrink = (std::min)(shrink, maxHalfSpanY / extY);
-        if (shrink < 1.0f) {
-            spec.scaleX *= shrink;
-            spec.scaleY *= shrink;
-            halfW *= shrink;
-            halfH *= shrink;
-        }
-    }
-
-    extX = halfW * cosA + halfH * sinA;
-    extY = halfW * sinA + halfH * cosA;
-
-    spec.x = std::clamp(spec.x, minX + extX, maxX - extX);
-    spec.y = std::clamp(spec.y, minY + extY, maxY - extY);
-
-    return (spec.scaleX >= 0.002f && spec.scaleY >= 0.002f);
+    return true;
 }
 
 // ============================================================================
@@ -3980,8 +3830,8 @@ static ContourAnalysis analyzeSelectedContour(EditorUIType* ui) {
                 // В GD стандартный блок имеет центр (pos.x, pos.y) и точные края [pos.x - 15*sx, pos.x + 15*sx].
                 // Чтобы блоки, сдвинутые на полблока (например pos.x = 120.0), не прыгали на соседнюю клетку,
                 // вычисляем индекс клетки через std::lround((pos.x - 15.0f) / 30.0f)!
-                int gx = static_cast<int>(std::lround((pos.x - 15.0f) / 30.0f));
-                int gy = static_cast<int>(std::lround((pos.y - 15.0f) / 30.0f));
+                int gx = static_cast<int>(std::floor(pos.x / 30.0f));
+                int gy = static_cast<int>(std::floor(pos.y / 30.0f));
                 info.rawCells.insert({ gx, gy });
                 info.occupiedCells.insert({ gx, gy });
                 info.solidObjects.push_back(obj);
@@ -4028,8 +3878,8 @@ static ContourAnalysis analyzeSelectedContour(EditorUIType* ui) {
         std::set<std::pair<int, int>> explicitSlopes;
         for (GameObject* obj : info.solidObjects) {
             if (isSlopeGameObject(obj)) {
-                int sgx = static_cast<int>(std::lround((obj->getPosition().x - 15.0f) / 30.0f));
-                int sgy = static_cast<int>(std::lround((obj->getPosition().y - 15.0f) / 30.0f));
+                int sgx = static_cast<int>(std::floor(obj->getPosition().x / 30.0f));
+                int sgy = static_cast<int>(std::floor(obj->getPosition().y / 30.0f));
                 explicitSlopes.insert({ sgx, sgy });
             }
         }
@@ -4085,9 +3935,9 @@ static ContourAnalysis analyzeSelectedContour(EditorUIType* ui) {
     };
 
     for (auto const& [gx, gy] : info.occupiedCells) expandBounds(gx, gy);
-    for (auto const& sp : info.spikes) expandBounds(static_cast<int>(std::lround((sp.x - 15.0f) / 30.0f)), static_cast<int>(std::lround((sp.y - 15.0f) / 30.0f)));
+    for (auto const& sp : info.spikes) expandBounds(static_cast<int>(std::floor(sp.x / 30.0f)), static_cast<int>(std::floor(sp.y / 30.0f)));
     if (info.occupiedCells.empty() && info.spikes.empty()) {
-        for (auto const& op : info.orbsAndPortals) expandBounds(static_cast<int>(std::lround((op.x - 15.0f) / 30.0f)), static_cast<int>(std::lround((op.y - 15.0f) / 30.0f)));
+        for (auto const& op : info.orbsAndPortals) expandBounds(static_cast<int>(std::floor(op.x / 30.0f)), static_cast<int>(std::floor(op.y / 30.0f)));
     }
 
     if (info.exactBoxes.empty()) {
@@ -4338,10 +4188,10 @@ static void appendDynamicHighResAITextureCanvas(
     int styleSeed
 ) {
     resN = std::clamp(resN, 16, 128);
-    float islOriginX = (isl.exactMaxX > isl.exactMinX + 0.5f) ? isl.exactMinX : (isl.minGX * 30.0f);
-    float islOriginY = (isl.exactMaxY > isl.exactMinY + 0.5f) ? isl.exactMinY : (isl.minGY * 30.0f);
-    float islSpanW   = (isl.exactMaxX > isl.exactMinX + 0.5f) ? (isl.exactMaxX - isl.exactMinX) : ((std::max)(1, isl.maxGX - isl.minGX + 1) * 30.0f);
-    float islSpanH   = (isl.exactMaxY > isl.exactMinY + 0.5f) ? (isl.exactMaxY - isl.exactMinY) : ((std::max)(1, isl.maxGY - isl.minGY + 1) * 30.0f);
+    float islOriginX = isl.minGX * 30.0f;
+    float islOriginY = isl.minGY * 30.0f;
+    float islSpanW   = (std::max)(1, isl.maxGX - isl.minGX + 1) * 30.0f;
+    float islSpanH   = (std::max)(1, isl.maxGY - isl.minGY + 1) * 30.0f;
 
     int gridW = resN;
     int gridH = resN;
@@ -4890,6 +4740,7 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         return result;
     }
 
+    bool effectiveOverhang = allowOverhang || ai.allowOverhangByAI;
     auto islands = splitIntoIslands(contour.occupiedCells, &contour.exactBoxes);
 
     if (ai.taskMode == AITaskMode::Only3D) {
@@ -4932,7 +4783,7 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                 bool bottomOpen = (contour.occupiedCells.count({ gx, gy - 1 }) == 0);
                 bool leftOpen   = (contour.occupiedCells.count({ gx - 1, gy }) == 0);
                 bool rightOpen  = (contour.occupiedCells.count({ gx + 1, gy }) == 0);
-                appendOneSidedEdgeNeon(result, cx, cy, topOpen, bottomOpen, leftOpen, rightOpen, allowOverhang, ai.glowRGB);
+                appendOneSidedEdgeNeon(result, cx, cy, topOpen, bottomOpen, leftOpen, rightOpen, effectiveOverhang, ai.glowRGB);
             }
         }
         return result;
@@ -4959,10 +4810,10 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
     for (auto const& isl : islands) {
         int islCols = isl.maxGX - isl.minGX + 1;
         int islRows = isl.maxGY - isl.minGY + 1;
-        float islOriginX = (isl.exactMaxX > isl.exactMinX + 0.5f) ? isl.exactMinX : (isl.minGX * 30.f);
-        float islOriginY = (isl.exactMaxY > isl.exactMinY + 0.5f) ? isl.exactMinY : (isl.minGY * 30.f);
-        float islSpanW   = (isl.exactMaxX > isl.exactMinX + 0.5f) ? (isl.exactMaxX - isl.exactMinX) : (static_cast<float>((std::max)(1, islCols)) * 30.f);
-        float islSpanH   = (isl.exactMaxY > isl.exactMinY + 0.5f) ? (isl.exactMaxY - isl.exactMinY) : (static_cast<float>((std::max)(1, islRows)) * 30.f);
+        float islOriginX = isl.minGX * 30.f;
+        float islOriginY = isl.minGY * 30.f;
+        float islSpanW   = static_cast<float>((std::max)(1, islCols)) * 30.f;
+        float islSpanH   = static_cast<float>((std::max)(1, islRows)) * 30.f;
 
         auto addClippedSpec = [&](
             int objectId, float x, float y, float scaleX, float scaleY, float rotation,
@@ -5001,24 +4852,14 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         }
 
         for (auto const& [gx, gy] : isl.cells) {
-            // Определяем точные границы клетки (gx, gy) по реальным боксам каркаса (не вылезая за exactMin..exactMax!)
-            float cellLeft  = (std::max)(islOriginX, gx * 30.f);
-            float cellRight = (std::min)(islOriginX + islSpanW, (gx + 1) * 30.f);
-            float cellBot   = (std::max)(islOriginY, gy * 30.f);
-            float cellTop   = (std::min)(islOriginY + islSpanH, (gy + 1) * 30.f);
-            for (auto const& bx : contour.exactBoxes) {
-                if (bx.gx == gx && bx.gy == gy) {
-                    cellLeft  = bx.minX;
-                    cellRight = bx.maxX;
-                    cellBot   = bx.minY;
-                    cellTop   = bx.maxY;
-                    break;
-                }
-            }
-            float cellW = (std::max)(1.0f, cellRight - cellLeft);
-            float cellH = (std::max)(1.0f, cellTop - cellBot);
-            float cx = (cellLeft + cellRight) * 0.5f;
-            float cy = (cellBot + cellTop) * 0.5f;
+            float cellLeft  = gx * 30.f;
+            float cellRight = (gx + 1) * 30.f;
+            float cellBot   = gy * 30.f;
+            float cellTop   = (gy + 1) * 30.f;
+            float cellW = 30.f;
+            float cellH = 30.f;
+            float cx = gx * 30.f + 15.f;
+            float cy = gy * 30.f + 15.f;
 
             bool topOpen    = (contour.occupiedCells.count({ gx, gy + 1 }) == 0);
             bool bottomOpen = (contour.occupiedCells.count({ gx, gy - 1 }) == 0);
@@ -5122,7 +4963,7 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                     if (bottomOpen && gy > 0) addClippedSpec(211, cx, cellBot + 0.35f, cellW / 30.f, 0.022f, 0.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 10, 0, false, 175, 3, 3, ai.outlineRGB, glowBorder);
                 }
                 if (ai.wantNeon && slopeKind == CellSlopeKind::None) {
-                    appendOneSidedEdgeNeon(result, cx, cy, topOpen, bottomOpen, leftOpen, rightOpen, allowOverhang, ai.glowRGB);
+                    appendOneSidedEdgeNeon(result, cx, cy, topOpen, bottomOpen, leftOpen, rightOpen, effectiveOverhang, ai.glowRGB);
                 }
             }
         }
@@ -5130,7 +4971,7 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
         // 5. Прямая генерация свободных макро-элементов от самой нейросети (строго внутри точных краев каркаса, если не Overhang!)
         for (auto const& el : ai.customElements) {
             bool isIntentionalOverhang = (el.rx < 0.0f || el.rx > 1.0f || el.ry < 0.0f || el.ry > 1.0f);
-            if (isIntentionalOverhang && !allowOverhang) continue;
+            if (isIntentionalOverhang && !effectiveOverhang) continue;
 
             float worldX = islOriginX + el.rx * islSpanW;
             float worldY = islOriginY + el.ry * islSpanH;
@@ -5760,6 +5601,159 @@ static CCSprite* createCyrillicOrEnglishAgreeLabelSprite(bool isRussian, float t
 class AIDecorPopup;
 static AIDecorPopup* g_activePopup = nullptr;
 
+// Создает скругленный пузырь сообщения как в Telegram со стрелочкой-хвостиком (слева для ИИ, справа для игрока!)
+static CCSprite* createTelegramBubbleSprite(
+    float width,
+    float height,
+    float radius,
+    bool tailOnRight,
+    ccColor3B bgColor,
+    ccColor3B borderColor
+) {
+    int tailW = 8;
+    int texW = std::clamp(static_cast<int>(std::lround((width + tailW) * 2.0f)), 16, 1200);
+    int texH = std::clamp(static_cast<int>(std::lround(height * 2.0f)), 16, 800);
+    float radPx = std::clamp(radius * 2.0f, 3.0f, (std::min)(texW - tailW * 2, texH) * 0.45f);
+    float bodyW = static_cast<float>(texW - tailW * 2);
+    float bodyLeft = tailOnRight ? 0.0f : static_cast<float>(tailW * 2);
+    float bodyCenterX = bodyLeft + bodyW * 0.5f;
+    float halfH = texH * 0.5f;
+    float innerW = bodyW * 0.5f - radPx;
+    float innerH = halfH - radPx;
+
+    std::vector<uint8_t> rgba(static_cast<size_t>(texW * texH * 4), 0);
+
+    for (int py = 0; py < texH; ++py) {
+        float y = py + 0.5f;
+        float dy = std::fabs(y - halfH) - innerH;
+        float distFromBottom = static_cast<float>(texH - 1 - py);
+
+        for (int px = 0; px < texW; ++px) {
+            float x = px + 0.5f;
+            float dx = std::fabs(x - bodyCenterX) - innerW;
+            float rectDist = (dx > 0.f && dy > 0.f) ? (std::sqrt(dx * dx + dy * dy) - radPx) : ((std::max)(dx, dy) - radPx);
+
+            float tailDist = 999.0f;
+            if (distFromBottom >= 0.0f && distFromBottom <= 14.0f) {
+                float t = distFromBottom / 14.0f;
+                float tipExtend = (1.0f - t) * (1.0f - t) * 11.0f;
+                if (tailOnRight) {
+                    float rightEdge = bodyLeft + bodyW + tipExtend;
+                    if (x >= bodyLeft + bodyW - 10.0f && x <= rightEdge + 1.0f) {
+                        tailDist = x - rightEdge;
+                    }
+                } else {
+                    float leftEdge = bodyLeft - tipExtend;
+                    if (x <= bodyLeft + 10.0f && x >= leftEdge - 1.0f) {
+                        tailDist = leftEdge - x;
+                    }
+                }
+            }
+
+            float dist = (std::min)(rectDist, tailDist);
+            if (dist >= 1.0f) continue;
+
+            float cov = std::clamp(0.5f - dist / 1.5f, 0.f, 1.f);
+            bool isBorder = (dist > -2.0f);
+            ccColor3B c = isBorder ? borderColor : bgColor;
+            uint8_t a8 = static_cast<uint8_t>(std::lround(cov * 255.f));
+            if (a8 == 0) continue;
+
+            size_t idx = static_cast<size_t>((py * texW + px) * 4);
+            rgba[idx + 0] = c.r;
+            rgba[idx + 1] = c.g;
+            rgba[idx + 2] = c.b;
+            rgba[idx + 3] = a8;
+        }
+    }
+
+    auto* tex = new CCTexture2D();
+    if (tex && tex->initWithData(rgba.data(), kCCTexture2DPixelFormat_RGBA8888, texW, texH, CCSize{ static_cast<float>(texW), static_cast<float>(texH) })) {
+        tex->autorelease();
+        if (auto* spr = CCSprite::createWithTexture(tex)) {
+            CCSize cs = spr->getContentSize();
+            spr->setScaleX((width + tailW) / (cs.width > 0.01f ? cs.width : static_cast<float>(texW)));
+            spr->setScaleY(height / (cs.height > 0.01f ? cs.height : static_cast<float>(texH)));
+            return spr;
+        }
+    } else {
+        CC_SAFE_DELETE(tex);
+    }
+    return CCSprite::create();
+}
+
+// Скругленная полая рамка (тонкие полоски области выделения, которые переливаются во время генерации)
+static CCSprite* createSmoothHollowRoundedBorder(float width, float height, float radius, float thickness, ccColor4F color) {
+    int texW = std::clamp(static_cast<int>(std::lround(width * 2.0f)), 16, 1200);
+    int texH = std::clamp(static_cast<int>(std::lround(height * 2.0f)), 16, 800);
+    float radPx = std::clamp(radius * 2.0f, 2.0f, (std::min)(texW, texH) * 0.5f);
+    float thickPx = std::clamp(thickness * 2.0f, 1.5f, 24.0f);
+
+    std::vector<uint8_t> rgba(static_cast<size_t>(texW * texH * 4), 0);
+    float halfW = texW * 0.5f;
+    float halfH = texH * 0.5f;
+    float innerW = halfW - radPx;
+    float innerH = halfH - radPx;
+
+    uint8_t r8 = static_cast<uint8_t>(std::lround(std::clamp(color.r, 0.f, 1.f) * 255.f));
+    uint8_t g8 = static_cast<uint8_t>(std::lround(std::clamp(color.g, 0.f, 1.f) * 255.f));
+    uint8_t b8 = static_cast<uint8_t>(std::lround(std::clamp(color.b, 0.f, 1.f) * 255.f));
+
+    for (int py = 0; py < texH; ++py) {
+        float dy = std::fabs((py + 0.5f) - halfH) - innerH;
+        for (int px = 0; px < texW; ++px) {
+            float dx = std::fabs((px + 0.5f) - halfW) - innerW;
+            float dist = (dx > 0.f && dy > 0.f) ? (std::sqrt(dx * dx + dy * dy) - radPx) : ((std::max)(dx, dy) - radPx);
+            if (dist >= 0.8f || dist <= -thickPx - 0.8f) continue;
+
+            float outerCov = std::clamp(0.5f - dist / 1.5f, 0.f, 1.f);
+            float innerCov = std::clamp((dist + thickPx) / 1.5f + 0.5f, 0.f, 1.f);
+            float cov = (std::min)(outerCov, innerCov);
+            uint8_t a8 = static_cast<uint8_t>(std::lround(color.a * cov * 255.f));
+            if (a8 == 0) continue;
+
+            size_t idx = static_cast<size_t>((py * texW + px) * 4);
+            rgba[idx + 0] = r8;
+            rgba[idx + 1] = g8;
+            rgba[idx + 2] = b8;
+            rgba[idx + 3] = a8;
+        }
+    }
+
+    auto* tex = new CCTexture2D();
+    if (tex && tex->initWithData(rgba.data(), kCCTexture2DPixelFormat_RGBA8888, texW, texH, CCSize{ static_cast<float>(texW), static_cast<float>(texH) })) {
+        tex->autorelease();
+        if (auto* spr = CCSprite::createWithTexture(tex)) {
+            CCSize cs = spr->getContentSize();
+            spr->setScaleX(width / (cs.width > 0.01f ? cs.width : static_cast<float>(texW)));
+            spr->setScaleY(height / (cs.height > 0.01f ? cs.height : static_cast<float>(texH)));
+            return spr;
+        }
+    } else {
+        CC_SAFE_DELETE(tex);
+    }
+    return CCSprite::create();
+}
+
+// Рекурсивное плавное изменение прозрачности всего меню
+static void applyRecursiveNodeOpacity(CCNode* node, GLubyte alpha) {
+    if (!node) return;
+    if (auto* spr = typeinfo_cast<CCSprite*>(node)) {
+        spr->setOpacity(alpha);
+    } else if (auto* lc = typeinfo_cast<CCLayerColor*>(node)) {
+        lc->setOpacity(alpha);
+    } else if (auto* lbl = typeinfo_cast<CCLabelBMFont*>(node)) {
+        lbl->setOpacity(alpha);
+    }
+    if (auto* children = node->getChildren()) {
+        for (unsigned int i = 0; i < children->count(); ++i) {
+            if (auto* child = typeinfo_cast<CCNode*>(children->objectAtIndex(i))) {
+                applyRecursiveNodeOpacity(child, alpha);
+            }
+        }
+    }
+}
+
 class AIDecorPopup : public geode::Popup {
 protected:
     EditorUI* m_editorUI = nullptr;
@@ -5769,16 +5763,20 @@ protected:
     bool m_russianLayout = true;
     int m_providerIdx = 0;
     int m_activeApiField = 0; // 0 = API Key, 1 = Base URL, 2 = Endpoint, 3 = Model Name
-    int m_previewTab = 0;     // 0 = Shape, 1 = Drawing, 2 = In GD (предпросмотр без мгновенного спавна!)
+    int m_previewTab = 0;     // 0 = Shape, 1 = Drawing, 2 = In GD
     std::string m_inputBuffer;
-    CCLayerColor* m_apiFieldBg[4]{ nullptr, nullptr, nullptr, nullptr };
+    CCSprite* m_apiFieldBg[4]{ nullptr, nullptr, nullptr, nullptr };
     CCLabelBMFont* m_apiFieldLbl[4]{ nullptr, nullptr, nullptr, nullptr };
     bool m_prevKeyStates[256]{};
+
+    // Плавное открытие и закрытие меню изменением прозрачности
+    float m_fadeAlpha = 0.0f;
+    bool m_isClosingFade = false;
 
     CCLabelBMFont* m_inputDisplayLabel = nullptr;
     CCLabelBMFont* m_langBadgeLabel = nullptr;
     CCLabelBMFont* m_apiGateStatusLabel = nullptr;
-    CCLayerColor* m_checkBoxBg = nullptr;
+    CCSprite* m_checkBoxBg = nullptr;
     CCNode* m_checkTickContainer = nullptr;
 
     // Элементы окна динамического выбора текстовых/кодовых моделей (Choose Model)
@@ -5786,26 +5784,41 @@ protected:
     CCLabelBMFont* m_modelSelectorPageLbl = nullptr;
     CCNode* m_modelRowsContainer = nullptr;
 
-    // Прокручиваемый ИИ-чат и кнопка подтверждения ("✓ Согласен" / "✓ Agree") внутри чата
+    // Прокручиваемый ИИ-чат с ползунком (вместо стрелочек) и кнопкой подтверждения
     geode::ScrollLayer* m_chatScrollLayer = nullptr;
+    CCSprite* m_chatScrollbarTrack = nullptr;
+    CCSprite* m_chatScrollbarThumb = nullptr;
+    float m_chatScrollTrackTopY = 0.f;
+    float m_chatScrollTrackBotY = 0.f;
+    float m_chatScrollTrackX = 0.f;
     CCMenuItemSpriteExtra* m_chatConfirmAgreeBtn = nullptr;
+
+    // Кнопка отправки / остановки генерации (стрелочка '>' <-> квадратик стоп)
+    CCLabelBMFont* m_sendArrowLbl = nullptr;
+    CCSprite* m_stopSquareIcon = nullptr;
+
+    // 3 плавно прыгающие вверх-вниз точки ожидания в чате
+    CCSprite* m_thinkingDots[3]{ nullptr, nullptr, nullptr };
+    float m_thinkingDotsBaseY = 0.f;
+    float m_thinkingDotsAnimTime = 0.f;
+
     CCLabelBMFont* m_stepPlanLabel = nullptr;
     CCLabelBMFont* m_stepDrawingLabel = nullptr;
     CCLabelBMFont* m_stepPlaceLabel = nullptr;
 
-    // Правая панель Art Agent (Shape | Drawing | In GD) + Shimmer-анимация загрузки на области выделения
-    CCLayerColor* m_tabShapeBg = nullptr;
-    CCLayerColor* m_tabDrawingBg = nullptr;
-    CCLayerColor* m_tabInGDBg = nullptr;
+    // Правая панель Art Agent (скругленные вкладки Shape | Drawing | In GD) + переливающиеся тонкие полоски выделения
+    CCSprite* m_tabShapeBg = nullptr;
+    CCSprite* m_tabDrawingBg = nullptr;
+    CCSprite* m_tabInGDBg = nullptr;
     CCMenuItemSpriteExtra* m_shapeFillToggleBtn = nullptr;
     CCLabelBMFont* m_shapeFillToggleLbl = nullptr;
-    CCSprite* m_selectionShimmerOverlay = nullptr;
-    CCSprite* m_selectionShimmerBand = nullptr;
+    CCSprite* m_selectionBorderNormal = nullptr;
+    CCSprite* m_selectionBorderShimmer = nullptr;
     CCPoint m_selectionBoxCenter{ 0.f, 0.f };
     CCNode* m_previewCanvasContent = nullptr;
     CCLabelBMFont* m_previewSubInfoLabel = nullptr;
-    CCLayerColor* m_insideTabBg = nullptr;
-    CCLayerColor* m_overhangTabBg = nullptr;
+    CCSprite* m_insideTabBg = nullptr;
+    CCSprite* m_overhangTabBg = nullptr;
 
     bool init(EditorUI* ui, ContourAnalysis contour, PopupStage requestedStage, PopupStage prevStage) {
         if (!Popup::init(500.f, 294.f)) return false;
@@ -5814,6 +5827,8 @@ protected:
         m_editorUI = ui;
         m_contour = std::move(contour);
         m_returnStageAfterModel = prevStage;
+        m_fadeAlpha = 0.0f;
+        m_isClosingFade = false;
 
         loadAndVerifySavedApiFromDisk();
         m_providerIdx = g_apiProviderIndex;
@@ -5902,12 +5917,14 @@ protected:
 #endif
         }
 
+        // Начинаем с нулевой прозрачности для плавного появления (fade-in)
+        applyRecursiveNodeOpacity(m_mainLayer, 0);
         this->schedule(schedule_selector(AIDecorPopup::updateKeyboardAndLock), 0.0f);
         return true;
     }
 
     void createCheckmarkBadge(CCPoint pos, bool checked) {
-        m_checkBoxBg = createSolidPanel(20.f, 20.f, checked ? ccColor3B{ 42, 205, 95 } : ccColor3B{ 58, 62, 72 }, 255);
+        m_checkBoxBg = createSmoothRoundedRect(20.f, 20.f, 7.f, toColor4F(checked ? ccColor3B{ 42, 205, 95 } : ccColor3B{ 58, 62, 72 }, 255));
         m_checkBoxBg->setPosition(pos);
         m_mainLayer->addChild(m_checkBoxBg);
 
@@ -5915,12 +5932,12 @@ protected:
         m_checkTickContainer->setPosition(pos);
         m_mainLayer->addChild(m_checkTickContainer);
 
-        auto* shortLeg = createSolidPanel(3.4f, 7.8f, ccColor3B{ 255, 255, 255 }, 255);
+        auto* shortLeg = createSmoothRoundedRect(3.4f, 7.8f, 1.5f, toColor4F(ccColor3B{ 255, 255, 255 }, 255));
         shortLeg->setRotation(-40.f);
         shortLeg->setPosition(CCPoint{ -2.8f, -1.4f });
         m_checkTickContainer->addChild(shortLeg);
 
-        auto* longLeg = createSolidPanel(3.4f, 12.8f, ccColor3B{ 255, 255, 255 }, 255);
+        auto* longLeg = createSmoothRoundedRect(3.4f, 12.8f, 1.5f, toColor4F(ccColor3B{ 255, 255, 255 }, 255));
         longLeg->setRotation(38.f);
         longLeg->setPosition(CCPoint{ 2.4f, 1.0f });
         m_checkTickContainer->addChild(longLeg);
@@ -5947,7 +5964,7 @@ protected:
     }
 
     // ========================================================================
-    // ЭКРАН 1: СТРОГАЯ ПРОВЕРКА ДОСТОВЕРНОСТИ API-КЛЮЧА
+    // ЭКРАН 1: СТРОГАЯ ПРОВЕРКА ДОСТОВЕРНОСТИ API-КЛЮЧА (СКРУГЛЕННЫЙ UI)
     // ========================================================================
     std::string getApiFieldValue(int fieldIdx) const {
         switch (fieldIdx) {
@@ -6016,7 +6033,7 @@ protected:
             m_buttonMenu->addChild(backBtn);
         }
 
-        auto* cardBg = createSmoothRoundedRect(448.f, 130.f, 14.f, toColor4F(ccColor3B{ 22, 16, 20 }, 240));
+        auto* cardBg = createSmoothRoundedRect(448.f, 130.f, 16.f, toColor4F(ccColor3B{ 22, 16, 20 }, 240));
         cardBg->setPosition(CCPoint{ center.x, center.y + 26.f });
         m_mainLayer->addChild(cardBg);
 
@@ -6032,18 +6049,25 @@ protected:
         m_mainLayer->addChild(m_apiGateStatusLabel);
 
         auto createFieldBox = [&](int idx, CCPoint pos, SEL_MenuHandler cb) {
-            m_apiFieldBg[idx] = createSolidPanel(208.f, 26.f, ccColor3B{ 36, 26, 32 }, 255);
-            auto* border = createSolidPanel(210.f, 28.f, ccColor3B{ 88, 52, 64 }, 255);
+            auto* container = CCNode::create();
+            container->setContentSize(CCSize{ 208.f, 26.f });
+            container->ignoreAnchorPointForPosition(false);
+            container->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
+
+            auto* border = createSmoothRoundedRect(210.f, 28.f, 12.f, toColor4F(ccColor3B{ 88, 52, 64 }, 255));
             border->setPosition(CCPoint{ 104.f, 13.f });
-            border->setZOrder(-1);
-            m_apiFieldBg[idx]->addChild(border);
+            container->addChild(border);
+
+            m_apiFieldBg[idx] = createSmoothRoundedRect(208.f, 26.f, 11.f, toColor4F(ccColor3B{ 36, 26, 32 }, 255));
+            m_apiFieldBg[idx]->setPosition(CCPoint{ 104.f, 13.f });
+            container->addChild(m_apiFieldBg[idx]);
 
             m_apiFieldLbl[idx] = CCLabelBMFont::create("", "chatFont.fnt");
             m_apiFieldLbl[idx]->setScale(0.42f);
             m_apiFieldLbl[idx]->setPosition(CCPoint{ 104.f, 13.f });
-            m_apiFieldBg[idx]->addChild(m_apiFieldLbl[idx]);
+            container->addChild(m_apiFieldLbl[idx]);
 
-            auto* btn = CCMenuItemSpriteExtra::create(m_apiFieldBg[idx], this, cb);
+            auto* btn = CCMenuItemSpriteExtra::create(container, this, cb);
             btn->setPosition(pos);
             m_buttonMenu->addChild(btn);
         };
@@ -6053,7 +6077,6 @@ protected:
         createFieldBox(2, CCPoint{ center.x - 108.f, center.y + 6.f },  menu_selector(AIDecorPopup::onSelectApiField2));
         createFieldBox(3, CCPoint{ center.x + 108.f, center.y + 6.f },  menu_selector(AIDecorPopup::onSelectApiField3));
 
-        // Скругленная кнопка открытия списка моделей (Choose Model)
         auto* presetListBtn = createSmoothRoundedButton(
             188.f, 20.f, 10.f, ccColor3B{ 44, 28, 38 }, ccColor3B{ 112, 52, 68 },
             "Choose Model from List...", 0.38f, ccColor3B{ 245, 225, 235 },
@@ -6062,7 +6085,6 @@ protected:
         presetListBtn->setPosition(CCPoint{ center.x, center.y - 22.f });
         m_buttonMenu->addChild(presetListBtn);
 
-        // Округленная строка ввода БЕЗ синей обводки
         auto* inputBorder = createSmoothRoundedRect(446.f, 36.f, 18.f, toColor4F(ccColor3B{ 68, 32, 42 }, 255));
         inputBorder->setPosition(CCPoint{ center.x, center.y - 58.f });
         m_mainLayer->addChild(inputBorder);
@@ -6080,24 +6102,24 @@ protected:
         refreshInputLabel();
         refreshApiGateFieldsUI();
 
-        auto* pasteBtn = createSolidButton(
-            130.f, 30.f, ccColor3B{ 42, 34, 40 },
+        auto* pasteBtn = createSmoothRoundedButton(
+            130.f, 30.f, 14.f, ccColor3B{ 42, 34, 40 }, ccColor3B{ 88, 52, 64 },
             "Paste (Ctrl+V)", 0.50f, ccColor3B{ 240, 245, 255 },
             this, menu_selector(AIDecorPopup::onPasteApiClicked)
         );
         pasteBtn->setPosition(CCPoint{ center.x - 155.f, center.y - 104.f });
         m_buttonMenu->addChild(pasteBtn);
 
-        auto* clearBtn = createSolidButton(
-            90.f, 30.f, ccColor3B{ 42, 34, 40 },
+        auto* clearBtn = createSmoothRoundedButton(
+            90.f, 30.f, 14.f, ccColor3B{ 42, 34, 40 }, ccColor3B{ 88, 52, 64 },
             "Clear", 0.50f, ccColor3B{ 240, 245, 255 },
             this, menu_selector(AIDecorPopup::onClearApiClicked)
         );
         clearBtn->setPosition(CCPoint{ center.x - 35.f, center.y - 104.f });
         m_buttonMenu->addChild(clearBtn);
 
-        auto* verifyBtn = createSolidButton(
-            195.f, 30.f, ccColor3B{ 212, 46, 78 },
+        auto* verifyBtn = createSmoothRoundedButton(
+            195.f, 30.f, 14.f, ccColor3B{ 212, 46, 78 }, ccColor3B{ 245, 82, 112 },
             "Save & Connect API", 0.52f, ccColor3B{ 255, 255, 255 },
             this, menu_selector(AIDecorPopup::onVerifyAndConnectApi)
         );
@@ -6107,7 +6129,6 @@ protected:
 
     // ========================================================================
     // ЭКРАН 2: ДИНАМИЧЕСКИЙ ВЫБОР ТЕКСТОВОЙ/КОДОВОЙ МОДЕЛИ ПО API (Choose Model)
-    // Исключает все модели генерации картинок и видео (Imagen, Veo, DALL-E, Sora и др.)
     // ========================================================================
     std::vector<DiscoveredTextModel> getActiveFilteredModelList() const {
         std::lock_guard<std::mutex> lk(g_discoveredModelsMutex);
@@ -6121,7 +6142,6 @@ protected:
         if (!m_modelRowsContainer) return;
         m_modelRowsContainer->removeAllChildrenWithCleanup(true);
 
-        // Удаляем старые динамические кнопки выбора моделей из m_buttonMenu (теги 7100..7103)
         for (int slot = 0; slot < 4; ++slot) {
             if (auto* oldItem = m_buttonMenu->getChildByTag(7100 + slot)) {
                 oldItem->removeFromParentAndCleanup(true);
@@ -6173,11 +6193,11 @@ protected:
             rowContainer->ignoreAnchorPointForPosition(false);
             rowContainer->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
 
-            auto* rowBorder = createSmoothRoundedRect(406.f, 38.f, 12.f, toColor4F(borderCol, 255));
+            auto* rowBorder = createSmoothRoundedRect(406.f, 38.f, 14.f, toColor4F(borderCol, 255));
             rowBorder->setPosition(CCPoint{ 202.f, 18.f });
             rowContainer->addChild(rowBorder);
 
-            auto* rowBg = createSmoothRoundedRect(404.f, 36.f, 11.f, toColor4F(cardColor, 255));
+            auto* rowBg = createSmoothRoundedRect(404.f, 36.f, 13.f, toColor4F(cardColor, 255));
             rowBg->setPosition(CCPoint{ 202.f, 18.f });
             rowContainer->addChild(rowBg);
 
@@ -6242,9 +6262,8 @@ protected:
         m_modelSelectorPageLbl->setPosition(CCPoint{ center.x - 82.f, center.y + 82.f });
         m_mainLayer->addChild(m_modelSelectorPageLbl);
 
-        // Кнопки прокрутки списка моделей вверх [^] и вниз [v]
         auto* upBtn = createSmoothRoundedButton(
-            24.f, 36.f, 10.f, ccColor3B{ 44, 28, 36 }, ccColor3B{ 98, 48, 62 },
+            24.f, 36.f, 12.f, ccColor3B{ 44, 28, 36 }, ccColor3B{ 98, 48, 62 },
             "^", 0.55f, ccColor3B{ 245, 248, 255 },
             this, menu_selector(AIDecorPopup::onScrollModelListUp)
         );
@@ -6252,7 +6271,7 @@ protected:
         m_buttonMenu->addChild(upBtn);
 
         auto* downBtn = createSmoothRoundedButton(
-            24.f, 36.f, 10.f, ccColor3B{ 44, 28, 36 }, ccColor3B{ 98, 48, 62 },
+            24.f, 36.f, 12.f, ccColor3B{ 44, 28, 36 }, ccColor3B{ 98, 48, 62 },
             "v", 0.50f, ccColor3B{ 245, 248, 255 },
             this, menu_selector(AIDecorPopup::onScrollModelListDown)
         );
@@ -6262,7 +6281,6 @@ protected:
         m_modelRowsContainer = CCNode::create();
         m_mainLayer->addChild(m_modelRowsContainer);
 
-        // Запускаем фоновый запрос к API за всеми доступными для ключа текстовыми/кодовыми моделями
         startAsyncFetchAvailableModels(false);
         rebuildModelSelectorRows();
     }
@@ -6287,8 +6305,41 @@ protected:
     }
 
     // ========================================================================
-    // ЭКРАН 3: ГЛАВНЫЙ ИНТЕРФЕЙС "ART AGENT" С ПРОКРУЧИВАЕМЫМ ИИ-ЧАТОМ
+    // ЭКРАН 3: ГЛАВНЫЙ ИНТЕРФЕЙС "ART AGENT" (ПОЛНОСТЬЮ СКРУГЛЕННЫЙ UI + ПОЛЗУНОК ЧАТА + TELEGRAM-СООБЩЕНИЯ)
     // ========================================================================
+    void refreshSendStopButtonVisual() {
+        bool isGen = (g_aiRequestThreadRunning || g_autoRetryTimerActive);
+        if (m_sendArrowLbl) {
+            m_sendArrowLbl->setVisible(!isGen);
+        }
+        if (m_stopSquareIcon) {
+            m_stopSquareIcon->setVisible(isGen);
+        }
+    }
+
+    void updateChatScrollbarThumb() {
+        if (!m_chatScrollLayer || !m_chatScrollLayer->m_contentLayer || !m_chatScrollbarThumb) return;
+
+        float viewH = m_chatScrollLayer->getContentSize().height;
+        float contentH = (std::max)(viewH, m_chatScrollLayer->m_contentLayer->getContentSize().height);
+        float trackH = (std::max)(20.f, m_chatScrollTrackTopY - m_chatScrollTrackBotY);
+
+        float ratio = std::clamp(viewH / contentH, 0.16f, 1.0f);
+        float thumbH = (std::max)(18.f, trackH * ratio);
+
+        float scrollable = (std::max)(1.0f, contentH - viewH);
+        float curY = m_chatScrollLayer->m_contentLayer->getPosition().y;
+        // В geode::ScrollLayer y=0 это низ, y=-(contentH-viewH) это верх
+        float scrollFrac = std::clamp(-curY / scrollable, 0.0f, 1.0f);
+        if (contentH <= viewH + 1.0f) scrollFrac = 0.0f;
+
+        float thumbCenterY = (m_chatScrollTrackBotY + thumbH * 0.5f) + scrollFrac * (trackH - thumbH);
+        m_chatScrollbarThumb->setPosition(CCPoint{ m_chatScrollTrackX, thumbCenterY });
+        CCSize cs = m_chatScrollbarThumb->getContentSize();
+        float curH = (cs.height > 0.01f) ? cs.height : 20.f;
+        m_chatScrollbarThumb->setScaleY(thumbH / curH);
+    }
+
     void refreshChatAgreeButtonState() {
         if (!m_buttonMenu) return;
         if (m_chatConfirmAgreeBtn) {
@@ -6332,7 +6383,7 @@ protected:
         m_chatConfirmAgreeBtn = CCMenuItemSpriteExtra::create(
             btnNode, this, menu_selector(AIDecorPopup::onConfirmAgreeInChat)
         );
-        m_chatConfirmAgreeBtn->setPosition(CCPoint{ leftX - 10.f, center.y - 42.f });
+        m_chatConfirmAgreeBtn->setPosition(CCPoint{ leftX, center.y - 42.f });
         m_buttonMenu->addChild(m_chatConfirmAgreeBtn);
     }
 
@@ -6345,7 +6396,7 @@ protected:
     void setupArtAgentMainUI(CCPoint center) {
         this->setTitle("");
 
-        // --- ВЕРХНЯЯ ПАНЕЛЬ ---
+        // --- ВЕРХНЯЯ ПАНЕЛЬ (ВСЯ СКРУГЛЕННАЯ) ---
         auto* headerTitle = CCLabelBMFont::create("Art Agent", "chatFont.fnt");
         headerTitle->setScale(0.58f);
         headerTitle->setColor(ccColor3B{ 245, 248, 255 });
@@ -6358,8 +6409,7 @@ protected:
 
         createCheckmarkBadge(CCPoint{ center.x - 223.f, center.y + 126.f }, true);
 
-        std::string apiTag = "API Config";
-        auto* apiTagLbl = CCLabelBMFont::create(apiTag.c_str(), "chatFont.fnt");
+        auto* apiTagLbl = CCLabelBMFont::create("API Config", "chatFont.fnt");
         apiTagLbl->setScale(0.44f);
         apiTagLbl->setColor(ccColor3B{ 230, 235, 245 });
         apiTagLbl->setPosition(CCPoint{ center.x - 184.f, center.y + 126.f });
@@ -6373,7 +6423,6 @@ protected:
         changeApiBtn->setPosition(CCPoint{ center.x - 140.f, center.y + 126.f });
         m_buttonMenu->addChild(changeApiBtn);
 
-        // СКРУГЛЕННАЯ кнопка/плашка отображения текущей выбранной модели (Choose Model)
         std::string shortMod = fmt::format("Model: {}", getCurrentModelID(m_providerIdx));
         if (shortMod.size() > 22) shortMod = shortMod.substr(0, 22);
         auto* modelBtn = createSmoothRoundedButton(
@@ -6400,7 +6449,6 @@ protected:
         langBtn->setPosition(CCPoint{ center.x + 186.f, center.y + 126.f });
         m_buttonMenu->addChild(langBtn);
 
-        // Разделители поверх градиента
         auto* topDivider = createSolidPanel(482.f, 1.2f, ccColor3B{ 88, 32, 40 }, 220);
         topDivider->setPosition(CCPoint{ center.x, center.y + 110.f });
         m_mainLayer->addChild(topDivider);
@@ -6410,42 +6458,40 @@ protected:
         m_mainLayer->addChild(midDivider);
 
         // ====================================================================
-        // ЛЕВАЯ КОЛОНКА: Прокручиваемый ИИ-чат + Статус + Единая круглая строка ввода с кнопкой отправки
+        // ЛЕВАЯ КОЛОНКА: РАСШИРЕННЫЙ ЧАТ С ПОЛЗУНКОМ (БЕЗ СТРЕЛОЧЕК) + КНОПКА СТОП/ОТПРАВКИ
         // ====================================================================
         float leftX = center.x - 125.f;
 
-        auto* chatBoxBorder = createSmoothRoundedRect(206.f, 160.f, 13.f, toColor4F(ccColor3B{ 68, 26, 34 }, 255));
-        chatBoxBorder->setPosition(CCPoint{ leftX - 10.f, center.y + 24.f });
+        // Чат расширен на всё освободившееся место (ширина 226 вместо 204!)
+        auto* chatBoxBorder = createSmoothRoundedRect(226.f, 160.f, 14.f, toColor4F(ccColor3B{ 68, 26, 34 }, 255));
+        chatBoxBorder->setPosition(CCPoint{ leftX, center.y + 24.f });
         m_mainLayer->addChild(chatBoxBorder);
 
-        auto* chatBoxBg = createSmoothRoundedRect(204.f, 158.f, 12.f, toColor4F(ccColor3B{ 16, 11, 15 }, 255));
-        chatBoxBg->setPosition(CCPoint{ leftX - 10.f, center.y + 24.f });
+        auto* chatBoxBg = createSmoothRoundedRect(224.f, 158.f, 13.f, toColor4F(ccColor3B{ 16, 11, 15 }, 255));
+        chatBoxBg->setPosition(CCPoint{ leftX, center.y + 24.f });
         m_mainLayer->addChild(chatBoxBg);
 
-        m_chatScrollLayer = geode::ScrollLayer::create(CCSize{ 196.f, 150.f }, true, true);
+        m_chatScrollLayer = geode::ScrollLayer::create(CCSize{ 208.f, 150.f }, true, true);
         m_chatScrollLayer->ignoreAnchorPointForPosition(false);
         m_chatScrollLayer->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
-        m_chatScrollLayer->setPosition(CCPoint{ leftX - 10.f, center.y + 24.f });
+        m_chatScrollLayer->setPosition(CCPoint{ leftX - 4.f, center.y + 24.f });
         m_mainLayer->addChild(m_chatScrollLayer);
 
-        auto* scrollUpBtn = createSolidButton(
-            18.f, 22.f, ccColor3B{ 44, 28, 34 },
-            "^", 0.52f, ccColor3B{ 245, 248, 255 },
-            this, menu_selector(AIDecorPopup::onScrollChatUp)
-        );
-        scrollUpBtn->setPosition(CCPoint{ leftX + 102.f, center.y + 84.f });
-        m_buttonMenu->addChild(scrollUpBtn);
+        // Ползунок (скроллбар) справа внутри чата вместо старых кнопок ^ / v
+        m_chatScrollTrackX = leftX + 104.f;
+        m_chatScrollTrackTopY = center.y + 94.f;
+        m_chatScrollTrackBotY = center.y - 46.f;
 
-        auto* scrollDownBtn = createSolidButton(
-            18.f, 22.f, ccColor3B{ 44, 28, 34 },
-            "v", 0.48f, ccColor3B{ 245, 248, 255 },
-            this, menu_selector(AIDecorPopup::onScrollChatDown)
-        );
-        scrollDownBtn->setPosition(CCPoint{ leftX + 102.f, center.y - 36.f });
-        m_buttonMenu->addChild(scrollDownBtn);
+        m_chatScrollbarTrack = createSmoothRoundedRect(5.f, 140.f, 2.5f, toColor4F(ccColor3B{ 38, 22, 28 }, 220));
+        m_chatScrollbarTrack->setPosition(CCPoint{ m_chatScrollTrackX, center.y + 24.f });
+        m_mainLayer->addChild(m_chatScrollbarTrack);
 
-        // Компактная полоска статуса шагов под чатом (Plan | Drawing | Place)
-        auto* statusBarBg = createSolidPanel(224.f, 20.f, ccColor3B{ 22, 14, 18 }, 220);
+        m_chatScrollbarThumb = createSmoothRoundedRect(5.f, 32.f, 2.5f, toColor4F(ccColor3B{ 215, 58, 88 }, 240));
+        m_chatScrollbarThumb->setPosition(CCPoint{ m_chatScrollTrackX, m_chatScrollTrackBotY + 16.f });
+        m_mainLayer->addChild(m_chatScrollbarThumb);
+
+        // Скругленная полоска статуса шагов под чатом
+        auto* statusBarBg = createSmoothRoundedRect(224.f, 20.f, 10.f, toColor4F(ccColor3B{ 22, 14, 18 }, 220));
         statusBarBg->setPosition(CCPoint{ leftX, center.y - 66.f });
         m_mainLayer->addChild(statusBarBg);
 
@@ -6468,8 +6514,8 @@ protected:
         m_mainLayer->addChild(m_stepPlaceLabel);
 
         auto addExampleChip = [&](const char* label, CCPoint pos, SEL_MenuHandler cb) {
-            auto* btn = createSolidButton(
-                52.f, 15.f, ccColor3B{ 36, 24, 30 },
+            auto* btn = createSmoothRoundedButton(
+                52.f, 16.f, 8.f, ccColor3B{ 36, 24, 30 }, ccColor3B{ 78, 36, 48 },
                 label, 0.34f, ccColor3B{ 230, 225, 235 },
                 this, cb
             );
@@ -6482,7 +6528,7 @@ protected:
         addExampleChip("New Style",   CCPoint{ leftX + 28.f, center.y - 88.f }, menu_selector(AIDecorPopup::onPresetUniqueNewStyle));
         addExampleChip("Build Ref",   CCPoint{ leftX + 84.f, center.y - 88.f }, menu_selector(AIDecorPopup::onPresetBuildFromRef));
 
-        // СТРОКА ВВОДА СООБЩЕНИЯ БЕЗ СИНЕЙ ОБВОДКИ + ВИЗУАЛЬНО ОБЪЕДИНЕННАЯ КРУГЛАЯ КНОПКА ОТПРАВКИ ВНУТРИ КАПСУЛЫ!
+        // Скругленная строка ввода без синей обводки + объединённая круглая кнопка отправки (или квадратик стоп!)
         auto* inputPillBorder = createSmoothRoundedRect(224.f, 30.f, 15.f, toColor4F(ccColor3B{ 64, 28, 38 }, 255));
         inputPillBorder->setPosition(CCPoint{ leftX, center.y - 116.f });
         m_mainLayer->addChild(inputPillBorder);
@@ -6497,85 +6543,113 @@ protected:
         m_mainLayer->addChild(m_inputDisplayLabel);
         refreshInputLabel();
 
-        // Круглая/капсульная кнопка отправки [>], визуально встроенная внутрь правой части строки ввода (чуть меньше по размеру: 22x22 внутри 28px капсулы!)
-        auto* sendBtn = createSmoothRoundedButton(
-            22.f, 22.f, 11.f, ccColor3B{ 215, 48, 80 }, ccColor3B{ 245, 82, 112 },
-            ">", 0.48f, ccColor3B{ 255, 255, 255 },
-            this, menu_selector(AIDecorPopup::onSendToNeuralNet)
-        );
+        // Круглая кнопка внутри строки ввода: ">" в покое и белый квадратик "■" (остановить) во время генерации
+        auto* sendContainer = CCNode::create();
+        sendContainer->setContentSize(CCSize{ 22.f, 22.f });
+        sendContainer->ignoreAnchorPointForPosition(false);
+        sendContainer->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
+
+        auto* sendBorder = createSmoothRoundedRect(24.f, 24.f, 12.f, toColor4F(ccColor3B{ 245, 82, 112 }, 255));
+        sendBorder->setPosition(CCPoint{ 11.f, 11.f });
+        sendContainer->addChild(sendBorder);
+
+        auto* sendBg = createSmoothRoundedRect(22.f, 22.f, 11.f, toColor4F(ccColor3B{ 215, 48, 80 }, 255));
+        sendBg->setPosition(CCPoint{ 11.f, 11.f });
+        sendContainer->addChild(sendBg);
+
+        m_sendArrowLbl = CCLabelBMFont::create(">", "chatFont.fnt");
+        m_sendArrowLbl->setScale(0.48f);
+        m_sendArrowLbl->setColor(ccColor3B{ 255, 255, 255 });
+        m_sendArrowLbl->setPosition(CCPoint{ 11.f, 11.f });
+        sendContainer->addChild(m_sendArrowLbl);
+
+        m_stopSquareIcon = createSmoothRoundedRect(8.5f, 8.5f, 2.f, toColor4F(ccColor3B{ 255, 255, 255 }, 255));
+        m_stopSquareIcon->setPosition(CCPoint{ 11.f, 11.f });
+        m_stopSquareIcon->setVisible(false);
+        sendContainer->addChild(m_stopSquareIcon);
+
+        auto* sendBtn = CCMenuItemSpriteExtra::create(sendContainer, this, menu_selector(AIDecorPopup::onSendOrStopClicked));
         sendBtn->setPosition(CCPoint{ leftX + 97.f, center.y - 116.f });
         m_buttonMenu->addChild(sendBtn);
+        refreshSendStopButtonVisual();
 
         rebuildChatScrollFeed();
 
         // ====================================================================
-        // ПРАВАЯ КОЛОНКА: Вкладки [Shape | Drawing | In GD] + Синее превью с Shimmer-анимацией
+        // ПРАВАЯ КОЛОНКА: ОКРУГЛЕННЫЕ ВКЛАДКИ [Shape | Drawing | In GD] + ПЕРЕЛИВАЮЩИЕСЯ ПОЛОСКИ ВЫДЕЛЕНИЯ
         // ====================================================================
         float rightX = center.x + 120.f;
         m_selectionBoxCenter = CCPoint{ rightX, center.y + 10.f };
 
-        auto* tabBarBg = createSolidPanel(224.f, 22.f, ccColor3B{ 22, 16, 20 }, 240);
+        auto* tabBarBg = createSmoothRoundedRect(224.f, 22.f, 11.f, toColor4F(ccColor3B{ 22, 16, 20 }, 240));
         tabBarBg->setPosition(CCPoint{ rightX, center.y + 92.f });
         m_mainLayer->addChild(tabBarBg);
 
-        auto createTabButton = [&](const char* title, CCPoint pos, SEL_MenuHandler cb, CCLayerColor*& outBg) {
-            outBg = createSolidPanel(72.f, 18.f, ccColor3B{ 28, 20, 24 }, 255);
+        auto createRoundedTabButton = [&](const char* title, CCPoint pos, SEL_MenuHandler cb, CCSprite*& outBg) {
+            auto* cont = CCNode::create();
+            cont->setContentSize(CCSize{ 72.f, 18.f });
+            cont->ignoreAnchorPointForPosition(false);
+            cont->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
+
+            outBg = createSmoothRoundedRect(72.f, 18.f, 9.f, toColor4F(ccColor3B{ 28, 20, 24 }, 255));
+            outBg->setPosition(CCPoint{ 36.f, 9.f });
+            cont->addChild(outBg);
+
             auto* lbl = CCLabelBMFont::create(title, "chatFont.fnt");
             lbl->setScale(0.45f);
             lbl->setColor(ccColor3B{ 245, 248, 255 });
             lbl->setPosition(CCPoint{ 36.f, 9.f });
-            outBg->addChild(lbl);
-            auto* btn = CCMenuItemSpriteExtra::create(outBg, this, cb);
+            cont->addChild(lbl);
+
+            auto* btn = CCMenuItemSpriteExtra::create(cont, this, cb);
             btn->setPosition(pos);
             m_buttonMenu->addChild(btn);
         };
 
-        createTabButton("Shape",   CCPoint{ rightX - 73.f, center.y + 92.f }, menu_selector(AIDecorPopup::onTabShape),   m_tabShapeBg);
-        createTabButton("Drawing", CCPoint{ rightX,        center.y + 92.f }, menu_selector(AIDecorPopup::onTabDrawing), m_tabDrawingBg);
-        createTabButton("In GD",   CCPoint{ rightX + 73.f, center.y + 92.f }, menu_selector(AIDecorPopup::onTabInGD),    m_tabInGDBg);
+        createRoundedTabButton("Shape",   CCPoint{ rightX - 73.f, center.y + 92.f }, menu_selector(AIDecorPopup::onTabShape),   m_tabShapeBg);
+        createRoundedTabButton("Drawing", CCPoint{ rightX,        center.y + 92.f }, menu_selector(AIDecorPopup::onTabDrawing), m_tabDrawingBg);
+        createRoundedTabButton("In GD",   CCPoint{ rightX + 73.f, center.y + 92.f }, menu_selector(AIDecorPopup::onTabInGD),    m_tabInGDBg);
 
-        auto* canvasBg = createSolidPanel(224.f, 128.f, ccColor3B{ 18, 92, 212 }, 255);
+        auto* canvasBg = createSmoothRoundedRect(224.f, 128.f, 14.f, toColor4F(ccColor3B{ 18, 92, 212 }, 255));
         canvasBg->setPosition(m_selectionBoxCenter);
         m_mainLayer->addChild(canvasBg);
 
-        auto* selectionFrame = createSolidPanel(166.f, 108.f, ccColor3B{ 95, 195, 255 }, 120);
-        selectionFrame->setPosition(m_selectionBoxCenter);
-        m_mainLayer->addChild(selectionFrame);
+        // Тонкие полоски рамки области выделения (переливаются при генерации!)
+        m_selectionBorderNormal = createSmoothHollowRoundedBorder(
+            166.f, 108.f, 10.f, 2.2f,
+            toColor4F(ccColor3B{ 95, 195, 255 }, 175)
+        );
+        m_selectionBorderNormal->setPosition(m_selectionBoxCenter);
+        m_selectionBorderNormal->setZOrder(4);
+        m_mainLayer->addChild(m_selectionBorderNormal);
 
-        auto* selectionInner = createSolidPanel(162.f, 104.f, ccColor3B{ 18, 92, 212 }, 255);
-        selectionInner->setPosition(m_selectionBoxCenter);
-        m_mainLayer->addChild(selectionInner);
+        m_selectionBorderShimmer = createSmoothHollowRoundedBorder(
+            166.f, 108.f, 10.f, 2.5f,
+            toColor4F(ccColor3B{ 255, 255, 255 }, 255)
+        );
+        m_selectionBorderShimmer->setPosition(m_selectionBoxCenter);
+        m_selectionBorderShimmer->setZOrder(5);
+        m_selectionBorderShimmer->setVisible(false);
+        m_mainLayer->addChild(m_selectionBorderShimmer);
 
         m_previewCanvasContent = CCNode::create();
         m_previewCanvasContent->setPosition(m_selectionBoxCenter);
+        m_previewCanvasContent->setZOrder(3);
         m_mainLayer->addChild(m_previewCanvasContent);
 
-        // Полупрозрачный прямоугольник выделения с плавным белым переливом (shimmer/пульсация) во время генерации ИИ!
-        m_selectionShimmerOverlay = createSmoothRoundedRect(
-            164.f, 106.f, 6.f,
-            toColor4F(ccColor3B{ 255, 255, 255 }, 95)
-        );
-        m_selectionShimmerOverlay->setPosition(m_selectionBoxCenter);
-        m_selectionShimmerOverlay->setZOrder(15);
-        m_selectionShimmerOverlay->setVisible(false);
-        m_mainLayer->addChild(m_selectionShimmerOverlay);
+        // Кнопка во вкладке Shape: скругленная
+        auto* fillCont = CCNode::create();
+        fillCont->setContentSize(CCSize{ 78.f, 16.f });
+        fillCont->ignoreAnchorPointForPosition(false);
+        fillCont->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
 
-        m_selectionShimmerBand = createSmoothGradientRoundedRect(
-            38.f, 104.f, 8.f,
-            toColor4F(ccColor3B{ 255, 255, 255 }, 165),
-            toColor4F(ccColor3B{ 235, 245, 255 }, 45)
-        );
-        m_selectionShimmerBand->setPosition(m_selectionBoxCenter);
-        m_selectionShimmerBand->setZOrder(16);
-        m_selectionShimmerBand->setVisible(false);
-        m_mainLayer->addChild(m_selectionShimmerBand);
+        auto* fillBtnBorder = createSmoothRoundedRect(80.f, 18.f, 9.f, toColor4F(ccColor3B{ 95, 195, 255 }, 255));
+        fillBtnBorder->setPosition(CCPoint{ 39.f, 8.f });
+        fillCont->addChild(fillBtnBorder);
 
-        // Кнопка во вкладке Shape: переключает показ "Только каркас" <-> "100% Заполнение структуры"
-        auto* fillBtnBg = createSolidPanel(78.f, 15.f, ccColor3B{ 26, 38, 68 }, 240);
-        auto* fillBtnBorder = createSolidPanel(80.f, 17.f, ccColor3B{ 95, 195, 255 }, 255);
-        fillBtnBorder->setPosition(CCPoint{ 39.f, 7.5f });
-        fillBtnBorder->setZOrder(-1);
-        fillBtnBg->addChild(fillBtnBorder);
+        auto* fillBtnBg = createSmoothRoundedRect(78.f, 16.f, 8.f, toColor4F(ccColor3B{ 26, 38, 68 }, 245));
+        fillBtnBg->setPosition(CCPoint{ 39.f, 8.f });
+        fillCont->addChild(fillBtnBg);
 
         m_shapeFillToggleLbl = CCLabelBMFont::create(
             g_showFilledInShapeTab ? "Mode: Filled" : "Show Fill",
@@ -6583,36 +6657,45 @@ protected:
         );
         m_shapeFillToggleLbl->setScale(0.36f);
         m_shapeFillToggleLbl->setColor(ccColor3B{ 235, 248, 255 });
-        m_shapeFillToggleLbl->setPosition(CCPoint{ 39.f, 7.5f });
-        fillBtnBg->addChild(m_shapeFillToggleLbl);
+        m_shapeFillToggleLbl->setPosition(CCPoint{ 39.f, 8.f });
+        fillCont->addChild(m_shapeFillToggleLbl);
 
         m_shapeFillToggleBtn = CCMenuItemSpriteExtra::create(
-            fillBtnBg, this, menu_selector(AIDecorPopup::onToggleShapeFillPreview)
+            fillCont, this, menu_selector(AIDecorPopup::onToggleShapeFillPreview)
         );
         m_shapeFillToggleBtn->setPosition(CCPoint{ rightX + 68.f, center.y + 64.f });
         m_buttonMenu->addChild(m_shapeFillToggleBtn);
 
         std::string dimText = m_contour.hasAnySelection
             ? fmt::format("{} x {} units  |  {} blocks, {} spikes, {} orbs", m_contour.widthUnits(), m_contour.heightUnits(), m_contour.cellCount(), m_contour.spikeCount(), m_contour.orbPortalCount())
-            : std::string("0 x 0 units  |  0 blocks (No selection - BG / Free Mode)");
+            : std::string("0 x 0 units  |  0 blocks (No selection - Free Mode)");
         m_previewSubInfoLabel = CCLabelBMFont::create(dimText.c_str(), "chatFont.fnt");
         m_previewSubInfoLabel->setScale(0.44f);
         m_previewSubInfoLabel->setColor(ccColor3B{ 195, 190, 200 });
         m_previewSubInfoLabel->setPosition(CCPoint{ rightX, center.y - 62.f });
         m_mainLayer->addChild(m_previewSubInfoLabel);
 
-        auto* modePill = createSolidPanel(224.f, 22.f, ccColor3B{ 24, 16, 20 }, 255);
+        auto* modePill = createSmoothRoundedRect(224.f, 22.f, 11.f, toColor4F(ccColor3B{ 24, 16, 20 }, 255));
         modePill->setPosition(CCPoint{ rightX, center.y - 84.f });
         m_mainLayer->addChild(modePill);
 
-        auto createModeHalf = [&](const char* txt, CCPoint pos, SEL_MenuHandler cb, CCLayerColor*& outBg) {
-            outBg = createSolidPanel(108.f, 18.f, ccColor3B{ 28, 20, 24 }, 255);
+        auto createModeHalf = [&](const char* txt, CCPoint pos, SEL_MenuHandler cb, CCSprite*& outBg) {
+            auto* cont = CCNode::create();
+            cont->setContentSize(CCSize{ 108.f, 18.f });
+            cont->ignoreAnchorPointForPosition(false);
+            cont->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
+
+            outBg = createSmoothRoundedRect(108.f, 18.f, 9.f, toColor4F(ccColor3B{ 28, 20, 24 }, 255));
+            outBg->setPosition(CCPoint{ 54.f, 9.f });
+            cont->addChild(outBg);
+
             auto* l = CCLabelBMFont::create(txt, "chatFont.fnt");
             l->setScale(0.42f);
             l->setColor(ccColor3B{ 245, 248, 255 });
             l->setPosition(CCPoint{ 54.f, 9.f });
-            outBg->addChild(l);
-            auto* b = CCMenuItemSpriteExtra::create(outBg, this, cb);
+            cont->addChild(l);
+
+            auto* b = CCMenuItemSpriteExtra::create(cont, this, cb);
             b->setPosition(pos);
             m_buttonMenu->addChild(b);
         };
@@ -6620,16 +6703,16 @@ protected:
         createModeHalf("Overhang", CCPoint{ rightX + 55.f, center.y - 84.f }, menu_selector(AIDecorPopup::onSelectOverhang), m_overhangTabBg);
 
         std::string varStr = fmt::format("Another variant ({})", g_variantIndex);
-        auto* varBtn = createSolidButton(
-            108.f, 28.f, ccColor3B{ 34, 22, 28 },
+        auto* varBtn = createSmoothRoundedButton(
+            108.f, 28.f, 13.f, ccColor3B{ 34, 22, 28 }, ccColor3B{ 82, 40, 52 },
             varStr.c_str(), 0.42f, ccColor3B{ 225, 220, 232 },
             this, menu_selector(AIDecorPopup::onAnotherVariantClicked)
         );
         varBtn->setPosition(CCPoint{ rightX - 58.f, center.y - 116.f });
         m_buttonMenu->addChild(varBtn);
 
-        auto* keepBtn = createSolidButton(
-            108.f, 28.f, ccColor3B{ 178, 38, 68 },
+        auto* keepBtn = createSmoothRoundedButton(
+            108.f, 28.f, 13.f, ccColor3B{ 178, 38, 68 }, ccColor3B{ 235, 72, 102 },
             "Keep", 0.50f, ccColor3B{ 255, 245, 248 },
             this, menu_selector(AIDecorPopup::onKeepClicked)
         );
@@ -6640,16 +6723,24 @@ protected:
     }
 
     // ========================================================================
-    // Перестроение прокручиваемой ленты ИИ-чата + кнопка подтверждения в чате
+    // Перестроение прокручиваемой ленты ИИ-чата:
+    // - Ответы ИИ слева со стрелочкой-хвостиком как в Telegram
+    // - Сообщения игрока справа со стрелочкой-хвостиком как в Telegram
+    // - 3 плавно прыгающие вверх-вниз точки во время размышления ИИ
     // ========================================================================
     void rebuildChatScrollFeed() {
         if (!m_chatScrollLayer || !m_chatScrollLayer->m_contentLayer) return;
 
+        for (int d = 0; d < 3; ++d) m_thinkingDots[d] = nullptr;
+
         auto* content = m_chatScrollLayer->m_contentLayer;
         content->removeAllChildrenWithCleanup(true);
 
+        bool isThinkingNow = (g_aiRequestThreadRunning || g_autoRetryTimerActive);
+
         struct ChatBubbleBlock {
             bool isUser = false;
+            bool isThinkingPlaceholder = false;
             std::vector<std::string> lines;
         };
         std::vector<ChatBubbleBlock> blocks;
@@ -6659,25 +6750,30 @@ protected:
             intro.isUser = false;
             intro.lines = wrapTextLines(
                 fmt::format(
-                    "Agent: {} blocks ({}x{}). Ref: {}. I build 100% custom layered art & exact edges!",
+                    "{} blocks ({}x{}). Ref: {}. I build custom layered art!",
                     m_contour.cellCount(), m_contour.widthUnits(), m_contour.heightUnits(),
-                    g_hasReferenceImage ? g_referenceFileName : "none (click '+ Ref Image')"
+                    g_hasReferenceImage ? g_referenceFileName : "none"
                 ),
-                36, 4
+                32, 4
             );
             blocks.push_back(std::move(intro));
         }
 
-        for (auto const& msg : g_chatHistory) {
+        for (size_t i = 0; i < g_chatHistory.size(); ++i) {
+            auto const& msg = g_chatHistory[i];
             ChatBubbleBlock b;
             b.isUser = (msg.role == "user");
-            std::string prefix = b.isUser ? "You: " : "Agent: ";
-            b.lines = wrapTextLines(prefix + msg.content, 36, 6);
+            bool isLastThinking = (!b.isUser && isThinkingNow && (i + 1 == g_chatHistory.size()));
+            if (isLastThinking) {
+                b.isThinkingPlaceholder = true;
+                b.lines = { "" };
+            } else {
+                b.lines = wrapTextLines(msg.content, 32, 6);
+            }
             blocks.push_back(std::move(b));
         }
 
-        // Если ИИ завершил генерацию в Drawing и ждет подтверждения в чате — оставляем место внизу ленты под кнопку "Согласен" / "Agree"
-        float bottomConfirmReserve = (g_hasPendingDrawingApproval && g_hasGeneratedArt) ? 30.f : 0.f;
+        float bottomConfirmReserve = (g_hasPendingDrawingApproval && g_hasGeneratedArt) ? 26.f : 0.f;
 
         float totalH = 8.f + bottomConfirmReserve;
         std::vector<float> blockHeights;
@@ -6687,14 +6783,14 @@ protected:
                 if (!ln.empty()) nonEmpty++;
             }
             nonEmpty = (std::max)(1, nonEmpty);
-            float h = 10.f + nonEmpty * 12.f;
+            float h = b.isThinkingPlaceholder ? 22.f : (10.f + nonEmpty * 12.f);
             blockHeights.push_back(h);
             totalH += h + 6.f;
         }
 
         float viewH = m_chatScrollLayer->getContentSize().height;
         float finalContentH = (std::max)(viewH, totalH);
-        content->setContentSize(CCSize{ 196.f, finalContentH });
+        content->setContentSize(CCSize{ 208.f, finalContentH });
 
         float curY = finalContentH - 6.f;
         for (size_t i = 0; i < blocks.size(); ++i) {
@@ -6702,38 +6798,45 @@ protected:
             float h = blockHeights[i];
             float centerY = curY - h * 0.5f;
 
-            ccColor3B cardCol = b.isUser ? ccColor3B{ 54, 24, 34 } : ccColor3B{ 26, 22, 28 };
-            auto* bubble = createSmoothRoundedRect(188.f, h, 8.f, toColor4F(cardCol, 255));
-            bubble->setPosition(CCPoint{ 98.f, centerY });
+            float bubbleW = b.isThinkingPlaceholder ? 54.f : 164.f;
+            // ИИ слева (centerX = 88), игрок справа (centerX = 118)
+            float bubbleCenterX = b.isUser ? (202.f - bubbleW * 0.5f) : (8.f + bubbleW * 0.5f);
+
+            ccColor3B cardCol   = b.isUser ? ccColor3B{ 78, 26, 42 } : ccColor3B{ 26, 22, 30 };
+            ccColor3B borderCol = b.isUser ? ccColor3B{ 158, 52, 78 } : ccColor3B{ 68, 44, 58 };
+
+            auto* bubble = createTelegramBubbleSprite(bubbleW, h, 9.f, b.isUser, cardCol, borderCol);
+            bubble->setPosition(CCPoint{ bubbleCenterX, centerY });
             content->addChild(bubble);
 
-            int drawnLines = 0;
-            float topTextY = curY - 10.f;
-            for (auto const& ln : b.lines) {
-                if (ln.empty()) continue;
-                auto* lbl = CCLabelBMFont::create(ln.c_str(), "chatFont.fnt");
-                lbl->setScale(0.39f);
-                lbl->setColor(b.isUser ? ccColor3B{ 255, 225, 232 } : ccColor3B{ 230, 235, 245 });
-                lbl->setPosition(CCPoint{ 98.f, topTextY - drawnLines * 12.f });
-                content->addChild(lbl);
-                drawnLines++;
+            if (b.isThinkingPlaceholder) {
+                // 3 круглые точки, которые плавно перемещаются поочередно вверх и вниз!
+                m_thinkingDotsBaseY = centerY;
+                for (int d = 0; d < 3; ++d) {
+                    m_thinkingDots[d] = createSmoothRoundedRect(5.5f, 5.5f, 2.75f, toColor4F(ccColor3B{ 235, 240, 255 }, 255));
+                    m_thinkingDots[d]->setPosition(CCPoint{ bubbleCenterX + (d - 1) * 11.0f, centerY });
+                    content->addChild(m_thinkingDots[d]);
+                }
+            } else {
+                int drawnLines = 0;
+                float topTextY = curY - 10.f;
+                for (auto const& ln : b.lines) {
+                    if (ln.empty()) continue;
+                    auto* lbl = CCLabelBMFont::create(ln.c_str(), "chatFont.fnt");
+                    lbl->setScale(0.38f);
+                    lbl->setColor(b.isUser ? ccColor3B{ 255, 232, 238 } : ccColor3B{ 230, 235, 245 });
+                    lbl->setPosition(CCPoint{ bubbleCenterX + (b.isUser ? -2.f : 2.f), topTextY - drawnLines * 12.f });
+                    content->addChild(lbl);
+                    drawnLines++;
+                }
             }
 
             curY -= (h + 6.f);
         }
 
         content->setPosition(CCPoint{ 0.f, 0.f });
+        updateChatScrollbarThumb();
         refreshChatAgreeButtonState();
-    }
-
-    void onScrollChatUp(CCObject*) {
-        if (!m_chatScrollLayer) return;
-        m_chatScrollLayer->scrollWheel(-42.f, 0.f);
-    }
-
-    void onScrollChatDown(CCObject*) {
-        if (!m_chatScrollLayer) return;
-        m_chatScrollLayer->scrollWheel(42.f, 0.f);
     }
 
     void onToggleShapeFillPreview(CCObject*) {
@@ -6741,8 +6844,6 @@ protected:
         refreshRightPanelTabsAndCanvas();
     }
 
-    // Вычисляет точные мировые границы области предпросмотра (учитывая и выделенный контур, и сгенерированные объекты g_lastPreviewSpecs,
-    // чтобы в режиме In GD ни один блок или шип НИКОГДА не вылезал за пределы синего окна предпросмотра!)
     void getExactPreviewWorldBounds(float& outMinX, float& outMaxX, float& outMinY, float& outMaxY) const {
         bool inited = false;
         auto includeRect = [&](float x0, float x1, float y0, float y1) {
@@ -6758,8 +6859,11 @@ protected:
             }
         };
 
-        if (m_contour.hasAnySelection && m_contour.exactMaxX > m_contour.exactMinX + 0.5f) {
-            includeRect(m_contour.exactMinX, m_contour.exactMaxX, m_contour.exactMinY, m_contour.exactMaxY);
+        if (m_contour.hasAnySelection && !m_contour.occupiedCells.empty()) {
+            includeRect(
+                m_contour.minGX * 30.0f, (m_contour.maxGX + 1) * 30.0f,
+                m_contour.minGY * 30.0f, (m_contour.maxGY + 1) * 30.0f
+            );
         }
         for (auto const& sp : m_contour.spikes) {
             float r = 16.0f * (std::max)(sp.scaleX, sp.scaleY);
@@ -6770,10 +6874,11 @@ protected:
             includeRect(op.x - r, op.x + r, op.y - r, op.y + r);
         }
 
+        // В режиме In GD (или при свободном объекте) включаем 100% всех сгенерированных объектов в общие границы!
         if ((m_previewTab == 2 || !inited) && !g_lastPreviewSpecs.empty()) {
             for (auto const& s : g_lastPreviewSpecs) {
-                float hw = std::clamp(std::fabs(s.scaleX) * 15.0f, 1.0f, 60.0f);
-                float hh = std::clamp(std::fabs(s.scaleY) * 15.0f, 1.0f, 60.0f);
+                float hw = (std::max)(1.0f, std::fabs(s.scaleX) * 15.0f);
+                float hh = (std::max)(1.0f, std::fabs(s.scaleY) * 15.0f);
                 includeRect(s.x - hw, s.x + hw, s.y - hh, s.y + hh);
             }
         }
@@ -6786,27 +6891,35 @@ protected:
         }
     }
 
-    // Создает четкий силуэт во вкладке Shape по ТОЧНЫМ координатам краев каркаса + треугольные повернутые шипы!
     CCSprite* createExactShapeSilhouetteSprite(float targetW, float targetH) {
-        float worldMinX = 0.f, worldMaxX = 30.f, worldMinY = 0.f, worldMaxY = 30.f;
-        getExactPreviewWorldBounds(worldMinX, worldMaxX, worldMinY, worldMaxY);
-        float worldSpanW = (std::max)(15.0f, worldMaxX - worldMinX);
-        float worldSpanH = (std::max)(15.0f, worldMaxY - worldMinY);
+        int cols = (std::max)(1, m_contour.maxGX - m_contour.minGX + 1);
+        int rows = (std::max)(1, m_contour.maxGY - m_contour.minGY + 1);
+        float worldMinX = m_contour.minGX * 30.0f;
+        float worldMinY = m_contour.minGY * 30.0f;
+        float worldSpanW = cols * 30.0f;
+        float worldSpanH = rows * 30.0f;
 
-        int texW = std::clamp(static_cast<int>(std::lround(worldSpanW * 0.85f)), 96, 512);
-        int texH = std::clamp(static_cast<int>(std::lround(worldSpanH * 0.85f)), 96, 512);
-
+        int SubPx = 24;
+        int texW = std::clamp(cols * SubPx, 64, 512);
+        int texH = std::clamp(rows * SubPx, 64, 512);
         std::vector<uint8_t> rgba(static_cast<size_t>(texW * texH * 4), 0);
+
+        auto const& activeCells = g_showFilledInShapeTab
+            ? m_contour.occupiedCells
+            : (m_contour.rawCells.empty() ? m_contour.occupiedCells : m_contour.rawCells);
 
         for (int py = 0; py < texH; ++py) {
             float v = 1.0f - (py + 0.5f) / static_cast<float>(texH);
             float wy = worldMinY + v * worldSpanH;
+            int gy = m_contour.minGY + std::clamp(static_cast<int>(v * rows), 0, rows - 1);
+            float localV = std::fmod(v * rows, 1.0f);
 
             for (int px = 0; px < texW; ++px) {
                 float u = (px + 0.5f) / static_cast<float>(texW);
                 float wx = worldMinX + u * worldSpanW;
+                int gx = m_contour.minGX + std::clamp(static_cast<int>(u * cols), 0, cols - 1);
+                float localU = std::fmod(u * cols, 1.0f);
 
-                // 1. Проверяем попадание в треугольник любого шипа (с учетом его точного угла поворота sp.rotation!)
                 bool hitSpike = false;
                 for (auto const& sp : m_contour.spikes) {
                     if (isWorldPointInsideRotatedSpikeTriangle(sp, wx, wy)) {
@@ -6823,52 +6936,25 @@ protected:
                     continue;
                 }
 
-                // 2. Проверяем попадание в точные края каркаса (или заполненной структуры)
-                bool hitFrame = false;
-                if (g_showFilledInShapeTab) {
-                    hitFrame = isWorldPointInsideExactContour(m_contour, wx, wy);
-                } else {
-                    for (auto const& bx : m_contour.exactBoxes) {
-                        if (m_contour.rawCells.empty() || m_contour.rawCells.count({ bx.gx, bx.gy }) > 0) {
-                            if (wx >= bx.minX && wx <= bx.maxX && wy >= bx.minY && wy <= bx.maxY) {
-                                CellSlopeKind sk = getCellSlopeKind(m_contour, bx.gx, bx.gy);
-                                float lu = (wx - bx.minX) / (std::max)(1.0f, bx.maxX - bx.minX);
-                                float lv = (wy - bx.minY) / (std::max)(1.0f, bx.maxY - bx.minY);
-                                if (isLocalPointInsideCellSlope(sk, lu, lv)) {
-                                    hitFrame = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
+                if (activeCells.count({ gx, gy }) == 0) continue;
+                CellSlopeKind sk = getCellSlopeKind(m_contour, gx, gy);
+                if (!isLocalPointInsideCellSlope(sk, localU, localV)) continue;
 
-                if (hitFrame) {
-                    size_t idx = static_cast<size_t>((py * texW + px) * 4);
-                    rgba[idx + 0] = 244;
-                    rgba[idx + 1] = 247;
-                    rgba[idx + 2] = 255;
-                    rgba[idx + 3] = 255;
-                }
+                size_t idx = static_cast<size_t>((py * texW + px) * 4);
+                rgba[idx + 0] = 244;
+                rgba[idx + 1] = 247;
+                rgba[idx + 2] = 255;
+                rgba[idx + 3] = 255;
             }
         }
 
         auto* tex = new CCTexture2D();
-        if (tex && tex->initWithData(
-                rgba.data(),
-                kCCTexture2DPixelFormat_RGBA8888,
-                texW,
-                texH,
-                CCSize{ static_cast<float>(texW), static_cast<float>(texH) }
-            )) {
+        if (tex && tex->initWithData(rgba.data(), kCCTexture2DPixelFormat_RGBA8888, texW, texH, CCSize{ static_cast<float>(texW), static_cast<float>(texH) })) {
             tex->autorelease();
-            auto* spr = CCSprite::createWithTexture(tex);
-            if (spr) {
+            if (auto* spr = CCSprite::createWithTexture(tex)) {
                 CCSize ptsSize = spr->getContentSize();
-                float curW = (ptsSize.width > 0.01f) ? ptsSize.width : static_cast<float>(texW);
-                float curH = (ptsSize.height > 0.01f) ? ptsSize.height : static_cast<float>(texH);
-                spr->setScaleX(targetW / curW);
-                spr->setScaleY(targetH / curH);
+                spr->setScaleX(targetW / (ptsSize.width > 0.01f ? ptsSize.width : static_cast<float>(texW)));
+                spr->setScaleY(targetH / (ptsSize.height > 0.01f ? ptsSize.height : static_cast<float>(texH)));
                 return spr;
             }
         } else {
@@ -6877,7 +6963,6 @@ protected:
         return nullptr;
     }
 
-    // Создает попиксельный CCSprite для вкладки Drawing строго по точным краям каркаса и повернутым треугольникам шипов!
     CCSprite* createPixelArtDrawingPreviewSprite(float targetW, float targetH) {
         float worldMinX = 0.f, worldMaxX = 30.f, worldMinY = 0.f, worldMaxY = 30.f;
         getExactPreviewWorldBounds(worldMinX, worldMaxX, worldMinY, worldMaxY);
@@ -6974,7 +7059,6 @@ protected:
                     float localX =  dx * cosA + dy * sinA;
                     float localY = -dx * sinA + dy * cosA;
                     if (isSpikeSpec) {
-                        // В экранных координатах текстуры ось Y направлена вниз (-halfH = вершина, +halfH = основание)
                         float tFromTip = (localY + halfH) / (std::max)(1.0f, 2.0f * halfH);
                         if (tFromTip < 0.0f || tFromTip > 1.0f || std::fabs(localX) > halfW * tFromTip) continue;
                     } else {
@@ -6999,21 +7083,12 @@ protected:
         }
 
         auto* tex = new CCTexture2D();
-        if (tex && tex->initWithData(
-                rgba.data(),
-                kCCTexture2DPixelFormat_RGBA8888,
-                texW,
-                texH,
-                CCSize{ static_cast<float>(texW), static_cast<float>(texH) }
-            )) {
+        if (tex && tex->initWithData(rgba.data(), kCCTexture2DPixelFormat_RGBA8888, texW, texH, CCSize{ static_cast<float>(texW), static_cast<float>(texH) })) {
             tex->autorelease();
-            auto* spr = CCSprite::createWithTexture(tex);
-            if (spr) {
+            if (auto* spr = CCSprite::createWithTexture(tex)) {
                 CCSize ptsSize = spr->getContentSize();
-                float curW = (ptsSize.width > 0.01f) ? ptsSize.width : static_cast<float>(texW);
-                float curH = (ptsSize.height > 0.01f) ? ptsSize.height : static_cast<float>(texH);
-                spr->setScaleX(targetW / curW);
-                spr->setScaleY(targetH / curH);
+                spr->setScaleX(targetW / (ptsSize.width > 0.01f ? ptsSize.width : static_cast<float>(texW)));
+                spr->setScaleY(targetH / (ptsSize.height > 0.01f ? ptsSize.height : static_cast<float>(texH)));
                 return spr;
             }
         } else {
@@ -7044,14 +7119,17 @@ protected:
         m_previewCanvasContent->removeFromParentAndCleanup(true);
         m_previewCanvasContent = CCNode::create();
         m_previewCanvasContent->setPosition(canvasPos);
+        m_previewCanvasContent->setZOrder(3);
         m_mainLayer->addChild(m_previewCanvasContent);
 
         float worldMinX = 0.f, worldMaxX = 30.f, worldMinY = 0.f, worldMaxY = 30.f;
         getExactPreviewWorldBounds(worldMinX, worldMaxX, worldMinY, worldMaxY);
         float worldSpanW = (std::max)(30.0f, worldMaxX - worldMinX);
         float worldSpanH = (std::max)(30.0f, worldMaxY - worldMinY);
+        float worldMidX  = (worldMinX + worldMaxX) * 0.5f;
+        float worldMidY  = (worldMinY + worldMaxY) * 0.5f;
 
-        float scaleRatio = (std::min)(146.f / worldSpanW, 96.f / worldSpanH);
+        float scaleRatio = (std::min)(152.f / worldSpanW, 96.f / worldSpanH);
         float totalW = worldSpanW * scaleRatio;
         float totalH = worldSpanH * scaleRatio;
         float cellPx = 30.0f * scaleRatio;
@@ -7059,20 +7137,19 @@ protected:
         if (m_previewTab == 0) {
             if (!m_contour.hasAnySelection) {
                 auto* emptyLbl = CCLabelBMFont::create("0 selected (Free Mode: ask AI for any object or BG!)", "chatFont.fnt");
-                emptyLbl->setScale(0.38f);
+                emptyLbl->setScale(0.36f);
                 emptyLbl->setColor(ccColor3B{ 215, 235, 255 });
                 emptyLbl->setPosition(CCPoint{ 0.f, 0.f });
                 m_previewCanvasContent->addChild(emptyLbl);
                 return;
             }
-            // ВКЛАДКА SHAPE: Точный силуэт по реальным краям каркаса + треугольные повернутые шипы!
             if (auto* shapeSpr = createExactShapeSilhouetteSprite(totalW, totalH)) {
                 shapeSpr->setPosition(CCPoint{ 0.f, 0.f });
                 m_previewCanvasContent->addChild(shapeSpr);
             }
             for (auto const& op : m_contour.orbsAndPortals) {
-                float px = -totalW * 0.5f + (op.x - worldMinX) * scaleRatio;
-                float py = -totalH * 0.5f + (op.y - worldMinY) * scaleRatio;
+                float px = (op.x - worldMidX) * scaleRatio;
+                float py = (op.y - worldMidY) * scaleRatio;
                 float w = (op.isPortal ? 0.55f : 0.72f) * cellPx;
                 float h = (op.isPortal ? 1.65f : 0.72f) * cellPx;
                 auto* orbSpr = createSmoothRoundedRect(w, h, (std::min)(w, h) * 0.45f, toColor4F(ccColor3B{ 120, 255, 195 }, 255));
@@ -7081,70 +7158,50 @@ protected:
                 m_previewCanvasContent->addChild(orbSpr);
             }
         } else if (m_previewTab == 1 && (g_hasGeneratedArt || g_hasReferenceImage)) {
-            // ВКЛАДКА DRAWING: Попиксельный рендер внутри точных границ каркаса и треугольных шипов!
             if (auto* artSpr = createPixelArtDrawingPreviewSprite(totalW, totalH)) {
                 artSpr->setPosition(CCPoint{ 0.f, 0.f });
                 m_previewCanvasContent->addChild(artSpr);
             }
         } else {
-            // ВКЛАДКА IN GD: РЕЖИМ ПРЕДПРОСМОТРА (НЕ спавнит объекты сразу на уровень, а показывает как будет выглядеть итог в GD!)
-            // 1. Отрисовываем сетку редактора GD внутри окна предпросмотра
+            // ВКЛАДКА IN GD: ПОЛНОЕ ОТОБРАЖЕНИЕ 100% ВСЕХ ОБЪЕКТОВ ВНУТРИ СИНЕЙ РАМКИ!
             for (float gx = std::ceil(worldMinX / 30.f) * 30.f; gx <= worldMaxX; gx += 30.f) {
-                float lx = -totalW * 0.5f + (gx - worldMinX) * scaleRatio;
+                float lx = (gx - worldMidX) * scaleRatio;
                 auto* vLine = createSolidPanel(0.8f, totalH, ccColor3B{ 45, 125, 235 }, 90);
                 vLine->setPosition(CCPoint{ lx, 0.f });
                 m_previewCanvasContent->addChild(vLine);
             }
             for (float gy = std::ceil(worldMinY / 30.f) * 30.f; gy <= worldMaxY; gy += 30.f) {
-                float ly = -totalH * 0.5f + (gy - worldMinY) * scaleRatio;
+                float ly = (gy - worldMidY) * scaleRatio;
                 auto* hLine = createSolidPanel(totalW, 0.8f, ccColor3B{ 45, 125, 235 }, 90);
                 hLine->setPosition(CCPoint{ 0.f, ly });
                 m_previewCanvasContent->addChild(hLine);
             }
 
-            constexpr float kMaxPreviewHalfW = 79.0f;
-            constexpr float kMaxPreviewHalfH = 50.0f;
-
-            // 2. Отрисовываем базовые шипы каркаса правильной треугольной формой строго внутри рамки предпросмотра
+            // Базовые шипы каркаса
             for (auto const& sp : m_contour.spikes) {
-                float px = -totalW * 0.5f + (sp.x - worldMinX) * scaleRatio;
-                float py = -totalH * 0.5f + (sp.y - worldMinY) * scaleRatio;
-                float w = (std::max)(3.f, 30.f * sp.scaleX * scaleRatio);
-                float h = (std::max)(3.f, ((sp.objectId == 39 || sp.objectId == 103) ? 15.f : 30.f) * sp.scaleY * scaleRatio);
-                if (px - w * 0.5f < -kMaxPreviewHalfW || px + w * 0.5f > kMaxPreviewHalfW ||
-                    py - h * 0.5f < -kMaxPreviewHalfH || py + h * 0.5f > kMaxPreviewHalfH) {
-                    continue;
-                }
+                float px = (sp.x - worldMidX) * scaleRatio;
+                float py = (sp.y - worldMidY) * scaleRatio;
+                float w = (std::max)(2.5f, 30.f * sp.scaleX * scaleRatio);
+                float h = (std::max)(2.5f, ((sp.objectId == 39 || sp.objectId == 103) ? 15.f : 30.f) * sp.scaleY * scaleRatio);
                 auto* triSpr = createTriangleSpikePreviewSprite(w, h, g_lastPreviewPalette.slotColors[static_cast<int>(ColorSlot::DarkFill)], 255);
                 triSpr->setRotation(sp.rotation);
                 triSpr->setPosition(CCPoint{ px, py });
                 m_previewCanvasContent->addChild(triSpr);
             }
 
-            // 3. Отрисовываем все сгенерированные объекты предпросмотра строго внутри границ синего прямоугольника
-            size_t shownCount = 0;
+            // Все 100% сгенерированных объектов предпросмотра (без обрезки!)
             for (auto const& s : g_lastPreviewSpecs) {
-                if (++shownCount > 6000) break;
+                float px = (s.x - worldMidX) * scaleRatio;
+                float py = (s.y - worldMidY) * scaleRatio;
 
-                float px = -totalW * 0.5f + (s.x - worldMinX) * scaleRatio;
-                float py = -totalH * 0.5f + (s.y - worldMinY) * scaleRatio;
-                if (px < -kMaxPreviewHalfW || px > kMaxPreviewHalfW ||
-                    py < -kMaxPreviewHalfH || py > kMaxPreviewHalfH) {
-                    continue;
-                }
-
-                float w = std::clamp(s.scaleX * cellPx, 0.5f, cellPx * 2.5f);
-                float h = std::clamp(s.scaleY * cellPx, 0.5f, cellPx * 2.5f);
-                w = (std::min)(w, (kMaxPreviewHalfW - std::fabs(px)) * 2.0f);
-                h = (std::min)(h, (kMaxPreviewHalfH - std::fabs(py)) * 2.0f);
-                if (w < 0.4f || h < 0.4f) continue;
-
+                float w = (std::max)(0.6f, std::fabs(s.scaleX) * cellPx);
+                float h = (std::max)(0.6f, std::fabs(s.scaleY) * cellPx);
                 ccColor3B col = (s.colorSlot == ColorSlot::CustomRGB)
                     ? s.customColor
                     : g_lastPreviewPalette.slotColors[std::clamp(static_cast<int>(s.colorSlot), 0, 5)];
 
                 if (isSpikeObjectID(s.objectId)) {
-                    auto* spSpr = createTriangleSpikePreviewSprite((std::max)(2.5f, w), (std::max)(2.5f, h), col, s.customOpacity);
+                    auto* spSpr = createTriangleSpikePreviewSprite((std::max)(2.0f, w), (std::max)(2.0f, h), col, s.customOpacity);
                     spSpr->setRotation(s.rotation);
                     spSpr->setPosition(CCPoint{ px, py });
                     m_previewCanvasContent->addChild(spSpr);
@@ -7194,7 +7251,7 @@ protected:
         ContourAnalysis contourCopy = m_contour;
         restoreLockedContourPositions();
         g_activePopup = nullptr;
-        this->onClose(nullptr);
+        Popup::onClose(nullptr);
         if (auto* next = AIDecorPopup::create(ui, std::move(contourCopy), nextStage, returnStage)) {
             next->show();
         }
@@ -7287,15 +7344,11 @@ protected:
         if (m_langBadgeLabel) {
             m_langBadgeLabel->setString(m_russianLayout ? "RUS" : "ENG");
         }
-        // Автоматически обновляем текст кнопки подтверждения в чате ("✓ Согласен" <-> "✓ Agree")!
         refreshChatAgreeButtonState();
     }
 
     void onTabShape(CCObject*)   { m_previewTab = 0; refreshRightPanelTabsAndCanvas(); }
     void onTabDrawing(CCObject*) { m_previewTab = 1; refreshRightPanelTabsAndCanvas(); }
-
-    // При нажатии на кнопку «In GD» мод НЕ спавнит реальные объекты сразу на уровень,
-    // а переключает экран в режим предпросмотра In GD!
     void onTabInGD(CCObject*) {
         m_previewTab = 2;
         refreshRightPanelTabsAndCanvas();
@@ -7391,7 +7444,6 @@ protected:
 
     void onKeepClicked(CCObject*) {
         if (g_hasPendingDrawingApproval && g_hasGeneratedArt) {
-            // Переключаем на предпросмотр In GD и подсказываем нажать кнопку подтверждения в чате
             m_previewTab = 2;
             refreshRightPanelTabsAndCanvas();
             if (m_previewSubInfoLabel) {
@@ -7406,6 +7458,26 @@ protected:
         this->onClose(nullptr);
     }
 
+    // Нажатие на кнопку [>] или [■] (Остановить генерацию!)
+    void onSendOrStopClicked(CCObject*) {
+        if (g_aiRequestThreadRunning || g_autoRetryTimerActive) {
+            cancelAllActiveAIRequestsOnEditorExit();
+            if (!g_chatHistory.empty() && g_chatHistory.back().role == "assistant") {
+                g_chatHistory.back().content = m_russianLayout
+                    ? "Generatsiya ostanovlena polzovatelem."
+                    : "Generation stopped by user.";
+            }
+            if (m_stepPlanLabel)    m_stepPlanLabel->setString("Plan: stopped");
+            if (m_stepDrawingLabel) m_stepDrawingLabel->setString("Draw: stopped");
+            if (m_selectionBorderShimmer) m_selectionBorderShimmer->setVisible(false);
+            if (m_selectionBorderNormal)  m_selectionBorderNormal->setOpacity(175);
+            refreshSendStopButtonVisual();
+            rebuildChatScrollFeed();
+            return;
+        }
+        onSendToNeuralNet(nullptr);
+    }
+
     void launchAsyncAIWorker(std::string const& promptToRun) {
         if (g_aiRequestThreadRunning) return;
         if (!g_editorSessionActive.load()) return;
@@ -7413,6 +7485,7 @@ protected:
         g_aiRequestThreadRunning = true;
         g_aiRequestHasCompleted = false;
         uint64_t myEpoch = g_aiRequestCancelEpoch.fetch_add(1) + 1;
+        refreshSendStopButtonVisual();
 
         ContourAnalysis contourCopy = m_contour;
         EditorTabCatalog catalogCopy = loadEditorTabCatalog(m_editorUI);
@@ -7433,7 +7506,6 @@ protected:
                 ovhCopy,
                 varCopy
             );
-            // Если пользователь вышел из редактора во время генерации — отбрасываем результат!
             if (!g_editorSessionActive.load() || myEpoch != g_aiRequestCancelEpoch.load()) {
                 g_aiRequestThreadRunning = false;
                 return;
@@ -7480,7 +7552,7 @@ protected:
         );
         g_hasPendingDrawingApproval = false;
         g_previewAlreadyPlacedInEditor = true;
-        m_previewTab = 2; // Показываем вкладку In GD
+        m_previewTab = 2;
         refreshRightPanelTabsAndCanvas();
 
         if (m_stepPlaceLabel) {
@@ -7534,7 +7606,6 @@ protected:
             }
         }
 
-        // Если ничего не выделено и игрок написал только общую фразу без указания конкретного объекта или фона — ничего не строим, а только спрашиваем!
         if (!m_contour.hasAnySelection && !g_hasReferenceImage && isUnspecifiedPromptWhenNothingSelected(promptText)) {
             m_inputBuffer.clear();
             refreshInputLabel();
@@ -7556,15 +7627,16 @@ protected:
         g_floatingDotsTimer = 0.0f;
         g_floatingDotsPhase = 0;
         g_loadingShimmerTimer = 0.0f;
+        m_thinkingDotsAnimTime = 0.0f;
 
         g_chatHistory.push_back({ "user", promptText });
-        g_chatHistory.push_back({ "assistant", " .  " });
-        rebuildChatScrollFeed();
+        g_chatHistory.push_back({ "assistant", " ... " });
 
         if (m_stepPlanLabel)    m_stepPlanLabel->setString("Plan: ...");
         if (m_stepDrawingLabel) m_stepDrawingLabel->setString("Draw: ...");
 
         launchAsyncAIWorker(promptText);
+        rebuildChatScrollFeed();
     }
 
     void handleCompletedAIResult(AIDecisionResult const& ai) {
@@ -7574,11 +7646,13 @@ protected:
             if (g_autoRetryAttemptCount < 10) {
                 g_autoRetryTimerActive = true;
                 g_autoRetryCountdown = 2.0f;
+                refreshSendStopButtonVisual();
                 return;
             }
 
             g_autoRetryTimerActive = false;
             g_autoRetryAttemptCount = 0;
+            refreshSendStopButtonVisual();
 
             std::string finalErrMsg = fmt::format("Failed after 10 attempts: {}", ai.replyText);
             if (!g_chatHistory.empty() && g_chatHistory.back().role == "assistant") {
@@ -7595,6 +7669,7 @@ protected:
 
         g_autoRetryTimerActive = false;
         g_autoRetryAttemptCount = 0;
+        refreshSendStopButtonVisual();
 
         if (!g_chatHistory.empty() && g_chatHistory.back().role == "assistant") {
             g_chatHistory.back().content = ai.replyText;
@@ -7650,11 +7725,11 @@ protected:
         g_lastPreviewTaskMode = ai.taskMode;
         g_hasGeneratedArt = true;
         g_hasPendingDrawingApproval = true;
-        m_previewTab = 1; // Открываем вкладку Drawing
+        m_previewTab = 1;
         refreshRightPanelTabsAndCanvas();
 
         if (!g_chatHistory.empty() && g_chatHistory.back().role == "assistant") {
-            g_chatHistory.back().content += " -> Ready in 'Drawing' & 'In GD' preview! Click the confirmation button below in chat to place into the level!";
+            g_chatHistory.back().content += " -> Ready in 'Drawing' & 'In GD'! Click 'Soglasen / Agree' to place!";
         }
         rebuildChatScrollFeed();
 
@@ -7689,15 +7764,31 @@ protected:
     }
 
     void updateKeyboardAndLock(float dt) {
-        // Если игрок вышел из редактора уровней — немедленно прерываем все запросы к ИИ!
         if (!m_editorUI || !m_editorUI->m_editorLayer || !g_editorSessionActive.load()) {
             cancelAllActiveAIRequestsOnEditorExit();
             return;
         }
 
-        restoreLockedContourPositions();
+        // Плавное появление / исчезновение меню изменением прозрачности
+        if (m_isClosingFade) {
+            m_fadeAlpha = (std::max)(0.0f, m_fadeAlpha - dt * 6.5f);
+            applyRecursiveNodeOpacity(m_mainLayer, static_cast<GLubyte>(std::lround(m_fadeAlpha * 255.0f)));
+            if (m_fadeAlpha <= 0.005f) {
+                restoreLockedContourPositions();
+                if (g_activePopup == this) {
+                    g_activePopup = nullptr;
+                }
+                Popup::onClose(nullptr);
+            }
+            return;
+        } else if (m_fadeAlpha < 1.0f) {
+            m_fadeAlpha = (std::min)(1.0f, m_fadeAlpha + dt * 6.5f);
+            applyRecursiveNodeOpacity(m_mainLayer, static_cast<GLubyte>(std::lround(m_fadeAlpha * 255.0f)));
+        }
 
-        // Проверяем завершение загрузки списка текстовых/кодовых моделей по API
+        restoreLockedContourPositions();
+        updateChatScrollbarThumb();
+
         if (g_modelFetchHasCompleted.load()) {
             g_modelFetchHasCompleted.store(false);
             if (m_stage == PopupStage::ModelSelector) {
@@ -7705,58 +7796,41 @@ protected:
             }
         }
 
-        // 1. Проверяем завершение фонового запроса к ИИ
         if (g_aiRequestHasCompleted) {
             g_aiRequestHasCompleted = false;
             handleCompletedAIResult(g_aiThreadResult);
         }
 
-        // 2. Анимация плавного белого перелива (Shimmer / пульсации) на области выделения + плавающие точки в чате во время генерации
+        // Переливание ТОНКИХ ПОЛОСОК рамки области выделения (без толстой полосы!) + плавная волна 3 точек в чате
         bool isGeneratingNow = (g_aiRequestThreadRunning || g_autoRetryTimerActive);
-        if (m_selectionShimmerOverlay && m_selectionShimmerBand) {
+        refreshSendStopButtonVisual();
+
+        if (m_selectionBorderNormal && m_selectionBorderShimmer) {
             if (isGeneratingNow) {
                 g_loadingShimmerTimer += dt;
-                m_selectionShimmerOverlay->setVisible(true);
-                m_selectionShimmerBand->setVisible(true);
-
-                float pulse = 0.5f + 0.5f * std::sin(g_loadingShimmerTimer * 4.5f);
-                GLubyte pulseAlpha = static_cast<GLubyte>(std::clamp(45.0f + pulse * 95.0f, 35.0f, 145.0f));
-                m_selectionShimmerOverlay->setOpacity(pulseAlpha);
-
-                // Плавное скольжение белой световой полосы (shimmer wave) слева направо внутри области выделения
-                float sweepFrac = std::fmod(g_loadingShimmerTimer * 0.85f, 1.0f);
-                float offsetX = -62.0f + sweepFrac * 124.0f;
-                float edgeFade = std::sin(sweepFrac * 3.14159265f);
-                m_selectionShimmerBand->setPosition(CCPoint{ m_selectionBoxCenter.x + offsetX, m_selectionBoxCenter.y });
-                m_selectionShimmerBand->setOpacity(static_cast<GLubyte>(std::clamp(edgeFade * 175.0f, 20.0f, 175.0f)));
+                float shimmerWave = 0.5f + 0.5f * std::sin(g_loadingShimmerTimer * 5.0f);
+                m_selectionBorderShimmer->setVisible(true);
+                m_selectionBorderShimmer->setOpacity(static_cast<GLubyte>(std::lround((45.0f + shimmerWave * 210.0f) * m_fadeAlpha)));
+                m_selectionBorderNormal->setOpacity(static_cast<GLubyte>(std::lround((110.0f + (1.0f - shimmerWave) * 100.0f) * m_fadeAlpha)));
             } else {
-                m_selectionShimmerOverlay->setVisible(false);
-                m_selectionShimmerBand->setVisible(false);
+                m_selectionBorderShimmer->setVisible(false);
+                m_selectionBorderNormal->setOpacity(static_cast<GLubyte>(std::lround(175.0f * m_fadeAlpha)));
             }
         }
 
         if (isGeneratingNow) {
-            g_floatingDotsTimer += dt;
-            if (g_floatingDotsTimer >= 0.32f) {
-                g_floatingDotsTimer = 0.0f;
-                g_floatingDotsPhase = (g_floatingDotsPhase + 1) % 4;
-                static constexpr const char* kFloatingDotsFrames[4] = {
-                    " .  ",
-                    " .. ",
-                    " ...",
-                    "  .."
-                };
-                if (!g_chatHistory.empty() && g_chatHistory.back().role == "assistant") {
-                    g_chatHistory.back().content = kFloatingDotsFrames[g_floatingDotsPhase];
-                    rebuildChatScrollFeed();
-                }
-                if (m_stepPlanLabel) {
-                    m_stepPlanLabel->setString(kFloatingDotsFrames[g_floatingDotsPhase]);
+            m_thinkingDotsAnimTime += dt;
+            for (int d = 0; d < 3; ++d) {
+                if (m_thinkingDots[d]) {
+                    // Каждая из 3 точек плавно движется поочередно вверх и вниз (синусоидальная волна со сдвигом фазы)
+                    float wave = std::sin(m_thinkingDotsAnimTime * 6.8f - d * 1.15f);
+                    float offsetY = wave * 3.0f;
+                    CCPoint curPos = m_thinkingDots[d]->getPosition();
+                    m_thinkingDots[d]->setPosition(CCPoint{ curPos.x, m_thinkingDotsBaseY + offsetY });
                 }
             }
         }
 
-        // 3. Тихий авто-повтор написанного сообщения каждые 2 секунды (без показа ошибок до 10-й попытки!)
         if (g_autoRetryTimerActive && !g_aiRequestThreadRunning && !g_pendingRetryPrompt.empty()) {
             g_autoRetryCountdown -= dt;
             if (g_autoRetryCountdown <= 0.0f) {
@@ -7765,7 +7839,6 @@ protected:
             }
         }
 
-        // Проверяем завершение фонового диалога выбора картинки-референса
         if (g_fileDialogHasResult) {
             g_fileDialogHasResult = false;
             if (g_fileDialogPickedSuccess && !g_fileDialogPickedPath.empty()) {
@@ -7883,12 +7956,10 @@ protected:
 #endif
     }
 
-    void onClose(CCObject* sender) override {
-        restoreLockedContourPositions();
-        if (g_activePopup == this) {
-            g_activePopup = nullptr;
+    void onClose(CCObject* /*sender*/) override {
+        if (!m_isClosingFade) {
+            m_isClosingFade = true;
         }
-        Popup::onClose(sender);
     }
 
 public:
