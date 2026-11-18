@@ -262,9 +262,11 @@ struct AIDecisionResult {
     bool wantCustomSpikes = false;      // Кастомные шипы от ИИ (собираются внутри треугольника шипа или спавнятся с нуля)
     bool allowOrbsAndPortals = false;   // Разрешение трогать орбы, дэш-орбы и порталы
     bool wantCustomOrbTexture = false;  // Кастомная текстура внутри орбов ТОЛЬКО по явной просьбе (иначе на орбах только неон!)
-    bool wantBackground = false;        // Создание заднего фона (BG), если ничего не выделено или попросили фон
+    bool wantBackground = false;        // Создание заднего фона (BG), только если явно попросили фон/небо/задник
     bool appendMode = false;            // Режим ДОБАВЛЕНИЯ к существующей постройке (не удаляет старый декор!)
     int textureResolution = 0;          // Разрешение текстуры ИИ по запросу: 0 (чистые векторы ИИ) или 16..128 (вплоть до 128x128!)
+    float freeSizeBlocksW = 0.0f;       // Ширина объекта/фона в блоках (выбирается самим ИИ или указывается игроком, когда ничего не выделено)
+    float freeSizeBlocksH = 0.0f;       // Высота объекта/фона в блоках (выбирается самим ИИ или указывается игроком, когда ничего не выделено)
 
     // cellElements: микро-дизайн ИИ внутри КАЖДОГО блока 30x30
     std::vector<AICustomDrawElement> cellElements;
@@ -2198,11 +2200,54 @@ static ccColor3B lerpColor(ccColor3B a, ccColor3B b, float t) {
 }
 
 // Одиночный вызов реальной нейросети (с поддержкой Multimodal Vision для референс-картинок!)
+// Проверяет, указал ли игрок конкретный объект или фон, когда в редакторе НИЧЕГО не выделено.
+// Если игрок ничего не выделил и написал только общие слова ("сделай", "декор", "построй", "новый стиль" и т.п.) без конкретного предмета/фона — возвращаем true (ИИ ничего не строит, а только спрашивает!).
+static bool isUnspecifiedPromptWhenNothingSelected(std::string const& rawPrompt) {
+    std::string lp = toLowerAsciiStr(trimWhitespace(rawPrompt));
+    if (lp.empty()) return true;
+
+    for (char& c : lp) {
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) continue;
+        c = ' ';
+    }
+
+    static const std::set<std::string> kGenericFillerWords = {
+        "sdelay", "sdelat", "postroy", "postroit", "narisuy", "narisovat", "sozday", "sozdat",
+        "dekor", "ukras", "ukrasit", "oformi", "oformit", "pridumay", "pridumat",
+        "make", "build", "create", "draw", "decorate", "decor", "design", "invent",
+        "completely", "new", "never", "before", "seen", "custom", "block", "blocks",
+        "variant", "with", "rich", "internal", "sub", "layers", "and", "transparency",
+        "unique", "multi", "layered", "art", "style", "glow", "non", "repeating",
+        "variation", "better", "a", "the", "on", "in", "to", "for", "of",
+        "pozhaluysta", "plz", "please", "bro", "vas", "vasya", "ey", "ale", "alo",
+        "privet", "hi", "hello", "zdarova", "test", "proverka", "davay", "go",
+        "chto", "nibud", "chtonibud", "lyuboy", "lyuboe", "krasivo", "krasiviy",
+        "normalno", "norm", "krutoy", "kruto", "horoshiy", "stil", "stily", "noviy"
+    };
+
+    std::istringstream iss(lp);
+    std::string w;
+    int concreteWordCount = 0;
+    while (iss >> w) {
+        bool allDigits = true;
+        for (char c : w) {
+            if (c < '0' || c > '9') { allDigits = false; break; }
+        }
+        if (allDigits) continue;
+        if (w.size() <= 1) continue;
+        if (kGenericFillerWords.count(w) > 0) continue;
+        concreteWordCount++;
+    }
+
+    return (concreteWordCount == 0);
+}
+
 static bool executeSingleNeuralNetPass(
     std::string const& systemRule,
     std::string const& userTurnPrompt,
     bool includeImage,
-    AIDecisionResult& outRes
+    AIDecisionResult& outRes,
+    bool hasSelectedContour = true
 ) {
     int httpStatus = 0;
     std::string rawResp;
@@ -2470,7 +2515,20 @@ static bool executeSingleNeuralNetPass(
         bool hasNeonWord  = (lp.find("neon") != std::string::npos || lp.find("glow") != std::string::npos ||
                              lp.find("svech") != std::string::npos || lp.find("svet") != std::string::npos);
 
-        if (forceBuildIfRequested && !isGreetingOnly && outRes.taskMode == AITaskMode::ChatOnly) {
+        bool unspecifiedNoSelection = (!hasSelectedContour && !g_hasReferenceImage && isUnspecifiedPromptWhenNothingSelected(userTurnPrompt));
+        if (unspecifiedNoSelection) {
+            outRes.taskMode = AITaskMode::ChatOnly;
+            outRes.cellElements.clear();
+            outRes.customElements.clear();
+            outRes.spikeElements.clear();
+            outRes.orbElements.clear();
+            if (outRes.replyText.empty() || outRes.replyText.find("Postroil") != std::string::npos) {
+                outRes.replyText = "U vas nichego ne vydeleno i ne ukazano, chto imenno stoyit sdelat! Vydelite bloki v redaktore ili napishite v chat, kakoy imenno obekt (i kakogo razmera) ili fon vy hotite sozdat.";
+            }
+            return;
+        }
+
+        if (forceBuildIfRequested && hasSelectedContour && !isGreetingOnly && outRes.taskMode == AITaskMode::ChatOnly) {
             outRes.taskMode = AITaskMode::FullDecor;
             outRes.selfMatchScore = 98;
         }
@@ -2525,6 +2583,71 @@ static bool executeSingleNeuralNetPass(
         }
 
         outRes.textureResolution = detectRequestedTextureResolution();
+
+        // Определяем размер объекта (в блоках), если игрок указал его в чате (например "размер 4x6", "5 на 5", "120x180 юнитов", "большой", "маленький")
+        bool hasTexWord = (lp.find("tekstur") != std::string::npos || lp.find("texture") != std::string::npos ||
+                           lp.find("piks") != std::string::npos || lp.find("pixel") != std::string::npos ||
+                           lp.find("kachestv") != std::string::npos || lp.find("razreshen") != std::string::npos);
+        for (size_t idx = 0; idx < lp.size(); ++idx) {
+            if (lp[idx] >= '0' && lp[idx] <= '9') {
+                size_t startNum = idx;
+                int wVal = 0;
+                while (idx < lp.size() && lp[idx] >= '0' && lp[idx] <= '9') {
+                    wVal = wVal * 10 + (lp[idx] - '0');
+                    ++idx;
+                }
+                size_t sepPos = idx;
+                while (sepPos < lp.size() && lp[sepPos] == ' ') ++sepPos;
+                bool matchedSep = false;
+                if (sepPos < lp.size() && (lp[sepPos] == 'x' || lp[sepPos] == '*')) {
+                    matchedSep = true;
+                    ++sepPos;
+                } else if (sepPos + 2 <= lp.size() && lp.compare(sepPos, 2, "na") == 0 &&
+                           (sepPos + 2 == lp.size() || lp[sepPos + 2] == ' ' || (lp[sepPos + 2] >= '0' && lp[sepPos + 2] <= '9'))) {
+                    matchedSep = true;
+                    sepPos += 2;
+                }
+                if (matchedSep) {
+                    while (sepPos < lp.size() && lp[sepPos] == ' ') ++sepPos;
+                    if (sepPos < lp.size() && lp[sepPos] >= '0' && lp[sepPos] <= '9') {
+                        int hVal = 0;
+                        while (sepPos < lp.size() && lp[sepPos] >= '0' && lp[sepPos] <= '9') {
+                            hVal = hVal * 10 + (lp[sepPos] - '0');
+                            ++sepPos;
+                        }
+                        idx = sepPos - 1;
+                        bool isStandardTexRes = (wVal == hVal && (wVal == 16 || wVal == 24 || wVal == 32 || wVal == 48 || wVal == 64 || wVal == 96 || wVal == 128));
+                        bool hasBlockOrSizeWordNear = (lp.find("razmer") != std::string::npos || lp.find("size") != std::string::npos ||
+                                                       lp.find("blok") != std::string::npos || lp.find("block") != std::string::npos);
+                        if (isStandardTexRes && (hasTexWord || !hasBlockOrSizeWordNear)) {
+                            continue;
+                        }
+                        bool isUnits = (lp.find("yunit") != std::string::npos || lp.find("unit") != std::string::npos);
+                        if (isUnits || (wVal >= 60 && hVal >= 60 && wVal % 30 == 0 && hVal % 30 == 0)) {
+                            outRes.freeSizeBlocksW = std::clamp(wVal / 30.0f, 1.0f, 60.0f);
+                            outRes.freeSizeBlocksH = std::clamp(hVal / 30.0f, 1.0f, 45.0f);
+                        } else if (wVal >= 1 && wVal <= 60 && hVal >= 1 && hVal <= 45) {
+                            outRes.freeSizeBlocksW = static_cast<float>(wVal);
+                            outRes.freeSizeBlocksH = static_cast<float>(hVal);
+                        }
+                        break;
+                    }
+                }
+                (void)startNum;
+            }
+        }
+        if (outRes.freeSizeBlocksW <= 0.1f || outRes.freeSizeBlocksH <= 0.1f) {
+            if (lp.find("ogromn") != std::string::npos || lp.find("huge") != std::string::npos || lp.find("giant") != std::string::npos) {
+                outRes.freeSizeBlocksW = 12.0f;
+                outRes.freeSizeBlocksH = 12.0f;
+            } else if (lp.find("bolsh") != std::string::npos || lp.find("big") != std::string::npos || lp.find("large") != std::string::npos) {
+                outRes.freeSizeBlocksW = 8.0f;
+                outRes.freeSizeBlocksH = 8.0f;
+            } else if (lp.find("malenk") != std::string::npos || lp.find("small") != std::string::npos || lp.find("mini") != std::string::npos) {
+                outRes.freeSizeBlocksW = 2.0f;
+                outRes.freeSizeBlocksH = 2.0f;
+            }
+        }
 
         bool hasAddWord = (lp.find("dobav") != std::string::npos || lp.find("esche") != std::string::npos ||
                            lp.find("esho") != std::string::npos || lp.find("dorisuy") != std::string::npos ||
@@ -2632,6 +2755,14 @@ static bool executeSingleNeuralNetPass(
         outRes.wantBackground        = extractJsonBoolField(innerJson, "want_background", false);
         outRes.appendMode        = extractJsonBoolField(innerJson, "append_mode", false);
         outRes.textureResolution = std::clamp(extractJsonIntField(innerJson, "tex_res", 0), 0, 128);
+        float aiSizeW = extractJsonFloatField(innerJson, "size_w", 0.0f);
+        float aiSizeH = extractJsonFloatField(innerJson, "size_h", 0.0f);
+        if (aiSizeW > 60.0f && aiSizeH > 60.0f) {
+            aiSizeW /= 30.0f;
+            aiSizeH /= 30.0f;
+        }
+        if (aiSizeW >= 0.5f) outRes.freeSizeBlocksW = std::clamp(aiSizeW, 0.5f, 60.0f);
+        if (aiSizeH >= 0.5f) outRes.freeSizeBlocksH = std::clamp(aiSizeH, 0.5f, 45.0f);
 
         outRes.cellElements.clear();
         outRes.customElements.clear();
@@ -2648,7 +2779,8 @@ static bool executeSingleNeuralNetPass(
                                    outRes.directDuplicateCount > 0 || outRes.directDeleteSelected || outRes.directRecolorOnly);
 
         if (outRes.taskMode == AITaskMode::ChatOnly &&
-            (!outRes.cellElements.empty() || !outRes.customElements.empty() || outRes.hasCustomPalette || hasDirectTransform)) {
+            (hasSelectedContour || !isUnspecifiedPromptWhenNothingSelected(userTurnPrompt)) &&
+            (!outRes.cellElements.empty() || !outRes.customElements.empty() || (hasSelectedContour && outRes.hasCustomPalette) || hasDirectTransform)) {
             outRes.taskMode = AITaskMode::FullDecor;
         }
         applyUserDirectivesAndFallbacks(true);
@@ -2721,6 +2853,9 @@ static AIDecisionResult queryRealNeuralNetwork(
         "3. REAL GD OBJECT IDs: 211 (universal colorable pixel/rectangle/line/micro-block), 8 (spike), 39 (small spike), 88/89/98 (saws), 406/407/408 (foliage), 1888 (glow), or any valid GD object ID. "
         "4. DIRECT EDITOR TRANSFORMS: \"move_x\", \"move_y\", \"rotate_deg\", \"scale_x\", \"scale_y\", \"duplicate_count\", \"duplicate_dx\", \"duplicate_dy\", \"delete_selected\": true/false, \"recolor_only\": true/false. "
         "5. Selection: {} blocks ({}x{} units, {} sloped cells, {} spikes, {} orbs/portals). Mode: {}. Variant #{}. Previously built: [{}]. {} "
+        "6. FREE OBJECT & BACKGROUND MODE (when 0 blocks are selected): "
+        "   - IF 0 blocks are selected AND the player did NOT specify a concrete object or background to create (e.g. empty/vague prompt like 'sdelay', 'dekor', 'postroy', 'new style', or greeting), DO NOT BUILD ANYTHING! Set \"action\": \"chat\", leave \"elements\": [] and \"cell_elements\": [] empty, and politely ask the player in \"reply\" what specific object (and size) or background they want you to create, or ask them to select blocks in the editor! "
+        "   - IF 0 blocks are selected AND the player DID specify a concrete object (e.g. tree, sword, dragon, pillar, monster, house, crystal, custom block, etc.) or background, build it with NO hitboxes, decide the best width and height in blocks via \"size_w\" (1..40) and \"size_h\" (1..30) (or use the size specified by the player), set \"want_background\": false for standalone objects, and \"want_background\": true ONLY for backgrounds! "
         "Respond ONLY with a single valid JSON object (no markdown fences): "
         "{{"
         "\"action\": \"build\" | \"only_3d\" | \"only_neon\" | \"only_fill\" | \"undo\" | \"chat\", "
@@ -2728,6 +2863,7 @@ static AIDecisionResult queryRealNeuralNetwork(
         "\"style_name\": \"name of the custom design\", "
         "\"plan\": \"detailed summary of layers, materials, and micro-textures\", "
         "\"match_score\": 99, "
+        "\"size_w\": 5, \"size_h\": 5, "
         "\"fill_rgb\": [r,g,b], \"mid_rgb\": [r,g,b], \"main_rgb\": [r,g,b], \"outline_rgb\": [r,g,b], \"glow_rgb\": [r,g,b], \"grad_top\": [r,g,b], \"grad_bot\": [r,g,b], \"plaster_rgb\": [r,g,b], \"mortar_rgb\": [r,g,b], "
         "\"tex_res\": 0..128, \"append_mode\": false, \"want_pbr\": false, \"want_gradient\": false, \"want_neon\": false, \"want_custom_spikes\": false, \"decorate_orbs_portals\": false, \"want_background\": false, "
         "\"move_x\": 0, \"move_y\": 0, \"rotate_deg\": 0, \"scale_x\": 1.0, \"scale_y\": 1.0, \"duplicate_count\": 0, \"duplicate_dx\": 0, \"duplicate_dy\": 0, \"delete_selected\": false, \"recolor_only\": false, "
@@ -2751,7 +2887,7 @@ static AIDecisionResult queryRealNeuralNetwork(
 
     uint64_t startEpoch = g_aiRequestCancelEpoch.load();
     AIDecisionResult bestRes;
-    if (!g_editorSessionActive.load() || !executeSingleNeuralNetPass(systemRule, userMessage, true, bestRes)) {
+    if (!g_editorSessionActive.load() || !executeSingleNeuralNetPass(systemRule, userMessage, true, bestRes, contour.hasAnySelection)) {
         return bestRes;
     }
     if (!g_editorSessionActive.load() || startEpoch != g_aiRequestCancelEpoch.load()) {
@@ -2786,7 +2922,7 @@ static AIDecisionResult queryRealNeuralNetwork(
             );
 
             AIDecisionResult refinedRes;
-            if (executeSingleNeuralNetPass(systemRule, critiquePrompt, false, refinedRes) &&
+            if (executeSingleNeuralNetPass(systemRule, critiquePrompt, false, refinedRes, contour.hasAnySelection) &&
                 refinedRes.httpSuccess &&
                 refinedRes.taskMode == AITaskMode::FullDecor &&
                 !refinedRes.customElements.empty()) {
@@ -3438,64 +3574,50 @@ static bool getExactFrameSpanAtWorldPoint(
     float& outMinY,
     float& outMaxY
 ) {
-    if (contour.exactMaxX > contour.exactMinX + 0.1f) {
-        if (wx < contour.exactMinX - 0.05f || wx > contour.exactMaxX + 0.05f ||
-            wy < contour.exactMinY - 0.05f || wy > contour.exactMaxY + 0.05f) {
-            return false;
+    if (contour.exactBoxes.empty()) return false;
+
+    // 1. Ищем бокс каркаса, содержащий точку (wx, wy) с небольшим допуском
+    int hitIdx = -1;
+    for (size_t i = 0; i < contour.exactBoxes.size(); ++i) {
+        auto const& bx = contour.exactBoxes[i];
+        if (wx >= bx.minX - 0.8f && wx <= bx.maxX + 0.8f &&
+            wy >= bx.minY - 0.8f && wy <= bx.maxY + 0.8f) {
+            hitIdx = static_cast<int>(i);
+            break;
         }
     }
+    if (hitIdx < 0) return false;
 
-    // 1. Проверяем, попадает ли точка напрямую внутрь одного из реальных боксов каркаса
-    bool hitRow = false;
-    float rowLeft = contour.exactMaxX;
-    float rowRight = contour.exactMinX;
-    for (auto const& bx : contour.exactBoxes) {
-        if (wy >= bx.minY - 1.5f && wy <= bx.maxY + 1.5f) {
-            rowLeft = (std::min)(rowLeft, bx.minX);
-            rowRight = (std::max)(rowRight, bx.maxX);
-            hitRow = true;
-        }
-    }
+    auto const& seedBox = contour.exactBoxes[hitIdx];
 
-    bool hitCol = false;
-    float colBot = contour.exactMaxY;
-    float colTop = contour.exactMinY;
-    for (auto const& bx : contour.exactBoxes) {
-        if (wx >= bx.minX - 1.5f && wx <= bx.maxX + 1.5f) {
-            colBot = (std::min)(colBot, bx.minY);
-            colTop = (std::max)(colTop, bx.maxY);
-            hitCol = true;
-        }
-    }
-
-    if (!hitRow) {
-        rowLeft = contour.exactMinX;
-        rowRight = contour.exactMaxX;
-    }
-    if (!hitCol) {
-        colBot = contour.exactMinY;
-        colTop = contour.exactMaxY;
-    }
-
-    if (wx < rowLeft - 0.05f || wx > rowRight + 0.05f ||
-        wy < colBot - 0.05f || wy > colTop + 0.05f) {
-        return false;
-    }
-
-    int gx = static_cast<int>(std::floor(wx / 30.0f));
-    int gy = static_cast<int>(std::floor(wy / 30.0f));
-    if (contour.occupiedCells.count({ gx, gy }) == 0) {
-        // Проверяем, не находится ли точка внутри реального смещенного блока каркаса
-        bool insideAnyExactBox = false;
+    // 2. Расширяем непрерывный горизонтальный интервал [rowLeft, rowRight] по соприкасающимся боксам на высоте wy
+    float rowLeft  = seedBox.minX;
+    float rowRight = seedBox.maxX;
+    bool expandedX = true;
+    while (expandedX) {
+        expandedX = false;
         for (auto const& bx : contour.exactBoxes) {
-            if (wx >= bx.minX && wx <= bx.maxX && wy >= bx.minY && wy <= bx.maxY) {
-                gx = bx.gx;
-                gy = bx.gy;
-                insideAnyExactBox = true;
-                break;
+            if (wy < bx.minY - 1.0f || wy > bx.maxY + 1.0f) continue;
+            if (bx.maxX >= rowLeft - 2.0f && bx.minX <= rowRight + 2.0f) {
+                if (bx.minX < rowLeft - 0.05f)  { rowLeft  = bx.minX; expandedX = true; }
+                if (bx.maxX > rowRight + 0.05f) { rowRight = bx.maxX; expandedX = true; }
             }
         }
-        if (!insideAnyExactBox) return false;
+    }
+
+    // 3. Расширяем непрерывный вертикальный интервал [colBot, colTop] по соприкасающимся боксам на координате wx
+    float colBot = seedBox.minY;
+    float colTop = seedBox.maxY;
+    bool expandedY = true;
+    while (expandedY) {
+        expandedY = false;
+        for (auto const& bx : contour.exactBoxes) {
+            if (wx < bx.minX - 1.0f || wx > bx.maxX + 1.0f) continue;
+            if (bx.maxY >= colBot - 2.0f && bx.minY <= colTop + 2.0f) {
+                if (bx.minY < colBot - 0.05f) { colBot = bx.minY; expandedY = true; }
+                if (bx.maxY > colTop + 0.05f) { colTop = bx.maxY; expandedY = true; }
+            }
+        }
     }
 
     outMinX = rowLeft;
@@ -3503,13 +3625,13 @@ static bool getExactFrameSpanAtWorldPoint(
     outMinY = colBot;
     outMaxY = colTop;
 
-    // Учитываем 45-градусные наклонные поверхности (Slope)
-    CellSlopeKind sk = getCellSlopeKind(contour, gx, gy);
+    // 4. Учитываем 45-градусные наклонные поверхности (Slope) внутри конкретного бокса seedBox
+    CellSlopeKind sk = getCellSlopeKind(contour, seedBox.gx, seedBox.gy);
     if (sk != CellSlopeKind::None) {
-        float cellLeft = (std::max)(rowLeft, gx * 30.0f);
-        float cellRight = (std::min)(rowRight, (gx + 1) * 30.0f);
-        float cellBot = (std::max)(colBot, gy * 30.0f);
-        float cellTop = (std::min)(colTop, (gy + 1) * 30.0f);
+        float cellLeft  = seedBox.minX;
+        float cellRight = seedBox.maxX;
+        float cellBot   = seedBox.minY;
+        float cellTop   = seedBox.maxY;
         float cellW = (std::max)(1.0f, cellRight - cellLeft);
         float cellH = (std::max)(1.0f, cellTop - cellBot);
         float u = std::clamp((wx - cellLeft) / cellW, 0.0f, 1.0f);
@@ -3549,17 +3671,17 @@ static bool getExactFrameSpanAtWorldPoint(
 static bool isWorldPointInsideExactContour(ContourAnalysis const& contour, float wx, float wy) {
     float minX = 0.f, maxX = 0.f, minY = 0.f, maxY = 0.f;
     return getExactFrameSpanAtWorldPoint(contour, wx, wy, minX, maxX, minY, maxY) &&
-           wx >= minX && wx <= maxX && wy >= minY && wy <= maxY;
+           wx >= minX - 0.1f && wx <= maxX + 0.1f && wy >= minY - 0.1f && wy <= maxY + 0.1f;
 }
 
 // Строго подрезает и зажимает любой внутренний блок/декор по ТОЧНЫМ координатам краев каркаса,
-// чтобы ни один пиксель или угол повернутого объекта НЕ вылезал за пределы каркаса!
+// не смещая блоки на чужую сетку и не оставляя щелей!
 static bool clipSpecStrictlyToExactContour(
     ContourAnalysis const& contour,
     IslandBounds const& isl,
     GeneratedObjectSpec& spec
 ) {
-    if (!contour.hasAnySelection || contour.occupiedCells.empty()) return true;
+    if (!contour.hasAnySelection || contour.exactBoxes.empty()) return true;
 
     float minX = isl.exactMinX;
     float maxX = isl.exactMaxX;
@@ -3568,10 +3690,6 @@ static bool clipSpecStrictlyToExactContour(
     if (!getExactFrameSpanAtWorldPoint(contour, spec.x, spec.y, minX, maxX, minY, maxY)) {
         return false;
     }
-    minX = (std::max)(minX, isl.exactMinX);
-    maxX = (std::min)(maxX, isl.exactMaxX);
-    minY = (std::max)(minY, isl.exactMinY);
-    maxY = (std::min)(maxY, isl.exactMaxY);
 
     float availW = maxX - minX;
     float availH = maxY - minY;
@@ -3586,9 +3704,8 @@ static bool clipSpecStrictlyToExactContour(
     float extX = halfW * cosA + halfH * sinA;
     float extY = halfW * sinA + halfH * cosA;
 
-    // Если размер объекта превышает точные границы каркаса в этом месте — уменьшаем его масштаб!
-    float maxHalfSpanX = availW * 0.495f;
-    float maxHalfSpanY = availH * 0.495f;
+    float maxHalfSpanX = availW * 0.50f;
+    float maxHalfSpanY = availH * 0.50f;
     if (sinA < 0.05f) {
         if (halfW > maxHalfSpanX) {
             halfW = maxHalfSpanX;
@@ -3625,37 +3742,15 @@ static bool clipSpecStrictlyToExactContour(
     spec.x = std::clamp(spec.x, minX + extX, maxX - extX);
     spec.y = std::clamp(spec.y, minY + extY, maxY - extY);
 
-    // Повторная проверка в новой точке (особенно важна возле наклонных 45° граней!)
-    float minX2 = minX, maxX2 = maxX, minY2 = minY, maxY2 = maxY;
-    if (!getExactFrameSpanAtWorldPoint(contour, spec.x, spec.y, minX2, maxX2, minY2, maxY2)) {
-        return false;
-    }
-    if (spec.x - extX < minX2 - 0.2f || spec.x + extX > maxX2 + 0.2f ||
-        spec.y - extY < minY2 - 0.2f || spec.y + extY > maxY2 + 0.2f) {
-        float availW2 = (std::max)(0.4f, maxX2 - minX2);
-        float availH2 = (std::max)(0.4f, maxY2 - minY2);
-        float shrink2 = 1.0f;
-        if (extX > availW2 * 0.48f && extX > 0.001f) shrink2 = (std::min)(shrink2, (availW2 * 0.48f) / extX);
-        if (extY > availH2 * 0.48f && extY > 0.001f) shrink2 = (std::min)(shrink2, (availH2 * 0.48f) / extY);
-        spec.scaleX *= shrink2;
-        spec.scaleY *= shrink2;
-        extX *= shrink2;
-        extY *= shrink2;
-        spec.x = std::clamp(spec.x, minX2 + extX, maxX2 - extX);
-        spec.y = std::clamp(spec.y, minY2 + extY, maxY2 - extY);
-    }
-
     return (spec.scaleX >= 0.002f && spec.scaleY >= 0.002f);
 }
 
 // ============================================================================
 // ТОЧНАЯ ГЕОМЕТРИЯ И ПОВОРОТ ШИПОВ (Spikes):
-// 1) Треугольная модель с учетом угла поворота sp.rotation и масштаба (sp.scaleX, sp.scaleY)
-// 2) Автоматическое определение ориентации шипа относительно поверхности и наклонных граней каркаса
+// 1) Треугольная форма с учетом угла поворота sp.rotation и масштаба (sp.scaleX, sp.scaleY)
+// 2) Корректный поворот по FlipX/FlipY и наклонным 45° граням каркаса (без переворачивания напольных шипов!)
 // ============================================================================
 static bool isWorldPointInsideRotatedSpikeTriangle(SelectedSpikeInfo const& sp, float wx, float wy) {
-    // В Cocos2d-x положительный угол rotation поворачивает по часовой стрелке:
-    // 0° = острие вверх (+Y), 90° = острие вправо (+X), 180° = острие вниз (-Y), -90°/270° = острие влево (-X)
     float rad = sp.rotation * (3.14159265f / 180.0f);
     float cosA = std::cos(rad);
     float sinA = std::sin(rad);
@@ -3663,7 +3758,6 @@ static bool isWorldPointInsideRotatedSpikeTriangle(SelectedSpikeInfo const& sp, 
     float dx = wx - sp.x;
     float dy = wy - sp.y;
 
-    // Обратное преобразование из мировых координат в локальные координаты шипа
     float lx =  dx * cosA - dy * sinA;
     float ly =  dx * sinA + dy * cosA;
 
@@ -3681,13 +3775,11 @@ static bool isWorldPointInsideRotatedSpikeTriangle(SelectedSpikeInfo const& sp, 
 }
 
 static void resolveSpikeRotationFromSurfaceAndGeometry(SelectedSpikeInfo& sp, ContourAnalysis const& info) {
-    // Нормализуем исходный угол из редактора к [-180, 180]
     float rot = std::fmod(sp.rotation, 360.0f);
     if (rot > 180.0f) rot -= 360.0f;
     if (rot <= -180.0f) rot += 360.0f;
 
-    // Учитываем FlipY / FlipX объекта в GD:
-    // Если шип отражен по вертикали (FlipY) при угле 0° -> он смотрит вниз (180°)!
+    // Учитываем отражение шипа в редакторе GD (FlipY / FlipX)
     if (sp.flipY && std::fabs(rot) < 5.0f) {
         rot = 180.0f;
     } else if (sp.flipY && std::fabs(std::fabs(rot) - 180.0f) < 5.0f) {
@@ -3697,60 +3789,13 @@ static void resolveSpikeRotationFromSurfaceAndGeometry(SelectedSpikeInfo& sp, Co
         rot = -rot;
     }
 
-    // Если угол остался 0° (по умолчанию), проверяем, к какой именно грани/поверхности каркаса прикреплен шип!
-    if (std::fabs(rot) < 1.0f && !sp.flipY && (!info.exactBoxes.empty() || !info.occupiedCells.empty())) {
+    // Если у шипа угол 0° и он стоит прямо на 45-градусном скате (Slope), поворачиваем его по нормали ската
+    if (std::fabs(rot) < 1.0f && !sp.flipY && !info.slopeCells.empty()) {
         int sgx = static_cast<int>(std::floor(sp.x / 30.0f));
         int sgy = static_cast<int>(std::floor(sp.y / 30.0f));
-
-        // 1. Проверяем наклонные 45° грани каркаса в клетке шипа или по соседству
-        CellSlopeKind skHere  = getCellSlopeKind(info, sgx, sgy);
-        CellSlopeKind skBelow = getCellSlopeKind(info, sgx, sgy - 1);
-        CellSlopeKind skAbove = getCellSlopeKind(info, sgx, sgy + 1);
-        CellSlopeKind activeSlope = (skHere != CellSlopeKind::None) ? skHere :
-                                    ((skBelow != CellSlopeKind::None) ? skBelow : skAbove);
-
-        if (activeSlope == CellSlopeKind::RoofLeft) {
-            rot = -45.0f;
-        } else if (activeSlope == CellSlopeKind::RoofRight) {
-            rot = 45.0f;
-        } else if (activeSlope == CellSlopeKind::CeilingLeft) {
-            rot = -135.0f;
-        } else if (activeSlope == CellSlopeKind::CeilingRight) {
-            rot = 135.0f;
-        } else {
-            // 2. Проверяем наличие опоры каркаса снизу, сверху (потолок), слева и справа (стены)
-            bool hasFloorBelow   = (info.occupiedCells.count({ sgx, sgy - 1 }) > 0);
-            bool hasCeilingAbove = (info.occupiedCells.count({ sgx, sgy + 1 }) > 0);
-            bool hasWallLeft     = (info.occupiedCells.count({ sgx - 1, sgy }) > 0);
-            bool hasWallRight    = (info.occupiedCells.count({ sgx + 1, sgy }) > 0);
-
-            for (auto const& bx : info.exactBoxes) {
-                bool xOverlap = (sp.x >= bx.minX - 6.0f && sp.x <= bx.maxX + 6.0f);
-                bool yOverlap = (sp.y >= bx.minY - 6.0f && sp.y <= bx.maxY + 6.0f);
-                if (xOverlap) {
-                    float dyFloor = sp.y - bx.maxY;
-                    if (dyFloor >= -4.0f && dyFloor <= 24.0f) hasFloorBelow = true;
-                    float dyCeil = bx.minY - sp.y;
-                    if (dyCeil >= -4.0f && dyCeil <= 24.0f) hasCeilingAbove = true;
-                }
-                if (yOverlap) {
-                    float dxLeft = sp.x - bx.maxX;
-                    if (dxLeft >= -4.0f && dxLeft <= 24.0f) hasWallLeft = true;
-                    float dxRight = bx.minX - sp.x;
-                    if (dxRight >= -4.0f && dxRight <= 24.0f) hasWallRight = true;
-                }
-            }
-
-            if (!hasFloorBelow) {
-                if (hasCeilingAbove) {
-                    rot = 180.0f; // Шип висит на потолке острием вниз
-                } else if (hasWallLeft && !hasWallRight) {
-                    rot = 90.0f;  // Шип на левой стене острием вправо
-                } else if (hasWallRight && !hasWallLeft) {
-                    rot = -90.0f; // Шип на правой стене острием влево
-                }
-            }
-        }
+        CellSlopeKind skHere = getCellSlopeKind(info, sgx, sgy);
+        if (skHere == CellSlopeKind::RoofLeft)       rot = -45.0f;
+        else if (skHere == CellSlopeKind::RoofRight) rot = 45.0f;
     }
 
     sp.rotation = rot;
@@ -3765,7 +3810,6 @@ static void detectAllContourSlopes(
     auto const& occ = info.occupiedCells;
     if (occ.empty()) return;
 
-    // 1. Сначала размечаем явные наклонные объекты и ступенчатые скаты крыш снизу вверх
     for (int pass = 0; pass < 3; ++pass) {
         for (auto const& [gx, gy] : occ) {
             bool topOpen    = (occ.count({ gx, gy + 1 }) == 0);
@@ -3774,7 +3818,6 @@ static void detectAllContourSlopes(
             bool rightOpen  = (occ.count({ gx + 1, gy }) == 0);
             bool isExp      = (explicitSlopeCells.count({ gx, gy }) > 0);
 
-            // Левый скат крыши / (сверху и слева пусто, справа и снизу занято, и идет ступенька вверх-вправо или снизу-слева уже скат)
             if (topOpen && leftOpen && !rightOpen && !bottomOpen) {
                 bool stepsUpRight   = (occ.count({ gx + 1, gy + 1 }) > 0);
                 bool contFromBelow  = (info.slopeCells.count({ gx - 1, gy - 1 }) > 0 && info.slopeCells[{ gx - 1, gy - 1 }] == CellSlopeKind::RoofLeft);
@@ -3783,7 +3826,6 @@ static void detectAllContourSlopes(
                     continue;
                 }
             }
-            // Правый скат крыши (сверху и справа пусто, слева и снизу занято)
             if (topOpen && rightOpen && !leftOpen && !bottomOpen) {
                 bool stepsUpLeft   = (occ.count({ gx - 1, gy + 1 }) > 0);
                 bool contFromBelow = (info.slopeCells.count({ gx + 1, gy - 1 }) > 0 && info.slopeCells[{ gx + 1, gy - 1 }] == CellSlopeKind::RoofRight);
@@ -3792,7 +3834,6 @@ static void detectAllContourSlopes(
                     continue;
                 }
             }
-            // Нижние скосы потолка
             if (bottomOpen && leftOpen && !rightOpen && !topOpen && isExp) {
                 info.slopeCells[{ gx, gy }] = CellSlopeKind::CeilingLeft;
             } else if (bottomOpen && rightOpen && !leftOpen && !topOpen && isExp) {
@@ -3813,22 +3854,6 @@ static void fillAllStructureInteriorsCompletely(std::set<std::pair<int, int>>& o
         if (w <= 2 || h <= 2 || w > 48 || h > 48) continue;
 
         std::set<std::pair<int, int>> boundary = isl.cells;
-        if (isl.minGY <= 1) {
-            int leftBottomX = 999999;
-            int rightBottomX = -999999;
-            for (auto const& [x, y] : isl.cells) {
-                if (y <= isl.minGY + 1) {
-                    leftBottomX  = (std::min)(leftBottomX, x);
-                    rightBottomX = (std::max)(rightBottomX, x);
-                }
-            }
-            if (leftBottomX < rightBottomX && (rightBottomX - leftBottomX) <= 16) {
-                for (int gx = leftBottomX; gx <= rightBottomX; ++gx) {
-                    boundary.insert({ gx, isl.minGY });
-                }
-            }
-        }
-
         int padMinX = isl.minGX - 1;
         int padMaxX = isl.maxGX + 1;
         int padMinY = isl.minGY - 1;
@@ -3952,23 +3977,19 @@ static ContourAnalysis analyzeSelectedContour(EditorUIType* ui) {
                 sp.sourceObj = obj;
                 info.spikes.push_back(sp);
             } else {
-                int gx = static_cast<int>(std::floor(pos.x / 30.0f));
-                int gy = static_cast<int>(std::floor(pos.y / 30.0f));
+                // В GD стандартный блок имеет центр (pos.x, pos.y) и точные края [pos.x - 15*sx, pos.x + 15*sx].
+                // Чтобы блоки, сдвинутые на полблока (например pos.x = 120.0), не прыгали на соседнюю клетку,
+                // вычисляем индекс клетки через std::lround((pos.x - 15.0f) / 30.0f)!
+                int gx = static_cast<int>(std::lround((pos.x - 15.0f) / 30.0f));
+                int gy = static_cast<int>(std::lround((pos.y - 15.0f) / 30.0f));
                 info.rawCells.insert({ gx, gy });
                 info.occupiedCells.insert({ gx, gy });
                 info.solidObjects.push_back(obj);
 
-                // Вычисляем точные координаты краев объекта каркаса (с учетом его реального размера, масштаба и поворота!)
                 float sx = std::fabs(obj->getScaleX()) > 0.01f ? std::fabs(obj->getScaleX()) : 1.0f;
                 float sy = std::fabs(obj->getScaleY()) > 0.01f ? std::fabs(obj->getScaleY()) : 1.0f;
-                float baseHalfW = 15.0f;
-                float baseHalfH = 15.0f;
-                CCSize cs = obj->getContentSize();
-                if (cs.width > 1.5f && cs.width < 27.0f) baseHalfW = cs.width * 0.5f;
-                if (cs.height > 1.5f && cs.height < 27.0f) baseHalfH = cs.height * 0.5f;
-
-                float halfW = baseHalfW * sx;
-                float halfH = baseHalfH * sy;
+                float halfW = 15.0f * sx;
+                float halfH = 15.0f * sy;
                 float rad = std::fabs(obj->getRotation()) * (3.14159265f / 180.0f);
                 float cosA = std::fabs(std::cos(rad));
                 float sinA = std::fabs(std::sin(rad));
@@ -4007,34 +4028,31 @@ static ContourAnalysis analyzeSelectedContour(EditorUIType* ui) {
         std::set<std::pair<int, int>> explicitSlopes;
         for (GameObject* obj : info.solidObjects) {
             if (isSlopeGameObject(obj)) {
-                int sgx = static_cast<int>(std::floor(obj->getPosition().x / 30.0f));
-                int sgy = static_cast<int>(std::floor(obj->getPosition().y / 30.0f));
+                int sgx = static_cast<int>(std::lround((obj->getPosition().x - 15.0f) / 30.0f));
+                int sgy = static_cast<int>(std::lround((obj->getPosition().y - 15.0f) / 30.0f));
                 explicitSlopes.insert({ sgx, sgy });
             }
         }
         fillAllStructureInteriorsCompletely(info.occupiedCells);
         detectAllContourSlopes(info, explicitSlopes);
 
-        // Для заполненных внутренних клеток между реальными краями каркаса добавляем боксы, зажатые в exactMin..exactMax
+        // Для заполненных внутренних клеток замкнутого контура вычисляем координаты из соседних реальных блоков
         for (auto const& [gx, gy] : info.occupiedCells) {
             if (info.rawCells.count({ gx, gy }) > 0) continue;
             ExactFrameBox ib;
             ib.gx = gx;
             ib.gy = gy;
-            ib.minX = (info.exactMaxX > info.exactMinX) ? (std::max)(info.exactMinX, gx * 30.0f) : (gx * 30.0f);
-            ib.maxX = (info.exactMaxX > info.exactMinX) ? (std::min)(info.exactMaxX, (gx + 1) * 30.0f) : ((gx + 1) * 30.0f);
-            ib.minY = (info.exactMaxY > info.exactMinY) ? (std::max)(info.exactMinY, gy * 30.0f) : (gy * 30.0f);
-            ib.maxY = (info.exactMaxY > info.exactMinY) ? (std::min)(info.exactMaxY, (gy + 1) * 30.0f) : ((gy + 1) * 30.0f);
-            if (ib.maxX > ib.minX && ib.maxY > ib.minY) {
-                ib.cx = (ib.minX + ib.maxX) * 0.5f;
-                ib.cy = (ib.minY + ib.maxY) * 0.5f;
-                ib.halfW = (ib.maxX - ib.minX) * 0.5f;
-                ib.halfH = (ib.maxY - ib.minY) * 0.5f;
-                info.exactBoxes.push_back(ib);
-            }
+            ib.minX = gx * 30.0f;
+            ib.maxX = (gx + 1) * 30.0f;
+            ib.minY = gy * 30.0f;
+            ib.maxY = (gy + 1) * 30.0f;
+            ib.cx = gx * 30.0f + 15.0f;
+            ib.cy = gy * 30.0f + 15.0f;
+            ib.halfW = 15.0f;
+            ib.halfH = 15.0f;
+            info.exactBoxes.push_back(ib);
         }
 
-        // Определяем точный угол поворота каждого шипа по его настройкам и геометрии поверхности каркаса
         for (auto& sp : info.spikes) {
             resolveSpikeRotationFromSurfaceAndGeometry(sp, info);
         }
@@ -4042,8 +4060,6 @@ static ContourAnalysis analyzeSelectedContour(EditorUIType* ui) {
 
     info.hasAnySelection = (!info.occupiedCells.empty() || !info.spikes.empty() || !info.orbsAndPortals.empty());
 
-    // Если НИЧЕГО не выделено — НЕ добавляем 9 фейковых блоков в occupiedCells (оставляем 0 блоков!),
-    // а задаем только рабочие границы камеры 16x9 клеток на случай генерации заднего фона (Background)!
     if (!info.hasAnySelection) {
         int baseGX = static_cast<int>(std::floor(info.cameraCenterWorld.x / 30.0f));
         int baseGY = (std::max)(2, static_cast<int>(std::floor(info.cameraCenterWorld.y / 30.0f)));
@@ -4069,9 +4085,9 @@ static ContourAnalysis analyzeSelectedContour(EditorUIType* ui) {
     };
 
     for (auto const& [gx, gy] : info.occupiedCells) expandBounds(gx, gy);
-    for (auto const& sp : info.spikes) expandBounds(static_cast<int>(std::floor(sp.x / 30.0f)), static_cast<int>(std::floor(sp.y / 30.0f)));
+    for (auto const& sp : info.spikes) expandBounds(static_cast<int>(std::lround((sp.x - 15.0f) / 30.0f)), static_cast<int>(std::lround((sp.y - 15.0f) / 30.0f)));
     if (info.occupiedCells.empty() && info.spikes.empty()) {
-        for (auto const& op : info.orbsAndPortals) expandBounds(static_cast<int>(std::floor(op.x / 30.0f)), static_cast<int>(std::floor(op.y / 30.0f)));
+        for (auto const& op : info.orbsAndPortals) expandBounds(static_cast<int>(std::lround((op.x - 15.0f) / 30.0f)), static_cast<int>(std::lround((op.y - 15.0f) / 30.0f)));
     }
 
     if (info.exactBoxes.empty()) {
@@ -4659,41 +4675,134 @@ static void appendCustomOrbDashPortalDecoration(
     }
 }
 
-// СБОРКА ЗАДНЕГО ФОНА (BACKGROUND / BG) ИСКЛЮЧИТЕЛЬНО ИЗ ЭЛЕМЕНТОВ САМОЙ НЕЙРОСЕТИ (без заготовленных гор и шаблонов!)
+// СВОБОДНАЯ ГЕНЕРАЦИЯ ОБЪЕКТОВ БЕЗ ХИТБОКСОВ ИЛИ ЗАДНЕГО ФОНА (КОГДА НИЧЕГО НЕ ВЫДЕЛЕНО В РЕДАКТОРЕ!)
+// ИИ сам выбирает размер объекта (size_w x size_h в блоках) или берет размер, который указал игрок в чате.
+// Все создаваемые объекты гарантированно имеют noTouch = true (0% хитбоксов)!
 static void appendCustomBackgroundInEditor(
     std::vector<GeneratedObjectSpec>& result,
     ContourAnalysis const& contour,
     EditorTabCatalog const& cat,
     AIDecisionResult const& ai
 ) {
-    int bgCols = (std::max)(12, contour.maxGX - contour.minGX + 1);
-    int bgRows = (std::max)(8,  contour.maxGY - contour.minGY + 1);
-    float bgOriginX = contour.minGX * 30.f;
-    float bgOriginY = contour.minGY * 30.f;
-    float bgSpanW   = bgCols * 30.f;
-    float bgSpanH   = bgRows * 30.f;
-    float centerX   = bgOriginX + bgSpanW * 0.5f;
-    float centerY   = bgOriginY + bgSpanH * 0.5f;
+    bool isFullBackground = ai.wantBackground;
 
-    if (!ai.appendMode) {
-        addSpec(result, 211, centerX, centerY, bgSpanW / 30.0f, bgSpanH / 30.0f, 0.f, LayerRole::Fill, ColorSlot::CustomRGB, -15, 0, true, 255, -3, 0, ai.fillRGB, false);
+    // ИИ сам решает размер (или берет размер, указанный игроком):
+    // для фона по умолчанию 16x9 блоков, для отдельного объекта — выбранный ИИ/игроком размер (по умолчанию 5x5 блоков)
+    float blocksW = (ai.freeSizeBlocksW >= 0.5f)
+        ? std::clamp(ai.freeSizeBlocksW, 0.5f, 60.0f)
+        : (isFullBackground ? 16.0f : 5.0f);
+    float blocksH = (ai.freeSizeBlocksH >= 0.5f)
+        ? std::clamp(ai.freeSizeBlocksH, 0.5f, 45.0f)
+        : (isFullBackground ? 9.0f : 5.0f);
+
+    float spanW = blocksW * 30.0f;
+    float spanH = blocksH * 30.0f;
+    float centerX = contour.cameraCenterWorld.x;
+    float centerY = (std::max)(spanH * 0.5f + 15.0f, contour.cameraCenterWorld.y);
+    float originX = centerX - spanW * 0.5f;
+    float originY = centerY - spanH * 0.5f;
+
+    // 1. Если игрок попросил именно ФОН (wantBackground == true) — ставим фоновую подложку (или сплошной градиент без полосок)
+    if (isFullBackground && !ai.appendMode) {
+        if (ai.hasGradient) {
+            constexpr int kBgGradBands = 24;
+            for (int b = 0; b < kBgGradBands; ++b) {
+                float t = (b + 0.5f) / static_cast<float>(kBgGradBands);
+                float by = originY + t * spanH;
+                ccColor3B gCol = lerpColor(ai.gradBotRGB, ai.gradTopRGB, t);
+                addSpec(
+                    result, 211, centerX, by,
+                    spanW / 30.0f, (spanH / 30.0f) * (1.25f / kBgGradBands),
+                    0.f, LayerRole::Fill, ColorSlot::CustomRGB,
+                    -15 + b, 0, true, 255, -3, 0, gCol, false
+                );
+            }
+        } else {
+            addSpec(result, 211, centerX, centerY, spanW / 30.0f, spanH / 30.0f, 0.f, LayerRole::Fill, ColorSlot::CustomRGB, -15, 0, true, 255, -3, 0, ai.fillRGB, false);
+        }
     }
 
+    // 2. Если игрок попросил высокоточную текстуру (например 32x32, 64x64, 128x128) или приложил референс для свободного объекта
+    if (!isFullBackground && !ai.appendMode && (ai.textureResolution >= 16 || g_hasReferenceImage)) {
+        int resN = (ai.textureResolution >= 16) ? std::clamp(ai.textureResolution, 16, 128) : 64;
+        int cols = (std::max)(1, static_cast<int>(std::lround(blocksW)));
+        int rows = (std::max)(1, static_cast<int>(std::lround(blocksH)));
+        ContourAnalysis freeContour;
+        freeContour.hasAnySelection = true;
+        freeContour.minGX = 0;
+        freeContour.maxGX = cols - 1;
+        freeContour.minGY = 0;
+        freeContour.maxGY = rows - 1;
+        freeContour.exactMinX = originX;
+        freeContour.exactMaxX = originX + spanW;
+        freeContour.exactMinY = originY;
+        freeContour.exactMaxY = originY + spanH;
+
+        IslandBounds freeIsl;
+        freeIsl.minGX = 0;
+        freeIsl.maxGX = cols - 1;
+        freeIsl.minGY = 0;
+        freeIsl.maxGY = rows - 1;
+        freeIsl.exactMinX = originX;
+        freeIsl.exactMaxX = originX + spanW;
+        freeIsl.exactMinY = originY;
+        freeIsl.exactMaxY = originY + spanH;
+
+        for (int gy = 0; gy < rows; ++gy) {
+            for (int gx = 0; gx < cols; ++gx) {
+                freeContour.occupiedCells.insert({ gx, gy });
+                freeIsl.cells.insert({ gx, gy });
+                ExactFrameBox bx;
+                bx.gx = gx;
+                bx.gy = gy;
+                bx.minX = originX + gx * (spanW / cols);
+                bx.maxX = originX + (gx + 1) * (spanW / cols);
+                bx.minY = originY + gy * (spanH / rows);
+                bx.maxY = originY + (gy + 1) * (spanH / rows);
+                bx.cx = (bx.minX + bx.maxX) * 0.5f;
+                bx.cy = (bx.minY + bx.maxY) * 0.5f;
+                bx.halfW = (bx.maxX - bx.minX) * 0.5f;
+                bx.halfH = (bx.maxY - bx.minY) * 0.5f;
+                freeContour.exactBoxes.push_back(bx);
+            }
+        }
+        int styleSeed = static_cast<int>(ai.fillRGB.r * 73 + ai.mainRGB.g * 151 + g_variantIndex * 997);
+        appendDynamicHighResAITextureCanvas(result, freeContour, freeIsl, ai, resN, styleSeed);
+    } else if (!isFullBackground && !ai.appendMode && ai.hasGradient && ai.customElements.empty()) {
+        // Если попросили свободный градиентный объект без выделения — строим сплошной бесшовный градиент выбранного размера
+        constexpr int kFreeGradBands = 20;
+        for (int b = 0; b < kFreeGradBands; ++b) {
+            float t = (b + 0.5f) / static_cast<float>(kFreeGradBands);
+            float by = originY + t * spanH;
+            ccColor3B gCol = lerpColor(ai.gradBotRGB, ai.gradTopRGB, t);
+            addSpec(
+                result, 211, centerX, by,
+                spanW / 30.0f, (spanH / 30.0f) * (1.22f / kFreeGradBands),
+                0.f, LayerRole::InnerDetail, ColorSlot::CustomRGB,
+                2 + b, 0, true, 255, 1, 1, gCol, false
+            );
+        }
+    }
+
+    // 3. Собираем сам запрошенный объект (или детали сцены) из элементов ИИ в выбранном масштабе (blocksW x blocksH) БЕЗ ХИТБОКСОВ!
+    float scaleMulW = isFullBackground ? 1.0f : std::clamp(blocksW / 4.0f, 0.35f, 8.0f);
+    float scaleMulH = isFullBackground ? 1.0f : std::clamp(blocksH / 4.0f, 0.35f, 8.0f);
+
     for (auto const& el : ai.customElements) {
-        float wx = bgOriginX + el.rx * bgSpanW;
-        float wy = bgOriginY + el.ry * bgSpanH;
+        float wx = originX + el.rx * spanW;
+        float wy = originY + el.ry * spanH;
 
         GeneratedObjectSpec cs;
         cs.objectId               = resolveAIElementObjectID(el, cat, true);
         cs.x                      = wx;
         cs.y                      = wy;
-        cs.scaleX                 = std::clamp(el.scaleX, 0.005f, 25.0f);
-        cs.scaleY                 = std::clamp(el.scaleY, 0.005f, 25.0f);
+        cs.scaleX                 = std::clamp(el.scaleX * (el.scaleX <= 1.5f ? scaleMulW : 1.0f), 0.005f, 30.0f);
+        cs.scaleY                 = std::clamp(el.scaleY * (el.scaleY <= 1.5f ? scaleMulH : 1.0f), 0.005f, 30.0f);
         cs.rotation               = el.rot;
         cs.layerRole              = LayerRole::InnerDetail;
-        cs.editorLayerOffset      = 1;
-        cs.zLayerCode             = -3;
-        cs.zOrder                 = std::clamp(el.zOrder, -14, -1);
+        cs.editorLayerOffset      = isFullBackground ? 1 : std::clamp(el.editorLayerOff, 1, 5);
+        cs.zLayerCode             = isFullBackground ? -3 : (std::max)(1, el.zLayerCode);
+        cs.zOrder                 = isFullBackground ? std::clamp(el.zOrder, -14, -1) : (std::max)(5, el.zOrder);
         cs.colorSlot              = ColorSlot::CustomRGB;
         cs.customColor            = el.color;
         cs.customOpacity          = el.opacity;
@@ -4704,9 +4813,54 @@ static void appendCustomBackgroundInEditor(
         cs.detailBlending         = el.detailBlending;
         cs.priorityTier           = 0;
         cs.isOverhang             = true;
-        cs.noTouch                = true;
+        cs.noTouch                = true; // СТРОГО БЕЗ ХИТБОКСОВ!
         cs.noGlow                 = true;
         result.push_back(cs);
+    }
+
+    // Если ИИ также передал клеточные элементы cell_elements для свободного объекта (и не включен сплошной градиент)
+    if (!isFullBackground && !ai.hasGradient && !ai.cellElements.empty() && ai.textureResolution < 16) {
+        int gridCols = std::clamp(static_cast<int>(std::lround(blocksW)), 1, 16);
+        int gridRows = std::clamp(static_cast<int>(std::lround(blocksH)), 1, 16);
+        float cellW = spanW / static_cast<float>(gridCols);
+        float cellH = spanH / static_cast<float>(gridRows);
+        for (int gy = 0; gy < gridRows; ++gy) {
+            for (int gx = 0; gx < gridCols; ++gx) {
+                float cLeft = originX + gx * cellW;
+                float cBot  = originY + gy * cellH;
+                for (auto const& cel : ai.cellElements) {
+                    GeneratedObjectSpec cs;
+                    cs.objectId               = resolveAIElementObjectID(cel, cat, true);
+                    cs.x                      = cLeft + std::clamp(cel.rx, 0.0f, 1.0f) * cellW;
+                    cs.y                      = cBot  + std::clamp(cel.ry, 0.0f, 1.0f) * cellH;
+                    cs.scaleX                 = std::clamp(cel.scaleX * (cellW / 30.0f), 0.005f, 5.0f);
+                    cs.scaleY                 = std::clamp(cel.scaleY * (cellH / 30.0f), 0.005f, 5.0f);
+                    cs.rotation               = cel.rot;
+                    cs.layerRole              = LayerRole::InnerDetail;
+                    cs.editorLayerOffset      = std::clamp(cel.editorLayerOff, 1, 5);
+                    cs.zLayerCode             = (std::max)(1, cel.zLayerCode);
+                    cs.zOrder                 = (std::max)(8, cel.zOrder);
+                    cs.colorSlot              = ColorSlot::CustomRGB;
+                    cs.customColor            = cel.color;
+                    cs.customOpacity          = cel.opacity;
+                    cs.customBlending         = cel.blending;
+                    cs.hasSeparateDetailColor = cel.hasDetailColor;
+                    cs.detailColor            = cel.detailColor;
+                    cs.detailOpacity          = cel.detailOpacity;
+                    cs.detailBlending         = cel.detailBlending;
+                    cs.priorityTier           = 0;
+                    cs.isOverhang             = true;
+                    cs.noTouch                = true; // СТРОГО БЕЗ ХИТБОКСОВ!
+                    cs.noGlow                 = true;
+                    result.push_back(cs);
+                }
+            }
+        }
+    }
+
+    // Гарантируем, что абсолютно каждый объект, созданный без выделения, не имеет хитбокса!
+    for (auto& s : result) {
+        s.noTouch = true;
     }
 }
 
@@ -4872,10 +5026,21 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
             bool rightOpen  = (contour.occupiedCells.count({ gx + 1, gy }) == 0);
             CellSlopeKind slopeKind = getCellSlopeKind(contour, gx, gy);
 
-            // 2. Базовая подложка клетки (строго в пределах точных координат краев каркаса!)
+            // Проверяем открытые грани по реальному соседству точных боксов каркаса (а не только по сетке 30x30!)
+            for (auto const& otherBx : contour.exactBoxes) {
+                if (&otherBx == &std::as_const(otherBx) && std::fabs(otherBx.cx - cx) < 0.5f && std::fabs(otherBx.cy - cy) < 0.5f) continue;
+                bool overlapX = (otherBx.maxX > cellLeft + 2.0f && otherBx.minX < cellRight - 2.0f);
+                bool overlapY = (otherBx.maxY > cellBot + 2.0f && otherBx.minY < cellTop - 2.0f);
+                if (overlapX && std::fabs(otherBx.minY - cellTop) <= 3.5f) topOpen = false;
+                if (overlapX && std::fabs(otherBx.maxY - cellBot) <= 3.5f) bottomOpen = false;
+                if (overlapY && std::fabs(otherBx.maxX - cellLeft) <= 3.5f) leftOpen = false;
+                if (overlapY && std::fabs(otherBx.minX - cellRight) <= 3.5f) rightOpen = false;
+            }
+
+            // 2. Базовая подложка клетки: когда идет градиент — рендерим СПЛОШНОЙ бесшовный градиент без полосок!
             if (!ai.appendMode && ai.textureResolution < 16) {
                 if (slopeKind != CellSlopeKind::None) {
-                    constexpr int kSlopeBands = 8;
+                    constexpr int kSlopeBands = 12;
                     for (int sb = 0; sb < kSlopeBands; ++sb) {
                         float lv = (sb + 0.5f) / static_cast<float>(kSlopeBands);
                         float uMin = 0.0f, uMax = 1.0f;
@@ -4885,56 +5050,66 @@ static std::vector<GeneratedObjectSpec> generateArtFromAIDecision(
                         ccColor3B bCol = ai.hasGradient
                             ? lerpColor(ai.gradBotRGB, ai.gradTopRGB, std::clamp((bandY - originY) / spanH, 0.0f, 1.0f))
                             : ai.fillRGB;
-                        addClippedSpec(211, bandX, bandY, (uMax - uMin) * (cellW / 30.f), (1.05f / kSlopeBands) * (cellH / 30.f), 0.f, LayerRole::Fill, ColorSlot::CustomRGB, 1, 0, false, 255, -3, 0, bCol, false);
+                        addClippedSpec(211, bandX, bandY, (uMax - uMin) * (cellW / 30.f), (1.15f / kSlopeBands) * (cellH / 30.f), 0.f, LayerRole::Fill, ColorSlot::CustomRGB, 4, 0, false, 255, 1, 1, bCol, false);
                     }
                 } else if (ai.hasGradient) {
-                    for (int band = 0; band < 4; ++band) {
-                        float bandFrac = (band + 0.5f) / 4.0f;
+                    // Сплошной гладкий градиент из 12 бесшовных перекрывающихся слоев на клетку (0 полосок и 0 щелей!)
+                    constexpr int kSmoothGradBands = 12;
+                    for (int band = 0; band < kSmoothGradBands; ++band) {
+                        float bandFrac = (band + 0.5f) / static_cast<float>(kSmoothGradBands);
                         float bandY = cellBot + bandFrac * cellH;
                         float globalT = std::clamp((bandY - originY) / spanH, 0.0f, 1.0f);
                         ccColor3B bandCol = lerpColor(ai.gradBotRGB, ai.gradTopRGB, globalT);
-                        addClippedSpec(211, cx, bandY, cellW / 30.f, 0.27f * (cellH / 30.f), 0.f, LayerRole::Fill, ColorSlot::CustomRGB, 1 + band, 0, false, 255, -3, 0, bandCol, false);
+                        addClippedSpec(
+                            211, cx, bandY,
+                            cellW / 30.f,
+                            (1.22f / kSmoothGradBands) * (cellH / 30.f),
+                            0.f, LayerRole::Fill, ColorSlot::CustomRGB,
+                            4 + band, 0, false, 255, 1, 1, bandCol, false
+                        );
                     }
                 } else {
-                    addClippedSpec(211, cx, cy, cellW / 30.f, cellH / 30.f, 0.f, LayerRole::Fill, ColorSlot::CustomRGB, 1, 0, false, 255, -3, 0, ai.fillRGB, false);
+                    addClippedSpec(211, cx, cy, cellW / 30.f, cellH / 30.f, 0.f, LayerRole::Fill, ColorSlot::CustomRGB, 4, 0, false, 255, 1, 1, ai.fillRGB, false);
                 }
             }
 
-            // 3. Прямая генерация клеточных элементов от самой нейросети (строго подрезанная по точным краям каркаса!)
-            for (auto const& cel : ai.cellElements) {
-                float u = std::clamp(cel.rx, 0.01f, 0.99f);
-                float v = std::clamp(cel.ry, 0.01f, 0.99f);
-                if (!isLocalPointInsideCellSlope(slopeKind, u, v)) continue;
+            // 3. Прямая генерация клеточных элементов от нейросети (отключаем повторяющиеся полоски при сплошном градиенте!)
+            if (!ai.hasGradient) {
+                for (auto const& cel : ai.cellElements) {
+                    float u = std::clamp(cel.rx, 0.01f, 0.99f);
+                    float v = std::clamp(cel.ry, 0.01f, 0.99f);
+                    if (!isLocalPointInsideCellSlope(slopeKind, u, v)) continue;
 
-                GeneratedObjectSpec cs;
-                cs.objectId               = resolveAIElementObjectID(cel, cat, true);
-                cs.x                      = cellLeft + u * cellW;
-                cs.y                      = cellBot  + v * cellH;
-                cs.scaleX                 = std::clamp(cel.scaleX, 0.002f, 2.5f) * (cellW / 30.f);
-                cs.scaleY                 = std::clamp(cel.scaleY, 0.002f, 2.5f) * (cellH / 30.f);
-                cs.rotation               = cel.rot;
-                cs.layerRole              = LayerRole::InnerDetail;
-                cs.editorLayerOffset      = std::clamp(cel.editorLayerOff, 1, 5);
-                cs.zLayerCode             = (std::max)(1, cel.zLayerCode);
-                cs.zOrder                 = (std::max)(8, cel.zOrder);
-                cs.colorSlot              = ColorSlot::CustomRGB;
-                cs.customColor            = cel.color;
-                cs.customOpacity          = cel.opacity;
-                cs.customBlending         = cel.blending;
-                cs.hasSeparateDetailColor = cel.hasDetailColor;
-                cs.detailColor            = cel.detailColor;
-                cs.detailOpacity          = cel.detailOpacity;
-                cs.detailBlending         = cel.detailBlending;
-                cs.priorityTier           = 0;
-                cs.noTouch                = true;
-                cs.noGlow                 = true;
-                if (clipSpecStrictlyToExactContour(contour, isl, cs)) {
-                    result.push_back(cs);
+                    GeneratedObjectSpec cs;
+                    cs.objectId               = resolveAIElementObjectID(cel, cat, true);
+                    cs.x                      = cellLeft + u * cellW;
+                    cs.y                      = cellBot  + v * cellH;
+                    cs.scaleX                 = std::clamp(cel.scaleX, 0.002f, 2.5f) * (cellW / 30.f);
+                    cs.scaleY                 = std::clamp(cel.scaleY, 0.002f, 2.5f) * (cellH / 30.f);
+                    cs.rotation               = cel.rot;
+                    cs.layerRole              = LayerRole::InnerDetail;
+                    cs.editorLayerOffset      = std::clamp(cel.editorLayerOff, 1, 5);
+                    cs.zLayerCode             = (std::max)(1, cel.zLayerCode);
+                    cs.zOrder                 = (std::max)(8, cel.zOrder);
+                    cs.colorSlot              = ColorSlot::CustomRGB;
+                    cs.customColor            = cel.color;
+                    cs.customOpacity          = cel.opacity;
+                    cs.customBlending         = cel.blending;
+                    cs.hasSeparateDetailColor = cel.hasDetailColor;
+                    cs.detailColor            = cel.detailColor;
+                    cs.detailOpacity          = cel.detailOpacity;
+                    cs.detailBlending         = cel.detailBlending;
+                    cs.priorityTier           = 0;
+                    cs.noTouch                = true;
+                    cs.noGlow                 = true;
+                    if (clipSpecStrictlyToExactContour(contour, isl, cs)) {
+                        result.push_back(cs);
+                    }
                 }
             }
 
-            // 4. Тонкая обводка по точным внешним краям и 45° скатам
-            if (!ai.appendMode) {
+            // 4. Тонкая обводка ТОЛЬКО если не включен сплошной градиент (чтобы на градиенте не было никаких полосок!)
+            if (!ai.appendMode && !ai.hasGradient) {
                 bool glowBorder = ai.wantNeon;
                 if (slopeKind == CellSlopeKind::RoofLeft || slopeKind == CellSlopeKind::CeilingRight) {
                     addSpec(result, 211, cx, cy, 1.414f * (cellW / 30.f), 0.025f, -45.f, LayerRole::Outline3D, ColorSlot::CustomRGB, 11, 0, false, 200, 3, 3, ai.outlineRGB, glowBorder);
@@ -5135,12 +5310,21 @@ static SpawnSummary placeGeneratedArtInEditor(
     }
 
     if (!isAppendingToPlaced && (taskMode == AITaskMode::FullDecor || taskMode == AITaskMode::OnlyFill || taskMode == AITaskMode::OnlyNeon)) {
-        ColorSlot blockSlot = g_lastAIDecisionForEditor.directRecolorOnly ? ColorSlot::BrightMain : ColorSlot::DarkFill;
+        float gradMinY = (contour.exactMaxY > contour.exactMinY + 0.5f) ? contour.exactMinY : (contour.minGY * 30.f);
+        float gradSpanH = (contour.exactMaxY > contour.exactMinY + 0.5f) ? (contour.exactMaxY - contour.exactMinY) : ((std::max)(1, contour.maxGY - contour.minGY + 1) * 30.f);
         for (GameObject* baseObj : contour.solidObjects) {
             if (!baseObj) continue;
             writeObjEditorLayers(baseObj, summary.firstLayer, 0);
             writeObjFlags(baseObj, 0, -3, false, true);
-            bindObjectToColor(baseObj, palette, blockSlot, g_lastAIDecisionForEditor.mainRGB);
+            if (g_lastAIDecisionForEditor.hasGradient) {
+                float gt = std::clamp((baseObj->getPosition().y - gradMinY) / (std::max)(1.0f, gradSpanH), 0.0f, 1.0f);
+                ccColor3B gCol = lerpColor(g_lastAIDecisionForEditor.gradBotRGB, g_lastAIDecisionForEditor.gradTopRGB, gt);
+                bindObjectToColor(baseObj, palette, ColorSlot::CustomRGB, gCol, 255, false, true, gCol, 255, false);
+            } else {
+                ColorSlot blockSlot = g_lastAIDecisionForEditor.directRecolorOnly ? ColorSlot::BrightMain : ColorSlot::DarkFill;
+                ccColor3B bCol = g_lastAIDecisionForEditor.directRecolorOnly ? g_lastAIDecisionForEditor.mainRGB : g_lastAIDecisionForEditor.fillRGB;
+                bindObjectToColor(baseObj, palette, blockSlot, bCol, 255, false, true, bCol, 255, false);
+            }
         }
         for (auto const& sp : contour.spikes) {
             if (!sp.sourceObj) continue;
@@ -5512,11 +5696,13 @@ static CCSprite* createCyrillicOrEnglishAgreeLabelSprite(bool isRussian, float t
     // ' '
     static constexpr Glyph8x10 kSpace = {{ 0,0,0,0,0,0,0,0,0,0 }};
 
+    (void)kGlyphCheck;
+    (void)kSpace;
     std::vector<Glyph8x10> seq;
     if (isRussian) {
-        seq = { kGlyphCheck, kSpace, kRus_S_Cap, kRus_o, kRus_g, kRus_l, kRus_a, kRus_s, kRus_e, kRus_n };
+        seq = { kRus_S_Cap, kRus_o, kRus_g, kRus_l, kRus_a, kRus_s, kRus_e, kRus_n };
     } else {
-        seq = { kGlyphCheck, kSpace, kEng_A, kEng_g, kEng_r, kRus_e, kRus_e };
+        seq = { kEng_A, kEng_g, kEng_r, kRus_e, kRus_e };
     }
 
     int scale = 3;
@@ -6118,27 +6304,27 @@ protected:
         auto center = CCPoint{ size.width / 2.f, size.height / 2.f };
         float leftX = center.x - 125.f;
 
-        // Создаем скругленную кнопку подтверждения в чате ("✓ Согласен" на RUS / "✓ Agree" на ENG)
-        float btnW = 132.f;
-        float btnH = 22.f;
+        // Компактная круглая (pill) КРАСНАЯ кнопка подтверждения в чате ("Согласен" на RUS / "Agree" на ENG)
+        float btnW = 72.f;
+        float btnH = 16.f;
         auto* btnNode = CCNode::create();
         btnNode->setContentSize(CCSize{ btnW, btnH });
         btnNode->ignoreAnchorPointForPosition(false);
         btnNode->setAnchorPoint(CCPoint{ 0.5f, 0.5f });
 
-        auto* borderSpr = createSmoothRoundedRect(btnW + 2.f, btnH + 2.f, 12.f, toColor4F(ccColor3B{ 115, 255, 165 }, 255));
+        auto* borderSpr = createSmoothRoundedRect(btnW + 2.f, btnH + 2.f, 9.f, toColor4F(ccColor3B{ 245, 82, 112 }, 255));
         borderSpr->setPosition(CCPoint{ btnW * 0.5f, btnH * 0.5f });
         btnNode->addChild(borderSpr);
 
         auto* bgSpr = createSmoothGradientRoundedRect(
-            btnW, btnH, 11.f,
-            toColor4F(ccColor3B{ 42, 196, 102 }, 255),
-            toColor4F(ccColor3B{ 24, 138, 68 }, 255)
+            btnW, btnH, 8.f,
+            toColor4F(ccColor3B{ 215, 48, 80 }, 255),
+            toColor4F(ccColor3B{ 158, 24, 52 }, 255)
         );
         bgSpr->setPosition(CCPoint{ btnW * 0.5f, btnH * 0.5f });
         btnNode->addChild(bgSpr);
 
-        if (auto* txtSpr = createCyrillicOrEnglishAgreeLabelSprite(m_russianLayout, 10.5f)) {
+        if (auto* txtSpr = createCyrillicOrEnglishAgreeLabelSprite(m_russianLayout, 7.6f)) {
             txtSpr->setPosition(CCPoint{ btnW * 0.5f, btnH * 0.5f });
             btnNode->addChild(txtSpr);
         }
@@ -6146,8 +6332,7 @@ protected:
         m_chatConfirmAgreeBtn = CCMenuItemSpriteExtra::create(
             btnNode, this, menu_selector(AIDecorPopup::onConfirmAgreeInChat)
         );
-        // Размещаем кнопку подтверждения прямо внутри нижней части окна чата
-        m_chatConfirmAgreeBtn->setPosition(CCPoint{ leftX - 10.f, center.y - 38.f });
+        m_chatConfirmAgreeBtn->setPosition(CCPoint{ leftX - 10.f, center.y - 42.f });
         m_buttonMenu->addChild(m_chatConfirmAgreeBtn);
     }
 
@@ -6556,33 +6741,48 @@ protected:
         refreshRightPanelTabsAndCanvas();
     }
 
-    // Вычисляет точные мировые границы области предпросмотра (включая точные края каркаса, повернутые шипы и орбы)
+    // Вычисляет точные мировые границы области предпросмотра (учитывая и выделенный контур, и сгенерированные объекты g_lastPreviewSpecs,
+    // чтобы в режиме In GD ни один блок или шип НИКОГДА не вылезал за пределы синего окна предпросмотра!)
     void getExactPreviewWorldBounds(float& outMinX, float& outMaxX, float& outMinY, float& outMaxY) const {
-        if (m_contour.exactMaxX > m_contour.exactMinX + 0.5f) {
-            outMinX = m_contour.exactMinX;
-            outMaxX = m_contour.exactMaxX;
-            outMinY = m_contour.exactMinY;
-            outMaxY = m_contour.exactMaxY;
-        } else {
+        bool inited = false;
+        auto includeRect = [&](float x0, float x1, float y0, float y1) {
+            if (!inited) {
+                outMinX = x0; outMaxX = x1;
+                outMinY = y0; outMaxY = y1;
+                inited = true;
+            } else {
+                outMinX = (std::min)(outMinX, x0);
+                outMaxX = (std::max)(outMaxX, x1);
+                outMinY = (std::min)(outMinY, y0);
+                outMaxY = (std::max)(outMaxY, y1);
+            }
+        };
+
+        if (m_contour.hasAnySelection && m_contour.exactMaxX > m_contour.exactMinX + 0.5f) {
+            includeRect(m_contour.exactMinX, m_contour.exactMaxX, m_contour.exactMinY, m_contour.exactMaxY);
+        }
+        for (auto const& sp : m_contour.spikes) {
+            float r = 16.0f * (std::max)(sp.scaleX, sp.scaleY);
+            includeRect(sp.x - r, sp.x + r, sp.y - r, sp.y + r);
+        }
+        for (auto const& op : m_contour.orbsAndPortals) {
+            float r = (op.isPortal ? 28.0f : 16.0f) * (std::max)(op.scaleX, op.scaleY);
+            includeRect(op.x - r, op.x + r, op.y - r, op.y + r);
+        }
+
+        if ((m_previewTab == 2 || !inited) && !g_lastPreviewSpecs.empty()) {
+            for (auto const& s : g_lastPreviewSpecs) {
+                float hw = std::clamp(std::fabs(s.scaleX) * 15.0f, 1.0f, 60.0f);
+                float hh = std::clamp(std::fabs(s.scaleY) * 15.0f, 1.0f, 60.0f);
+                includeRect(s.x - hw, s.x + hw, s.y - hh, s.y + hh);
+            }
+        }
+
+        if (!inited) {
             outMinX = m_contour.minGX * 30.0f;
             outMaxX = (m_contour.maxGX + 1) * 30.0f;
             outMinY = m_contour.minGY * 30.0f;
             outMaxY = (m_contour.maxGY + 1) * 30.0f;
-        }
-
-        for (auto const& sp : m_contour.spikes) {
-            float r = 16.0f * (std::max)(sp.scaleX, sp.scaleY);
-            outMinX = (std::min)(outMinX, sp.x - r);
-            outMaxX = (std::max)(outMaxX, sp.x + r);
-            outMinY = (std::min)(outMinY, sp.y - r);
-            outMaxY = (std::max)(outMaxY, sp.y + r);
-        }
-        for (auto const& op : m_contour.orbsAndPortals) {
-            float r = (op.isPortal ? 28.0f : 16.0f) * (std::max)(op.scaleX, op.scaleY);
-            outMinX = (std::min)(outMinX, op.x - r);
-            outMaxX = (std::max)(outMaxX, op.x + r);
-            outMinY = (std::min)(outMinY, op.y - r);
-            outMaxY = (std::max)(outMaxY, op.y + r);
         }
     }
 
@@ -6706,7 +6906,9 @@ protected:
                 int gx = static_cast<int>(std::floor(wx / 30.0f));
                 float localU = (wx - gx * 30.0f) / 30.0f;
 
-                bool inBlockCell = (!m_contour.hasAnySelection) || isWorldPointInsideExactContour(m_contour, wx, wy);
+                bool inBlockCell = (!m_contour.hasAnySelection)
+                    ? (previewAI.wantBackground || previewAI.textureResolution >= 16 || g_hasReferenceImage || previewAI.customElements.empty())
+                    : isWorldPointInsideExactContour(m_contour, wx, wy);
                 bool inSpikeTriangle = false;
                 if (!inBlockCell) {
                     for (auto const& sp : m_contour.spikes) {
@@ -6856,7 +7058,7 @@ protected:
 
         if (m_previewTab == 0) {
             if (!m_contour.hasAnySelection) {
-                auto* emptyLbl = CCLabelBMFont::create("0 objects selected (Ask AI for Background!)", "chatFont.fnt");
+                auto* emptyLbl = CCLabelBMFont::create("0 selected (Free Mode: ask AI for any object or BG!)", "chatFont.fnt");
                 emptyLbl->setScale(0.38f);
                 emptyLbl->setColor(ccColor3B{ 215, 235, 255 });
                 emptyLbl->setPosition(CCPoint{ 0.f, 0.f });
@@ -6900,28 +7102,43 @@ protected:
                 m_previewCanvasContent->addChild(hLine);
             }
 
-            // 2. Отрисовываем базовые шипы каркаса правильной треугольной формой с их реальным поворотом
+            constexpr float kMaxPreviewHalfW = 79.0f;
+            constexpr float kMaxPreviewHalfH = 50.0f;
+
+            // 2. Отрисовываем базовые шипы каркаса правильной треугольной формой строго внутри рамки предпросмотра
             for (auto const& sp : m_contour.spikes) {
                 float px = -totalW * 0.5f + (sp.x - worldMinX) * scaleRatio;
                 float py = -totalH * 0.5f + (sp.y - worldMinY) * scaleRatio;
                 float w = (std::max)(3.f, 30.f * sp.scaleX * scaleRatio);
                 float h = (std::max)(3.f, ((sp.objectId == 39 || sp.objectId == 103) ? 15.f : 30.f) * sp.scaleY * scaleRatio);
+                if (px - w * 0.5f < -kMaxPreviewHalfW || px + w * 0.5f > kMaxPreviewHalfW ||
+                    py - h * 0.5f < -kMaxPreviewHalfH || py + h * 0.5f > kMaxPreviewHalfH) {
+                    continue;
+                }
                 auto* triSpr = createTriangleSpikePreviewSprite(w, h, g_lastPreviewPalette.slotColors[static_cast<int>(ColorSlot::DarkFill)], 255);
                 triSpr->setRotation(sp.rotation);
                 triSpr->setPosition(CCPoint{ px, py });
                 m_previewCanvasContent->addChild(triSpr);
             }
 
-            // 3. Отрисовываем все сгенерированные объекты предпросмотра (блоки и треугольные шипы)
+            // 3. Отрисовываем все сгенерированные объекты предпросмотра строго внутри границ синего прямоугольника
             size_t shownCount = 0;
             for (auto const& s : g_lastPreviewSpecs) {
                 if (++shownCount > 6000) break;
 
                 float px = -totalW * 0.5f + (s.x - worldMinX) * scaleRatio;
                 float py = -totalH * 0.5f + (s.y - worldMinY) * scaleRatio;
+                if (px < -kMaxPreviewHalfW || px > kMaxPreviewHalfW ||
+                    py < -kMaxPreviewHalfH || py > kMaxPreviewHalfH) {
+                    continue;
+                }
 
                 float w = std::clamp(s.scaleX * cellPx, 0.5f, cellPx * 2.5f);
                 float h = std::clamp(s.scaleY * cellPx, 0.5f, cellPx * 2.5f);
+                w = (std::min)(w, (kMaxPreviewHalfW - std::fabs(px)) * 2.0f);
+                h = (std::min)(h, (kMaxPreviewHalfH - std::fabs(py)) * 2.0f);
+                if (w < 0.4f || h < 0.4f) continue;
+
                 ccColor3B col = (s.colorSlot == ColorSlot::CustomRGB)
                     ? s.customColor
                     : g_lastPreviewPalette.slotColors[std::clamp(static_cast<int>(s.colorSlot), 0, 5)];
@@ -7120,7 +7337,22 @@ protected:
         refreshRightPanelTabsAndCanvas();
     }
 
+    void askUserWhatToBuildWhenNothingSelected() {
+        std::string askMsg = m_russianLayout
+            ? "Nichego ne vydeleno i ne ukazano! Vydelite bloki v redaktore ili napishite v chat, kakoy imenno obekt (i kakogo razmera) ili fon vy hotite sdelat."
+            : "Nothing is selected or specified! Select blocks in the editor or write in chat what specific object (and size) or background you want me to create.";
+        g_chatHistory.push_back({ "assistant", askMsg });
+        rebuildChatScrollFeed();
+        if (m_stepPlanLabel)    m_stepPlanLabel->setString("Plan: ask");
+        if (m_stepDrawingLabel) m_stepDrawingLabel->setString("Draw: idle");
+        if (m_stepPlaceLabel)   m_stepPlaceLabel->setString("Place: 0 obj");
+    }
+
     void onPresetUniqueNewStyle(CCObject*) {
+        if (!m_contour.hasAnySelection && !g_hasReferenceImage && trimWhitespace(m_inputBuffer).empty()) {
+            askUserWhatToBuildWhenNothingSelected();
+            return;
+        }
         g_variantIndex++;
         m_inputBuffer = fmt::format("Invent a completely new never-before-seen custom block decor (variant #{}) with rich internal sub-layers and transparency", g_variantIndex);
         refreshInputLabel();
@@ -7128,6 +7360,10 @@ protected:
     }
 
     void onPresetBuildFromRef(CCObject*) {
+        if (!m_contour.hasAnySelection && !g_hasReferenceImage && trimWhitespace(m_inputBuffer).empty()) {
+            askUserWhatToBuildWhenNothingSelected();
+            return;
+        }
         if (g_hasReferenceImage) {
             m_inputBuffer = "Recreate the attached reference image on the selected contour with 100% accuracy, multi-layer colors, and opacity";
         } else {
@@ -7138,6 +7374,10 @@ protected:
     }
 
     void onAnotherVariantClicked(CCObject*) {
+        if (!m_contour.hasAnySelection && !g_hasReferenceImage && g_lastBuildPrompt.empty() && trimWhitespace(m_inputBuffer).empty()) {
+            askUserWhatToBuildWhenNothingSelected();
+            return;
+        }
         g_variantIndex++;
         if (g_hasReferenceImage) {
             m_inputBuffer = fmt::format("Refine and improve the part to match the reference image even closer (variant #{})", g_variantIndex);
@@ -7286,9 +7526,21 @@ protected:
         if (promptText.empty()) {
             if (g_hasReferenceImage) {
                 promptText = "Recreate the attached reference image on the selected contour with maximum accuracy";
+            } else if (!m_contour.hasAnySelection) {
+                askUserWhatToBuildWhenNothingSelected();
+                return;
             } else {
                 return;
             }
+        }
+
+        // Если ничего не выделено и игрок написал только общую фразу без указания конкретного объекта или фона — ничего не строим, а только спрашиваем!
+        if (!m_contour.hasAnySelection && !g_hasReferenceImage && isUnspecifiedPromptWhenNothingSelected(promptText)) {
+            m_inputBuffer.clear();
+            refreshInputLabel();
+            g_chatHistory.push_back({ "user", promptText });
+            askUserWhatToBuildWhenNothingSelected();
+            return;
         }
 
         m_inputBuffer.clear();
@@ -7417,12 +7669,22 @@ protected:
             m_stepPlaceLabel->setString("Wait confirm");
         }
         if (m_previewSubInfoLabel) {
-            int shownRes = (ai.textureResolution >= 16) ? ai.textureResolution : 64;
-            std::string subStr = fmt::format(
-                "{}x{} px | {} objs | Click 'Soglasen / Agree' in chat to build in GD",
-                shownRes, shownRes, g_lastPreviewSpecs.size()
-            );
-            m_previewSubInfoLabel->setString(subStr.c_str());
+            if (!m_contour.hasAnySelection) {
+                float bw = (ai.freeSizeBlocksW >= 0.5f) ? ai.freeSizeBlocksW : (ai.wantBackground ? 16.f : 5.f);
+                float bh = (ai.freeSizeBlocksH >= 0.5f) ? ai.freeSizeBlocksH : (ai.wantBackground ? 9.f : 5.f);
+                std::string subStr = fmt::format(
+                    "Free {} ({:.0f}x{:.0f} blocks, No Hitbox) | {} objs | Click 'Soglasen / Agree'",
+                    ai.wantBackground ? "BG" : "Object", bw, bh, g_lastPreviewSpecs.size()
+                );
+                m_previewSubInfoLabel->setString(subStr.c_str());
+            } else {
+                int shownRes = (ai.textureResolution >= 16) ? ai.textureResolution : 64;
+                std::string subStr = fmt::format(
+                    "{}x{} px | {} objs | Click 'Soglasen / Agree' in chat to build in GD",
+                    shownRes, shownRes, g_lastPreviewSpecs.size()
+                );
+                m_previewSubInfoLabel->setString(subStr.c_str());
+            }
         }
     }
 
